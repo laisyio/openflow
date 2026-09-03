@@ -39,6 +39,11 @@ mod app;
 // run the app.
 mod version;
 
+// Not gated either, for the same reason: the ServiceManagement calls inside are
+// macOS only, but the state-to-screen mapping beside them is pure and its test
+// runs on every platform in the matrix.
+mod login_item;
+
 #[cfg(target_os = "macos")]
 fn main() {
     app::main();
