@@ -36,6 +36,7 @@ use openflow_core::speech::SpeechRequest;
 use openflow_core::transcribe::ModelInfo;
 
 use crate::hotkeys;
+use crate::login_item;
 use crate::overlay;
 use crate::ui::card::{Card, Flipped, GAP, MARGIN, PADDING};
 use crate::ui::recorder::ChordRecorder;
@@ -172,6 +173,7 @@ const TAG_LOCAL_MODEL: isize = 32;
 const TAG_LOCAL_IDLE: isize = 33;
 const TAG_LOCAL_ONLY: isize = 34;
 const TAG_LIVE_PREVIEW: isize = 10;
+const TAG_OPEN_AT_LOGIN: isize = 11;
 
 const TAG_TTS_ENABLED: isize = 40;
 const TAG_TTS_PROVIDER: isize = 41;
@@ -197,6 +199,10 @@ struct Controls {
     theme: Retained<NSPopUpButton>,
     language: Retained<NSPopUpButton>,
     live_preview: Retained<NSSwitch>,
+    open_at_login: Retained<NSSwitch>,
+    /// Whatever the login item needs said about itself: the approval hint, or
+    /// the reason a register call was refused. Empty the rest of the time.
+    login_status: Retained<NSTextField>,
 
     backend: Retained<NSPopUpButton>,
     /// The online-provider rows and the on-this-Mac rows share one frame; the
@@ -449,6 +455,7 @@ impl SettingsPage {
             &controls.tts_enabled,
             &controls.save_history,
             &controls.live_preview,
+            &controls.open_at_login,
             &controls.local_only,
         ] {
             wire(control, target, changed);
@@ -624,6 +631,10 @@ impl SettingsPage {
         );
 
         set_switch(&controls.live_preview, settings.live_preview());
+        // No stored key for this one: macOS is the record, and the user can
+        // change it from System Settings while this window is shut. Read it
+        // fresh every time the window opens.
+        self.show_login_state(login_item::state());
 
         // Providers
         select_value(
@@ -729,6 +740,18 @@ impl SettingsPage {
         combo.setStringValue(&NSString::from_str(value));
     }
 
+    /// Put a login item state on screen: the switch, and the line under it.
+    ///
+    /// Every path that touches the login item ends here, including the failing
+    /// one, which is what puts a switch the user flipped back where macOS says
+    /// it belongs.
+    fn show_login_state(&self, state: login_item::State) {
+        let controls = &self.ivars().controls;
+        let (on, note) = login_item::presentation(state);
+        set_switch(&controls.open_at_login, on);
+        self.set_text(&controls.login_status, note);
+    }
+
     fn reload_microphones(&self) {
         let ivars = self.ivars();
         let controls = &ivars.controls;
@@ -808,6 +831,23 @@ impl SettingsPage {
             TAG_LANGUAGE => settings.set("language", selected_value(&controls.language, LANGUAGES)),
             TAG_LIVE_PREVIEW => {
                 settings.set("live_preview", bool_setting(is_on(&controls.live_preview)))
+            }
+            TAG_OPEN_AT_LOGIN => {
+                // Nothing is written to the database here: macOS holds this
+                // state, so the switch is told what it is rather than asked.
+                // A refusal reverts the switch to the state macOS still
+                // reports and puts the reason under it.
+                let (state, refusal) = match login_item::set_enabled(is_on(&controls.open_at_login))
+                {
+                    Ok(state) => (state, None),
+                    Err(message) => (login_item::state(), Some(message)),
+                };
+                let (on, note) = login_item::presentation(state);
+                set_switch(&controls.open_at_login, on);
+                // One write, not a note the error then paints over: a refusal
+                // is the more useful of the two lines and the only one shown.
+                self.set_text(&controls.login_status, refusal.as_deref().unwrap_or(note));
+                Ok(())
             }
             TAG_BACKEND => {
                 let value = selected_value(&controls.backend, BACKENDS);
@@ -1416,6 +1456,29 @@ fn build_sections(
         mtm,
         "Shows words in the pill as you speak. On a machine on your network it is free; on a paid provider it re-sends the recording every 0.8 s and bills for each one.",
     );
+
+    let (l, c) = form.row(ROW);
+    form.add(&label(mtm, "Open at login", l));
+    let open_at_login = switch_control(mtm, switch_rect(c), TAG_OPEN_AT_LOGIN);
+    form.add(&open_at_login);
+    form.note_row(
+        mtm,
+        "Starts OpenFlow when you sign in. macOS lists it under Login Items.",
+    );
+    // Reserved rather than measured: this line is written after the fact, and a
+    // field grown to fit an empty string would have nowhere to put the approval
+    // hint or a refusal from macOS. Two lines of the note font.
+    let n = form.control_only(28.0);
+    let login_status = note(mtm, "", n);
+    allow_wrapping(&login_status, n.size.width);
+    // The card's height was measured once, above, so the row cannot grow later
+    // to fit a long `localizedDescription`. Capping it at the two lines the
+    // frame reserved, and truncating the tail rather than word-wrapping past
+    // the bottom edge, is the difference between a message that ends in an
+    // ellipsis and one that ends without the user knowing it was cut.
+    login_status.setMaximumNumberOfLines(2);
+    login_status.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
+    form.add(&login_status);
     let general = form.fit();
 
     // Providers
@@ -1612,6 +1675,8 @@ fn build_sections(
         theme,
         language,
         live_preview,
+        open_at_login,
+        login_status,
         backend,
         remote_box,
         local_box,
