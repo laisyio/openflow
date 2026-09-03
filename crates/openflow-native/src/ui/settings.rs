@@ -837,13 +837,16 @@ impl SettingsPage {
                 // state, so the switch is told what it is rather than asked.
                 // A refusal reverts the switch to the state macOS still
                 // reports and puts the reason under it.
-                match login_item::set_enabled(is_on(&controls.open_at_login)) {
-                    Ok(state) => self.show_login_state(state),
-                    Err(message) => {
-                        self.show_login_state(login_item::state());
-                        self.set_text(&controls.login_status, &message);
-                    }
-                }
+                let (state, refusal) = match login_item::set_enabled(is_on(&controls.open_at_login))
+                {
+                    Ok(state) => (state, None),
+                    Err(message) => (login_item::state(), Some(message)),
+                };
+                let (on, note) = login_item::presentation(state);
+                set_switch(&controls.open_at_login, on);
+                // One write, not a note the error then paints over: a refusal
+                // is the more useful of the two lines and the only one shown.
+                self.set_text(&controls.login_status, refusal.as_deref().unwrap_or(note));
                 Ok(())
             }
             TAG_BACKEND => {
@@ -1468,6 +1471,13 @@ fn build_sections(
     let n = form.control_only(28.0);
     let login_status = note(mtm, "", n);
     allow_wrapping(&login_status, n.size.width);
+    // The card's height was measured once, above, so the row cannot grow later
+    // to fit a long `localizedDescription`. Capping it at the two lines the
+    // frame reserved, and truncating the tail rather than word-wrapping past
+    // the bottom edge, is the difference between a message that ends in an
+    // ellipsis and one that ends without the user knowing it was cut.
+    login_status.setMaximumNumberOfLines(2);
+    login_status.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
     form.add(&login_status);
     let general = form.fit();
 

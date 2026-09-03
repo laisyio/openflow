@@ -39,9 +39,11 @@ mod app;
 // run the app.
 mod version;
 
-// Not gated either, for the same reason: the ServiceManagement calls inside are
-// macOS only, but the state-to-screen mapping beside them is pure and its test
-// runs on every platform in the matrix.
+// Not gated either, though for a narrower reason: the ServiceManagement calls
+// inside are macOS only, but the state-to-screen mapping beside them is pure,
+// and a macOS-gated module would take its tests with it. Ungated, `cargo test
+// --workspace` covers that mapping wherever it is run, including the Linux
+// checkout that never compiles a line of AppKit.
 mod login_item;
 
 #[cfg(target_os = "macos")]

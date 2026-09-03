@@ -64,8 +64,8 @@ mod sys {
 
     /// Read the current login item state from macOS.
     ///
-    /// Any status the SDK grows later reads as [`State::Off`]: an unknown
-    /// number is not a reason to claim the app launches at login.
+    /// Any status the SDK grows later reads as [`State::Off`], and says so
+    /// under `OPENFLOW_TRACE=1`.
     pub fn state() -> State {
         // SAFETY: `mainAppService` takes no arguments and returns a retained
         // `SMAppService` for this bundle; `status` reads a scalar off it. The
@@ -76,7 +76,13 @@ mod sys {
             SMAppServiceStatus::Enabled => State::On,
             SMAppServiceStatus::RequiresApproval => State::RequiresApproval,
             SMAppServiceStatus::NotFound => State::NotFound,
-            _ => State::Off,
+            other => {
+                // An unknown number is not a reason to claim the app launches
+                // at login, but it is a reason to be able to find out: without
+                // the raw value there is nothing to look up in the SDK.
+                crate::trace!("login item: unknown SMAppServiceStatus {}", other.0);
+                State::Off
+            }
         }
     }
 
