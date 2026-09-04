@@ -1460,6 +1460,46 @@ fn build_done(mtm: MainThreadMarker) -> (Retained<NSView>, Retained<NSTextField>
 mod tests {
     use super::*;
 
+    /// The wizard's captions are one line each, and have to stay one line.
+    ///
+    /// `build_provider` gives each one a fixed 14pt row and never turns
+    /// wrapping on, so a caption too wide for its column is not wrapped -- it is
+    /// cut at the edge. That is how the on-this-Mac card came to read
+    /// "...No key, no network, and no audio leaves the machine. Needs Pyth".
+    ///
+    /// That one wraps now and is measured. These five deliberately do not: the
+    /// panel they sit in is `STEP_HEIGHT`, which is the measured height of the
+    /// tallest panel, and a caption that grew to two lines would push the panel
+    /// past it and back on top of the Back and Continue buttons. So the
+    /// constraint here is real, and this is where it is written down.
+    #[test]
+    fn every_provider_caption_stays_on_one_line() {
+        let column = STEP_WIDTH - 20.0;
+        for option in PROVIDER_OPTIONS {
+            let width = crate::ui::metrics::note_width(option.description);
+            assert!(
+                width <= column,
+                "{:?}'s caption renders {width:.1}pt wide in a {column}pt row that does not wrap; \
+                 shorten it, or give it the wrapping treatment the on-this-Mac card got and check \
+                 STEP_HEIGHT still holds the panel",
+                option.label
+            );
+        }
+    }
+
+    /// The on-this-Mac card's own two strings, which sit in different boxes: the
+    /// radio's title shares its row with the badge column, and the caption wraps
+    /// into the same column as the ones above.
+    #[test]
+    fn the_on_this_mac_card_fits_its_row() {
+        let title = crate::ui::metrics::label_width(LOCAL_CARD_LABEL);
+        let room = STEP_WIDTH - 110.0;
+        assert!(
+            title <= room,
+            "the card title {LOCAL_CARD_LABEL:?} renders {title:.1}pt wide in {room}pt"
+        );
+    }
+
     /// The wizard must not be able to walk off either end, and every panel has
     /// to be reachable from the front by pressing the primary button.
     #[test]

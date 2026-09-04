@@ -237,6 +237,27 @@ impl Form {
         field
     }
 
+    /// A wrapping note across the whole width, for a caption under a control
+    /// that spans the form rather than sitting in the control column.
+    ///
+    /// The same shape as `note_row`: laid out at the real width, wrapped, and
+    /// then asked how tall it turned out. A fixed height here is what cut
+    /// "...Sent to Whisper as a hint, and ap" off mid-word.
+    pub fn note_full(&mut self, mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+        let field = note(
+            mtm,
+            text,
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(self.width, 14.0)),
+        );
+        wrap(&field, self.width);
+        let height = field.frame().size.height;
+        self.y -= height;
+        field.setFrameOrigin(NSPoint::new(0.0, self.y));
+        self.y -= GAP;
+        self.add(&field);
+        field
+    }
+
     pub fn add(&self, view: &NSView) {
         self.view.addSubview(view);
     }
@@ -536,5 +557,43 @@ pub fn wire(control: &NSControl, target: &AnyObject, action: objc2::runtime::Sel
     unsafe {
         control.setTarget(Some(target));
         control.setAction(Some(action));
+    }
+}
+
+/// Text measurement, so a string that does not fit its box fails a test instead
+/// of waiting to be noticed in a screenshot.
+///
+/// Two of those shipped: a 148.8pt label in a 132pt column, and a 607pt sentence
+/// drawn on one line in a 468pt row. Neither is visible in the code, neither
+/// breaks a build, and both were found by driving the built app. They are
+/// arithmetic, though -- and AppKit does this arithmetic off the main thread,
+/// with no `NSApplication`, which is what lets the checks be `cargo test`.
+///
+/// The fonts are read from the same constructors [`label`] and [`note`] use, so
+/// a change there cannot leave the measurements behind.
+#[cfg(test)]
+pub(crate) mod metrics {
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::{NSFont, NSFontAttributeName, NSStringDrawing};
+    use objc2_foundation::{NSDictionary, NSString};
+
+    fn width(text: &str, font: &NSFont) -> f64 {
+        let font: &AnyObject = font;
+        let attributes = NSDictionary::from_slices(&[unsafe { NSFontAttributeName }], &[font]);
+        let string = NSString::from_str(text);
+        unsafe { string.sizeWithAttributes(Some(&attributes)) }.width
+    }
+
+    /// How wide `text` draws at the font [`super::label`] gives a row label.
+    pub(crate) fn label_width(text: &str) -> f64 {
+        width(
+            text,
+            &NSFont::systemFontOfSize(NSFont::smallSystemFontSize()),
+        )
+    }
+
+    /// How wide `text` draws at the font [`super::note`] gives a caption.
+    pub(crate) fn note_width(text: &str) -> f64 {
+        width(text, &NSFont::systemFontOfSize(10.0))
     }
 }

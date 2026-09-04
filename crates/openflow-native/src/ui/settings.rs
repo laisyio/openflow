@@ -1409,7 +1409,7 @@ fn build_sections(
     form.add(&language);
 
     let (l, c) = form.row(ROW);
-    form.add(&label(mtm, "Live preview while recording", l));
+    form.add(&label(mtm, "Live preview", l));
     let live_preview = switch_control(mtm, switch_rect(c), TAG_LIVE_PREVIEW);
     form.add(&live_preview);
     form.note_row(
@@ -1569,12 +1569,10 @@ fn build_sections(
     let n = form.full(14.0);
     let dictionary_count = note(mtm, "0/800", n);
     form.add(&dictionary_count);
-    let n = form.full(28.0);
-    form.add(&note(
+    form.note_full(
         mtm,
         "Names and terms to spell correctly, comma separated. Sent to Whisper as a hint, and applied to every transcript afterwards. Write `heard -> Correct` to fix a mishearing.",
-        n,
-    ));
+    );
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Save history", l));
@@ -2004,6 +2002,51 @@ fn titles(table: &'static [(&'static str, &'static str)]) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pull every row label out of this file's own source.
+    ///
+    /// Reading the source rather than a table is deliberate. A table would be a
+    /// second place to remember, and the labels are written inline beside the
+    /// control they name, which is where they read best. This way a label added
+    /// tomorrow is measured tomorrow without anyone opting it in.
+    fn row_labels(source: &str) -> Vec<&str> {
+        // Written split so this needle does not match itself in the scan.
+        let needle: &str = concat!("label(mtm,", " \"");
+        source
+            .match_indices(needle)
+            .filter_map(|(at, _)| {
+                let rest = &source[at + needle.len()..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect()
+    }
+
+    /// Every label has to fit the column it is drawn in.
+    ///
+    /// `LABEL_WIDTH` is a hard edge, not a hint: the control column starts at
+    /// `CONTROL_X` and the controls fill it, so a label wider than the column is
+    /// drawn underneath the control beside it. "Live preview while recording"
+    /// was 148.8pt in a 132pt column and shipped that way, because nothing in
+    /// the code says how wide a string is -- it took a screenshot of the built
+    /// app to see it.
+    #[test]
+    fn every_row_label_fits_its_column() {
+        let labels = row_labels(include_str!("settings.rs"));
+        assert!(
+            labels.len() > 25,
+            "found only {} labels, so the scan is what broke, not the layout",
+            labels.len()
+        );
+        let column = crate::ui::LABEL_WIDTH;
+        for text in labels {
+            let width = crate::ui::metrics::label_width(text);
+            assert!(
+                width <= column,
+                "the label {text:?} renders {width:.1}pt wide in a {column}pt column; \
+                 shorten it, or widen LABEL_WIDTH and narrow all the other rows to match"
+            );
+        }
+    }
 
     /// The provider setting packs a kind and a URL into one string. Both halves
     /// have to survive a round trip, or a custom endpoint silently becomes Groq
