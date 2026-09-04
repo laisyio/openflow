@@ -21,7 +21,11 @@ The project is currently an early source build. There are no official pre-built 
 
 ### Streaming scope
 
-Speech-to-text is not live streaming: OpenFlow records locally, then uploads the finished WAV and waits for a transcript. The Gemini TTS preview progressively appends ordered MP3 chunks and starts playback while the response is still downloading when the system webview supports Media Source Extensions; otherwise it falls back to playback after download. Groq's Orpheus returns WAV only, which cannot be streamed through Media Source Extensions, so it always plays after the download completes.
+Speech-to-text is not live streaming: every request carries a complete WAV and waits for a transcript back, and the transcript you keep is always the one returned for the finished recording.
+
+Live preview is the exception to "nothing is uploaded until you let go". With it on, OpenFlow also re-uploads the whole recording so far every 0.8 seconds while you are still speaking, so the pill can show words as they arrive. That previewing stops 20 seconds into a take, or at the first reading that takes longer than 0.8 seconds, whichever comes first: a 60-second dictation sends up to 24 preview requests carrying about 4 minutes of audio in total, and then the final upload of the 60-second WAV. It is off by default for the hosted providers and **on by default for custom (self-hosted) endpoints**, where the requests cost nothing but your own hardware. Settings > General > "Live preview while recording" turns it off or on for any provider; turn it off before pointing a custom endpoint at a paid, per-minute API. On-device transcription previews the same way, against the local model, and nothing leaves the machine.
+
+The Gemini TTS preview progressively appends ordered MP3 chunks and starts playback while the response is still downloading when the system webview supports Media Source Extensions; otherwise it falls back to playback after download. Groq's Orpheus returns WAV only, which cannot be streamed through Media Source Extensions, so it always plays after the download completes.
 
 ## Providers
 

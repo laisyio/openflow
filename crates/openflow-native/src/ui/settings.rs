@@ -38,6 +38,7 @@ use openflow_core::transcribe::ModelInfo;
 use crate::hotkeys;
 use crate::overlay;
 use crate::ui::card::{Card, Flipped, GAP, MARGIN, PADDING};
+use crate::ui::onboarding::microphone_items;
 use crate::ui::recorder::ChordRecorder;
 use crate::ui::{
     allow_wrapping, button, combo, label, note, popup, secure_field, switch_control, text_field,
@@ -732,24 +733,24 @@ impl SettingsPage {
     fn reload_microphones(&self) {
         let ivars = self.ivars();
         let controls = &ivars.controls;
+        // Same conflation the wizard had: `list_audio_devices` fails one way
+        // and comes back empty another, and `unwrap_or_default` flattens both
+        // into the same empty list. It is left flattened *here* on purpose --
+        // unlike the wizard's step, this row has no second line to tell the
+        // two apart on, and the popup itself can only say that there is
+        // nothing to pick. What it must not do is name something anyway.
         let devices = ivars.engine.list_audio_devices().unwrap_or_default();
+        // Keyed to the popup by position, first entry empty either way: an
+        // empty `microphone` row means "let the recorder pick".
         let mut ids = vec![String::new()];
         {
             controls.microphone.removeAllItems();
-            controls
-                .microphone
-                .addItemWithTitle(&NSString::from_str("System default"));
-            for device in &devices {
-                let title = if device.is_default {
-                    format!("{} (default)", device.name)
-                } else {
-                    device.name.clone()
-                };
+            for title in microphone_items(&devices) {
                 controls
                     .microphone
                     .addItemWithTitle(&NSString::from_str(&title));
-                ids.push(device.id.clone());
             }
+            ids.extend(devices.iter().map(|device| device.id.clone()));
         }
         let saved = ivars.engine.settings().microphone().unwrap_or_default();
         let index = ids.iter().position(|id| *id == saved).unwrap_or(0);
