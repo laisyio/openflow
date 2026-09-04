@@ -145,6 +145,17 @@ fn clipboard_still_ours(current: Option<&str>, ours: &str) -> bool {
     current == Some(ours)
 }
 
+/// What a `type_text` call will post, or `None` when it will post nothing.
+///
+/// The empty case is decided here rather than inline because `type_text` itself
+/// cannot be asked about it: posting the stray `a` and posting nothing both
+/// return `Ok(())`, and the difference only shows up as a character in whatever
+/// window happened to be focused.
+#[cfg(target_os = "macos")]
+fn keystroke_payload(text: &str) -> Option<&str> {
+    (!text.is_empty()).then_some(text)
+}
+
 /// Send `text` as a synthesized keystroke, unicode payload and all.
 ///
 /// Three things here are load-bearing, each one measured rather than assumed:
@@ -162,9 +173,9 @@ pub fn type_text(text: &str) -> Result<(), String> {
     use core_graphics::event::{CGEvent, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
-    if text.is_empty() {
+    let Some(text) = keystroke_payload(text) else {
         return Ok(());
-    }
+    };
 
     let source = || {
         CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -357,6 +368,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn typing_empty_text_posts_nothing() {
-        assert_eq!(type_text(""), Ok(()));
+        assert_eq!(keystroke_payload(""), None);
+        assert_eq!(keystroke_payload("the transcript"), Some("the transcript"));
     }
 }

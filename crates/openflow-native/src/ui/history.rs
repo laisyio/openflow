@@ -122,6 +122,15 @@ pub fn row_columns(item: &Transcription) -> (String, String, String) {
     )
 }
 
+/// What to say after asking the engine to re-insert a row.
+///
+/// The engine answers with the problem when there was one, and the problem is
+/// worth more than the verb: a paste macOS refused leaves the text on the
+/// clipboard and names the Accessibility grant that would have let it through.
+pub fn paste_caption(problem: Option<String>) -> String {
+    problem.unwrap_or_else(|| "Pasted.".to_string())
+}
+
 /// The line under the table.
 pub fn status_line(rows: usize, query: &str) -> String {
     let query = query.trim();
@@ -221,8 +230,8 @@ define_class!(
                 self.say("Select a row first.");
                 return;
             };
-            self.ivars().engine.paste_transcription(&item.id);
-            self.say("Pasted.");
+            let problem = self.ivars().engine.paste_transcription(&item.id);
+            self.say(&paste_caption(problem));
         }
 
         #[unsafe(method(deleteRow:))]
@@ -621,6 +630,17 @@ mod tests {
 
         let midnight = jakarta.with_ymd_and_hms(2026, 12, 25, 0, 30, 0).unwrap();
         assert_eq!(format_stamp(&midnight), "Dec 25, 2026 at 12:30 AM");
+    }
+
+    /// "Pasted." is a claim about a keystroke, and under Keep the clipboard
+    /// write can land while macOS refuses that keystroke. The window says
+    /// whichever of the two actually happened.
+    #[test]
+    fn the_window_reports_a_paste_the_system_refused() {
+        assert_eq!(paste_caption(None), "Pasted.");
+        let blocked = "Text was copied, but macOS blocked automatic paste. \
+Grant OpenFlow Accessibility access.";
+        assert_eq!(paste_caption(Some(blocked.to_string())), blocked);
     }
 
     /// A timestamp that does not parse is shown as it is stored. Dropping it

@@ -175,6 +175,12 @@ pub fn recording_slot_free(slot: &Option<Instant>) -> bool {
     }
 }
 
+/// What the re-copy slot holds for a history row: the cleaned-up text when the
+/// take was cleaned up, and the raw transcript otherwise.
+fn recopy_text(item: Transcription) -> String {
+    item.formatted_text.unwrap_or(item.raw_text)
+}
+
 /// Everything a reading of a recording in progress needs from settings.
 ///
 /// Resolved once when the capture starts and moved into the preview task, so a
@@ -250,7 +256,7 @@ impl Engine {
             .get_history(1)?
             .into_iter()
             .next()
-            .map(|item| item.formatted_text.unwrap_or(item.raw_text));
+            .map(recopy_text);
 
         // Built for every launch, started for none: an idle supervisor is a
         // mutex and no threads, and building it here means the Settings screen
@@ -901,7 +907,7 @@ impl Engine {
         let transcription = Transcription {
             id: uuid::Uuid::new_v4().to_string(),
             raw_text,
-            formatted_text: Some(formatted.clone()),
+            formatted_text: Some(formatted),
             provider: provider_str,
             duration_ms,
             context_type: None,
@@ -909,6 +915,27 @@ impl Engine {
             language,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
+        self.finish_take(&cancellation, transcription)
+    }
+
+    /// Write the take down and put it where the user is typing: the two steps
+    /// that cannot be taken back.
+    ///
+    /// The cancellation check belongs here and not only in the `select!`s
+    /// above, because the plugin hooks between them are blocking calls. A
+    /// cancel that arrives while one is running is not noticed until it
+    /// returns, and a hook is given five seconds before it is killed -- 2.5 s
+    /// measured against a hook that sleeps for two. Cancelling in that window
+    /// used to leave the take on disk and pasted into whatever the user had
+    /// stopped it from reaching.
+    fn finish_take(
+        &self,
+        cancellation: &CancellationToken,
+        transcription: Transcription,
+    ) -> Result<(Transcription, Option<String>), String> {
+        if cancellation.is_cancelled() {
+            return Err("Transcription cancelled".to_string());
+        }
 
         // Saving is opt-out, and an optional retention window trims old rows as we go.
         if self.settings.save_history() {
@@ -917,19 +944,21 @@ impl Engine {
                 let _ = self.settings.db().prune_older_than(days);
             }
         }
+        let text = transcription
+            .formatted_text
+            .as_deref()
+            .unwrap_or(&transcription.raw_text)
+            .to_string();
         {
             let mut last = self
                 .last_transcription
                 .lock()
                 .map_err(|_| "Clipboard history is unavailable".to_string())?;
-            *last = Some(formatted);
+            *last = Some(text.clone());
         }
 
         let paste_warning = paste_to_clipboard(
-            transcription
-                .formatted_text
-                .as_deref()
-                .unwrap_or(&transcription.raw_text),
+            &text,
             self.settings.insert_method(),
             self.settings.clipboard_policy(),
         )
@@ -982,13 +1011,28 @@ impl Engine {
         }
     }
 
-    /// Re-insert one history row, for the tray's recents list.
-    pub fn paste_transcription(&self, id: &str) {
-        if let Ok(Some(t)) = self.settings.db().get_transcription(id) {
-            let text = t.formatted_text.as_deref().unwrap_or(&t.raw_text);
-            let _ = paste_to_clipboard(text, self.settings.insert_method(), ClipboardPolicy::Keep);
-            self.emit(EngineEvent::RecopySuccess("Copied!".to_string()));
+    /// Re-insert one history row, for the tray's recents list and the History
+    /// window. Answers with the problem when there was one.
+    ///
+    /// Copying and pasting fail separately: under `Keep` the text can be sitting
+    /// on the clipboard while macOS refuses the keystroke, and that error is the
+    /// only sentence that tells the user about Accessibility. A host that shows
+    /// nothing of its own can ignore the answer, since the same message goes out
+    /// as an event.
+    pub fn paste_transcription(&self, id: &str) -> Option<String> {
+        let problem = match self.settings.db().get_transcription(id) {
+            Ok(Some(t)) => {
+                let text = t.formatted_text.as_deref().unwrap_or(&t.raw_text);
+                paste_to_clipboard(text, self.settings.insert_method(), ClipboardPolicy::Keep).err()
+            }
+            Ok(None) => Some("That transcription is no longer in history.".to_string()),
+            Err(error) => Some(error),
+        };
+        match problem.clone() {
+            None => self.emit(EngineEvent::RecopySuccess("Copied!".to_string())),
+            Some(problem) => self.emit(EngineEvent::TranscriptionWarning(problem)),
         }
+        problem
     }
 
     // ── History ───────────────────────────────────────────
@@ -1004,8 +1048,42 @@ impl Engine {
         self.settings.db().get_transcription(id)
     }
 
+    /// Delete one row, and stop offering its text to the re-copy hotkey.
+    ///
+    /// The slot holds text rather than an id, because a take is remembered
+    /// whether or not it was saved -- so it can be holding something that is in
+    /// no row at all. Text alone is therefore not identity: two rows can say
+    /// the same thing, and deleting the older of them must not move a slot that
+    /// is holding the newer. The row has to be the newest one *and* say what
+    /// the slot says. What replaces it is the newest row that survives, which
+    /// is the seed `Engine::new` starts from, so the hotkey after a delete says
+    /// the same thing as the hotkey after a restart.
     pub fn delete_transcription(&self, id: &str) -> Result<(), String> {
+        let held = self.settings.db().get_transcription(id)?.map(recopy_text);
+        let was_newest = self
+            .settings
+            .db()
+            .get_history(1)?
+            .into_iter()
+            .next()
+            .is_some_and(|newest| newest.id == id);
         self.settings.db().delete_transcription(id)?;
+
+        // Past this line the row is gone, so nothing below may turn the delete
+        // into an error or skip the event: a caller told the delete failed
+        // leaves a list on screen that no longer matches the database. A read
+        // that fails here costs the user a stale re-copy slot until the next
+        // launch, which is the smaller of the two.
+        if was_newest && held.is_some() {
+            if let Ok(rows) = self.settings.db().get_history(1) {
+                let newest = rows.into_iter().next().map(recopy_text);
+                if let Ok(mut last) = self.last_transcription.lock() {
+                    if last.as_deref() == held.as_deref() {
+                        *last = newest;
+                    }
+                }
+            }
+        }
         self.emit(EngineEvent::HistoryChanged);
         Ok(())
     }
@@ -1038,6 +1116,54 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The events a test cares about, rendered to one line each so a test can
+    /// say what the user would have been shown.
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl EngineEvents for Recorder {
+        fn emit(&self, event: EngineEvent) -> Result<(), String> {
+            let line = match event {
+                EngineEvent::RecopySuccess(message) => format!("success: {}", message),
+                EngineEvent::TranscriptionWarning(message) => format!("warning: {}", message),
+                _ => return Ok(()),
+            };
+            self.0.lock().expect("the event log").push(line);
+            Ok(())
+        }
+    }
+
+    /// An engine over a throwaway database, with a spawner nothing uses, beside
+    /// the log of what it told its host.
+    fn scratch_engine_and_events() -> (Arc<Engine>, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let dir = std::env::temp_dir().join(format!("openflow-engine-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::new(
+            dir,
+            Arc::new(Recorder(Arc::clone(&events))),
+            Box::new(|_| {}),
+        )
+        .expect("a scratch engine");
+        (engine, events)
+    }
+
+    fn scratch_engine() -> Arc<Engine> {
+        scratch_engine_and_events().0
+    }
+
+    fn stored_take(id: &str, text: &str, created_at: &str) -> Transcription {
+        Transcription {
+            id: id.to_string(),
+            raw_text: text.to_string(),
+            formatted_text: Some(text.to_string()),
+            provider: "test".to_string(),
+            duration_ms: Some(1_000),
+            context_type: None,
+            window_title: None,
+            language: None,
+            created_at: created_at.to_string(),
+        }
+    }
 
     #[test]
     fn recording_slot_frees_itself_after_the_watchdog_window() {
@@ -1074,6 +1200,177 @@ mod tests {
         assert!(should_hold(interval + Duration::from_millis(1), interval));
         // A LAN 1.7B at 20 s of audio, the case this exists for.
         assert!(should_hold(Duration::from_secs(2), interval));
+    }
+
+    /// Ctrl+Shift+V pastes the text the engine is holding, not the history
+    /// table, so deleting the newest row has to move the slot on. Re-seeding
+    /// from what is left is what launch does, and it keeps the shortcut alive.
+    #[test]
+    fn deleting_the_row_the_recopy_slot_holds_moves_it_to_the_next_one() {
+        let engine = scratch_engine();
+        let db = engine.settings().db();
+        db.save_transcription(&stored_take(
+            "older",
+            "the older take",
+            "2026-01-01T00:00:00Z",
+        ))
+        .expect("save the older take");
+        db.save_transcription(&stored_take(
+            "newer",
+            "the newest take",
+            "2026-01-02T00:00:00Z",
+        ))
+        .expect("save the newest take");
+        *engine.last_transcription.lock().expect("the slot") = Some("the newest take".to_string());
+
+        engine
+            .delete_transcription("newer")
+            .expect("delete the newest take");
+        assert_eq!(
+            engine
+                .last_transcription
+                .lock()
+                .expect("the slot")
+                .as_deref(),
+            Some("the older take"),
+            "deleting the held row must not leave its text one keystroke away"
+        );
+
+        engine
+            .delete_transcription("older")
+            .expect("delete the last take");
+        assert_eq!(
+            engine
+                .last_transcription
+                .lock()
+                .expect("the slot")
+                .as_deref(),
+            None,
+            "with no rows left there is nothing to re-copy"
+        );
+    }
+
+    /// With history saving off the slot holds a take that is in no row at all.
+    /// Deleting somebody else's row must not hand the user that row's text.
+    #[test]
+    fn deleting_a_row_the_recopy_slot_is_not_holding_leaves_it_alone() {
+        let engine = scratch_engine();
+        engine
+            .settings()
+            .db()
+            .save_transcription(&stored_take(
+                "saved",
+                "a saved take",
+                "2026-01-01T00:00:00Z",
+            ))
+            .expect("save a take");
+        *engine.last_transcription.lock().expect("the slot") =
+            Some("a take nobody saved".to_string());
+
+        engine
+            .delete_transcription("saved")
+            .expect("delete the saved take");
+        assert_eq!(
+            engine
+                .last_transcription
+                .lock()
+                .expect("the slot")
+                .as_deref(),
+            Some("a take nobody saved")
+        );
+    }
+
+    /// Two takes can say the same thing, and then the slot's text no longer
+    /// names which row it came from. Deleting an older row that happens to
+    /// match must not hand the user a different take's text -- the row has to
+    /// be the newest one as well as the matching one.
+    #[test]
+    fn deleting_an_older_row_that_reads_the_same_leaves_the_slot_alone() {
+        let engine = scratch_engine();
+        let db = engine.settings().db();
+        db.save_transcription(&stored_take("old", "same words", "2026-01-01T00:00:00Z"))
+            .expect("save the older take");
+        db.save_transcription(&stored_take(
+            "new",
+            "something else",
+            "2026-01-02T00:00:00Z",
+        ))
+        .expect("save the newer take");
+        // What the user just dictated, with history saving off: in no row.
+        *engine.last_transcription.lock().expect("the slot") = Some("same words".to_string());
+
+        engine
+            .delete_transcription("old")
+            .expect("delete the older take");
+
+        assert_eq!(
+            engine
+                .last_transcription
+                .lock()
+                .expect("the slot")
+                .as_deref(),
+            Some("same words"),
+            "an older row that only reads the same is not the take being held"
+        );
+    }
+
+    /// The tray and the History window both offer a row the database may no
+    /// longer have. Claiming a paste that never happened is the one answer that
+    /// leaves the user hunting for text that was never inserted.
+    #[test]
+    fn re_inserting_a_row_that_is_gone_says_so_instead_of_claiming_success() {
+        let (engine, events) = scratch_engine_and_events();
+
+        let problem = engine.paste_transcription("a row nobody has");
+
+        assert_eq!(
+            problem.as_deref(),
+            Some("That transcription is no longer in history.")
+        );
+        assert_eq!(
+            events.lock().expect("the event log").as_slice(),
+            ["warning: That transcription is no longer in history.".to_string()]
+        );
+    }
+
+    /// A cancel is only seen where something looks for it, and the last look
+    /// used to be before the plugin hooks -- which block for as long as five
+    /// seconds. By the time one returns the take is one step from the disk and
+    /// one step from the user's editor, and a cancelled take may take neither.
+    ///
+    /// The take carries no text on purpose: if this ever regresses, the
+    /// insertion it would then attempt has nothing to type into whatever window
+    /// happens to be focused while the suite runs.
+    #[test]
+    fn a_cancelled_take_is_neither_saved_nor_inserted() {
+        let engine = scratch_engine();
+        engine
+            .settings()
+            .db()
+            .set_setting("insert_method", "type")
+            .expect("an insertion with nothing to insert");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let outcome = engine.finish_take(
+            &cancellation,
+            stored_take("cancelled", "", "2026-01-01T00:00:00Z"),
+        );
+
+        assert_eq!(outcome.err().as_deref(), Some("Transcription cancelled"));
+        assert!(
+            engine.history(10).expect("history").is_empty(),
+            "a cancelled take must not be on disk"
+        );
+        assert_eq!(
+            engine
+                .last_transcription
+                .lock()
+                .expect("the slot")
+                .as_deref(),
+            None,
+            "a cancelled take must not be one keystroke away either"
+        );
     }
 
     #[test]
