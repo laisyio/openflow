@@ -25,7 +25,7 @@
 //! the Dictate page takes first responder when it comes forward so the key
 //! reaches the button without a Tab first.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use objc2::rc::Retained;
@@ -38,6 +38,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
 
 use openflow_core::engine::{Engine, RecordingState};
+use openflow_core::insert::InsertMethod;
 
 use crate::hotkeys;
 use crate::ui::card::{Card, GAP, MARGIN, PADDING};
@@ -174,6 +175,10 @@ pub struct DictateIvars {
     /// The full text behind the truncated card, so clicking it copies all of
     /// what was said rather than what fits.
     last: RefCell<Option<String>>,
+    /// What the page is currently showing. Kept because the idle copy depends
+    /// on settings as well as on state, so `load` has to redraw the state it is
+    /// already in rather than assume it is idle.
+    state: Cell<RecordingState>,
 }
 
 define_class!(
@@ -241,6 +246,7 @@ impl DictatePage {
             view,
             controls,
             last: RefCell::new(None),
+            state: Cell::new(RecordingState::Idle),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -283,8 +289,10 @@ impl DictatePage {
             .controls
             .hint
             .setStringValue(&NSString::from_str(&format!(
-                "{} works from any app  ·  {} pastes again",
-                record, recopy
+                "{} works from any app  ·  {} {} again",
+                record,
+                recopy,
+                insertion_verb(settings.insert_method())
             )));
 
         let newest = ivars
@@ -309,6 +317,10 @@ impl DictatePage {
                     .setStringValue(&NSString::from_str(""));
             }
         }
+
+        // The panel copy names the insert method too, so redraw whatever state
+        // the page is in rather than leaving yesterday's sentence up.
+        self.set_state(ivars.state.get());
     }
 
     /// Show `text` on the result card, with `caption` above it.
@@ -332,6 +344,11 @@ impl DictatePage {
     /// folds it: the pipeline never emits it, and inventing a fourth panel here
     /// would be inventing a state the engine does not have.
     pub fn set_state(&self, state: RecordingState) {
+        self.ivars().state.set(state);
+        let settings = self.ivars().engine.settings();
+        let cleanup = settings.format_enabled();
+        let idle_body = idle_body(cleanup, settings.insert_method());
+        let transcribing_body = transcribing_body(cleanup, settings.is_local_backend());
         let controls = &self.ivars().controls;
         let (eyebrow, title, body, action, enabled, cancel) = match state {
             RecordingState::Recording => (
@@ -345,7 +362,7 @@ impl DictatePage {
             RecordingState::Transcribing | RecordingState::Formatting => (
                 "Turning speech into text",
                 "One moment\u{2026}",
-                "Your provider is transcribing and formatting the result.",
+                transcribing_body,
                 "Transcribing\u{2026}",
                 false,
                 true,
@@ -353,7 +370,7 @@ impl DictatePage {
             RecordingState::Idle => (
                 "Ready when you are",
                 "Hold to speak",
-                "Release when you\u{2019}re done. OpenFlow cleans it up and pastes it for you.",
+                idle_body.as_str(),
                 "Hold to record",
                 true,
                 false,
@@ -384,6 +401,51 @@ fn preview_of(text: &str) -> String {
 /// The binding for `action` as the recorder spells it. Same helper Settings
 /// uses, kept separate rather than shared because the two screens are allowed
 /// to disagree about what to say when nothing is bound.
+/// "pastes" or "types", because they are not the same promise. Paste sends Cmd+V
+/// and takes the clipboard with it; Type sends the characters and never touches
+/// it. The Settings page spells the difference out one screen away, so the main
+/// screen should not tell every user it pastes.
+fn insertion_verb(method: InsertMethod) -> &'static str {
+    match method {
+        InsertMethod::Paste => "pastes",
+        InsertMethod::Type => "types",
+    }
+}
+
+/// What the idle panel promises will happen when the key comes up.
+///
+/// Both halves of it are settings: cleanup can be off, and the text can be
+/// typed rather than pasted. The line was fixed copy that claimed both, so on a
+/// machine with Smart cleanup off and Insert text by set to Type -- a
+/// combination the Settings page offers on purpose -- the first sentence a user
+/// reads on the main screen described someone else's setup.
+fn idle_body(cleanup: bool, method: InsertMethod) -> String {
+    let verb = insertion_verb(method);
+    if cleanup {
+        format!("Release when you\u{2019}re done. OpenFlow cleans it up and {verb} it for you.")
+    } else {
+        format!("Release when you\u{2019}re done. OpenFlow {verb} it for you.")
+    }
+}
+
+/// What the waiting panel says is happening, while it happens.
+///
+/// The same two settings as the idle line, read one panel later. It claimed
+/// "Your provider is transcribing and formatting the result" on every machine,
+/// which is two claims and both can be false: cleanup can be off, and on the
+/// local backend there is no provider in it at all -- the sidecar runs on this
+/// Mac, which is the whole promise of that setting. Cleanup is the exception
+/// worth spelling out, because it does go to the provider even on the local
+/// backend: the sidecar transcribes and nothing else.
+fn transcribing_body(cleanup: bool, local: bool) -> &'static str {
+    match (local, cleanup) {
+        (false, true) => "Your provider is transcribing and formatting the result.",
+        (false, false) => "Your provider is transcribing the recording.",
+        (true, true) => "OpenFlow is transcribing on this Mac, then your provider cleans it up.",
+        (true, false) => "OpenFlow is transcribing on this Mac.",
+    }
+}
+
 fn binding_text(settings: &openflow_core::settings::Settings, action: &str) -> String {
     settings
         .shortcut(action)
@@ -658,6 +720,68 @@ mod tests {
         let preview = preview_of(&long);
         assert_eq!(preview.chars().count(), RESULT_CHARS + 1);
         assert!(preview.ends_with('\u{2026}'));
+    }
+
+    /// Neither half of the idle promise is fixed, so neither is claimed when
+    /// it is off. The combination that matters is the last one: Smart cleanup
+    /// off and Insert text by set to Type is a setup the Settings page offers
+    /// on purpose, and the sentence used to describe someone else's.
+    #[test]
+    fn the_idle_panel_promises_only_what_the_settings_do() {
+        assert_eq!(
+            idle_body(true, InsertMethod::Paste),
+            "Release when you\u{2019}re done. OpenFlow cleans it up and pastes it for you."
+        );
+        assert_eq!(
+            idle_body(false, InsertMethod::Paste),
+            "Release when you\u{2019}re done. OpenFlow pastes it for you."
+        );
+        assert_eq!(
+            idle_body(false, InsertMethod::Type),
+            "Release when you\u{2019}re done. OpenFlow types it for you."
+        );
+    }
+
+    /// Paste and Type are different promises about the user's clipboard, which
+    /// is why the Settings page spells the difference out. The main screen must
+    /// not tell every user it pastes.
+    #[test]
+    fn the_insertion_verb_follows_the_insert_method() {
+        assert_eq!(insertion_verb(InsertMethod::Paste), "pastes");
+        assert_eq!(insertion_verb(InsertMethod::Type), "types");
+    }
+
+    /// The waiting panel makes the same two claims one panel later, and both
+    /// can be false. "Your provider" is the one to watch: on the local backend
+    /// the transcription happens on this Mac, and saying otherwise contradicts
+    /// the setting the user turned on to stop it leaving.
+    #[test]
+    fn the_waiting_panel_does_not_name_a_provider_that_is_not_involved() {
+        assert!(transcribing_body(true, false).contains("provider"));
+        assert!(transcribing_body(false, false).contains("provider"));
+
+        assert!(
+            !transcribing_body(false, true).contains("provider"),
+            "on-device with cleanup off, no provider sees the take at all"
+        );
+        // Cleanup is the exception: it goes to the provider even on the local
+        // backend, so this one names both.
+        let both = transcribing_body(true, true);
+        assert!(both.contains("this Mac"), "{both}");
+        assert!(both.contains("provider"), "{both}");
+    }
+
+    /// Formatting is claimed only when it will happen.
+    #[test]
+    fn the_waiting_panel_claims_formatting_only_when_cleanup_is_on() {
+        for local in [false, true] {
+            assert!(
+                !transcribing_body(false, local).contains("formatting")
+                    && !transcribing_body(false, local).contains("cleans it up"),
+                "cleanup is off: {}",
+                transcribing_body(false, local)
+            );
+        }
     }
 
     /// The centring constant has to be the sum of the steps `build_content`
