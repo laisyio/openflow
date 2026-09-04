@@ -1115,6 +1115,7 @@ pub(crate) mod tests {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             let seen = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                            stream.set_nonblocking(false).ok();
                             stream
                                 .set_read_timeout(Some(Duration::from_millis(500)))
                                 .ok();
