@@ -32,6 +32,7 @@ use objc2_foundation::{
 };
 
 use openflow_core::engine::Engine;
+use openflow_core::settings::Settings;
 use openflow_core::speech::SpeechRequest;
 use openflow_core::transcribe::ModelInfo;
 
@@ -676,6 +677,9 @@ impl SettingsPage {
                 .unwrap_or_default(),
         );
         set_switch(&controls.format_enabled, settings.format_enabled());
+        if let Err(error) = self.apply_cleanup_capability() {
+            self.set_text(&controls.models_status, &error);
+        }
         self.set_combo(
             &controls.stt_model,
             &settings.stt_model().unwrap_or_default(),
@@ -845,13 +849,16 @@ impl SettingsPage {
                 self.apply_local_only_gating();
                 written
             }
-            TAG_PROVIDER | TAG_PROVIDER_URL => settings.set(
-                "provider",
-                &join_provider(
-                    selected_value(&controls.provider, PROVIDERS),
-                    &string_value(&controls.provider_url),
-                ),
-            ),
+            TAG_PROVIDER | TAG_PROVIDER_URL => {
+                let written = settings.set(
+                    "provider",
+                    &join_provider(
+                        selected_value(&controls.provider, PROVIDERS),
+                        &string_value(&controls.provider_url),
+                    ),
+                );
+                written.and(self.apply_cleanup_capability())
+            }
             TAG_API_KEY => settings.set("api_key", string_value(&controls.api_key).trim()),
             TAG_SAME_PROVIDER => settings.set(
                 "same_provider",
@@ -922,6 +929,54 @@ impl SettingsPage {
             .get(index)
             .unwrap_or(&openflow_core::runner::LOCAL_MODELS[0]);
         self.set_text(&controls.local_cost, model.cost);
+    }
+
+    /// Keep "Same for cleanup" away from a transcription provider that cannot
+    /// run the cleanup pass, and show why rather than failing later.
+    ///
+    /// Called from `reload` as well as on a change, so that a database written
+    /// before this existed is brought into the same shape as one written after
+    /// it. Without that, the cleanup row would go on displaying a provider the
+    /// engine does not use, because an unset `formatting_provider` reads back
+    /// as the transcription one.
+    ///
+    /// What this does not do is make a keyless install able to dictate. It
+    /// stops Deepgram being handed a pass it refuses; the pass then goes to the
+    /// row's own provider, and if that one has no key `format_text` fails there
+    /// instead. That is the same shape the wizard already lands in
+    /// (`onboarding.rs::save` writes `formatting_provider` from a list Deepgram
+    /// is filtered out of, and its first entry is Groq), and the reason it
+    /// costs the whole take rather than just the cleanup is one `?` in
+    /// `engine.rs`. That is a product decision and it is filed separately.
+    fn apply_cleanup_capability(&self) -> Result<(), String> {
+        let ivars = self.ivars();
+        let controls = &ivars.controls;
+        let settings = ivars.engine.settings();
+        let stored = settings.provider_name();
+        let serves = serves_cleanup(&split_provider(&stored).0);
+        controls.same_provider.setEnabled(serves);
+        if serves {
+            return Ok(());
+        }
+        store_transcription_provider(
+            settings,
+            &stored,
+            selected_value(&controls.formatting_provider, FORMATTING_PROVIDERS),
+            &string_value(&controls.formatting_url),
+        )?;
+        set_switch(&controls.same_provider, false);
+        let (cleanup, cleanup_url) = split_provider(
+            &settings
+                .formatting_provider_name()
+                .unwrap_or_else(|| settings.provider_name()),
+        );
+        select_value(
+            &controls.formatting_provider,
+            FORMATTING_PROVIDERS,
+            &cleanup,
+        );
+        self.set_text(&controls.formatting_url, &cleanup_url);
+        Ok(())
     }
 
     /// What "Local only" turns off.
@@ -1336,6 +1391,55 @@ pub fn join_provider(kind: &str, url: &str) -> String {
     } else {
         kind.to_string()
     }
+}
+
+/// Whether a provider offered for transcription can also run the cleanup pass.
+///
+/// The cleanup menu is the list that knows: Deepgram transcribes and has no
+/// chat endpoint, which is why it is missing from `FORMATTING_PROVIDERS`. Both
+/// of the ways the window can hand cleanup a provider go around that menu, so
+/// they have to ask the same question themselves.
+pub fn serves_cleanup(kind: &str) -> bool {
+    FORMATTING_PROVIDERS.iter().any(|(value, _)| *value == kind)
+}
+
+/// Store a transcription provider without leaving the cleanup pass pointed at
+/// one that refuses to run.
+///
+/// The wizard already handles this (`onboarding.rs`, following the web
+/// wizard's `src/App.tsx:934`): choosing Deepgram there switches "Same for
+/// cleanup" off. Settings wrote the provider string and nothing else, and both
+/// routes back to the cleanup provider then led to Deepgram -- `same_provider`
+/// because it hands the transcription provider straight over, and an unset
+/// `formatting_provider` because [`openflow_core::settings::Settings`] falls
+/// back to the transcription one. `transcribe::format_text` refuses Deepgram
+/// outright and the pipeline propagates that refusal, so the take was
+/// abandoned: not a cleanup that was skipped, but the transcribed text thrown
+/// away after the work of producing it.
+///
+/// `shown_cleanup` is what the cleanup row is displaying, so that repairing
+/// the stored value leaves the screen and the engine saying the same thing.
+pub fn store_transcription_provider(
+    settings: &Settings,
+    provider: &str,
+    shown_cleanup: &str,
+    shown_cleanup_url: &str,
+) -> Result<(), String> {
+    settings.set("provider", provider)?;
+    if serves_cleanup(&split_provider(provider).0) {
+        return Ok(());
+    }
+    settings.set("same_provider", bool_setting(false))?;
+    let cleanup_stands = settings
+        .formatting_provider_name()
+        .is_some_and(|stored| serves_cleanup(&split_provider(&stored).0));
+    if !cleanup_stands {
+        settings.set(
+            "formatting_provider",
+            &join_provider(shown_cleanup, shown_cleanup_url),
+        )?;
+    }
+    Ok(())
 }
 
 // ── Tab construction ──────────────────────────────────────
@@ -2158,6 +2262,73 @@ mod tests {
         assert_eq!(human_bytes(2_792_422_202), "2.6 GB");
         assert_eq!(human_bytes(142_442_496), "136 MB");
         assert_eq!(human_bytes(0), "0 MB");
+    }
+
+    /// A `Settings` over a database of its own, so a test can write the rows
+    /// the window writes and read back the value the engine would read.
+    fn temp_settings() -> (Settings, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("openflow-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = openflow_core::db::Database::new(dir.clone()).expect("database");
+        let settings = Settings::new(db, openflow_core::secrets::SecretStore::new(dir.clone()));
+        (settings, dir)
+    }
+
+    /// Which provider `Engine::run_pipeline_inner` will hand `format_text`,
+    /// spelled the same way it spells it: the transcription provider while
+    /// "Same for cleanup" is on, and otherwise the cleanup row, which falls
+    /// back to the transcription provider when it has never been set.
+    fn cleanup_provider(settings: &Settings) -> String {
+        if settings.same_provider() {
+            settings.provider_name()
+        } else {
+            settings
+                .formatting_provider_name()
+                .unwrap_or_else(|| settings.provider_name())
+        }
+    }
+
+    /// Every provider this tab offers for transcription, stored the way the tab
+    /// stores it, has to leave the cleanup pass pointed at a provider that will
+    /// actually run it.
+    ///
+    /// Deepgram did not. `transcribe::format_text` refuses it outright and the
+    /// pipeline propagates that refusal, so the cost was not a cleanup that got
+    /// skipped -- it was the whole take abandoned and the transcribed text
+    /// dropped, on every dictation, until the user found the setting again.
+    /// The wizard has refused this since `src/App.tsx:934`; this tab did not.
+    #[test]
+    fn no_transcription_provider_leaves_cleanup_pointed_at_one_that_refuses_it() {
+        for (kind, _) in PROVIDERS {
+            let (settings, dir) = temp_settings();
+            let stored = join_provider(kind, "http://192.168.100.203:8881/v1");
+            store_transcription_provider(&settings, &stored, FORMATTING_PROVIDERS[0].0, "")
+                .expect("store");
+            let cleanup = cleanup_provider(&settings);
+            let survived = serves_cleanup(&split_provider(&cleanup).0);
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                survived,
+                "choosing {kind} for transcription left the cleanup pass on {cleanup}"
+            );
+        }
+    }
+
+    /// The repair points the cleanup pass somewhere it can run; it does not get
+    /// to overrule a provider the user picked for it.
+    #[test]
+    fn repairing_the_cleanup_provider_leaves_a_working_choice_alone() {
+        let (settings, dir) = temp_settings();
+        settings.set("formatting_provider", "openai").expect("set");
+        store_transcription_provider(&settings, "deepgram", "groq", "").expect("store");
+        let chosen = settings.formatting_provider_name();
+        let same = settings.same_provider();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(chosen.as_deref(), Some("openai"));
+        assert!(
+            !same,
+            "the toggle that hands Deepgram the cleanup pass is off"
+        );
     }
 
     /// The two boolean spellings the settings table understands.
