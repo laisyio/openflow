@@ -37,7 +37,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
 
-use openflow_core::engine::{Engine, RecordingState};
+use openflow_core::engine::{Engine, EngineEvent, RecordingState};
 
 use crate::hotkeys;
 use crate::ui::card::{Card, GAP, MARGIN, PADDING};
@@ -174,6 +174,10 @@ pub struct DictateIvars {
     /// The full text behind the truncated card, so clicking it copies all of
     /// what was said rather than what fits.
     last: RefCell<Option<String>>,
+    /// Set while the card is reporting a failure instead of a transcript, to
+    /// where in the app that failure is answered. The card is the page's
+    /// "what just happened", and what just happened was the failure.
+    problem: RefCell<Option<String>>,
 }
 
 define_class!(
@@ -209,6 +213,15 @@ define_class!(
         /// than at the app they would want the text typed into.
         #[unsafe(method(copyLast:))]
         fn copy_last(&self, _sender: &NSControl) {
+            // While the card is reporting a failure it is the way to the screen
+            // that answers it, not a copy of a transcript that never arrived.
+            let problem = self.ivars().problem.borrow().clone();
+            if let Some(target) = problem {
+                crate::app::with_app(|app| {
+                    app.handle_event(EngineEvent::Navigate(target));
+                });
+                return;
+            }
             let text = self.ivars().last.borrow().clone();
             let Some(text) = text else {
                 return;
@@ -241,6 +254,7 @@ impl DictatePage {
             view,
             controls,
             last: RefCell::new(None),
+            problem: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -287,6 +301,15 @@ impl DictatePage {
                 record, recopy
             )));
 
+        // The card is the page's "what just happened", and while a take has
+        // failed that is the failure -- not the take before it. Reloading is
+        // what every navigation into this page does, so without this the
+        // menu-bar item that offers to fix the failure would clear the copy of
+        // it on the way to the screen that answers it.
+        if ivars.problem.borrow().is_some() {
+            return;
+        }
+
         let newest = ivars
             .engine
             .history(1)
@@ -311,9 +334,40 @@ impl DictatePage {
         }
     }
 
+    /// Report a failure on the result card, and offer the screen that answers
+    /// it. `target` is a [`openflow_core::engine::EngineEvent::Navigate`] name,
+    /// or `None` when there is nowhere useful to go.
+    pub fn set_problem(&self, message: &str, target: Option<&str>) {
+        let ivars = self.ivars();
+        *ivars.problem.borrow_mut() = target.map(str::to_string);
+        ivars
+            .controls
+            .result
+            .setTitle(&NSString::from_str(&preview_of(message)));
+        // Readable either way; clickable only when the click leads somewhere.
+        ivars.controls.result.setEnabled(target.is_some());
+        ivars
+            .controls
+            .result_caption
+            .setStringValue(&NSString::from_str(match target {
+                Some(_) => "That take did not finish \u{2014} click to fix it",
+                None => "That take did not finish",
+            }));
+    }
+
+    /// Put the card back to the last transcript once the failure is answered.
+    pub fn clear_problem(&self) {
+        if self.ivars().problem.borrow().is_none() {
+            return;
+        }
+        *self.ivars().problem.borrow_mut() = None;
+        self.load();
+    }
+
     /// Show `text` on the result card, with `caption` above it.
     pub fn set_last(&self, text: &str, caption: &str) {
         let ivars = self.ivars();
+        *ivars.problem.borrow_mut() = None;
         *ivars.last.borrow_mut() = Some(text.to_string());
         ivars
             .controls

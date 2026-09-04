@@ -29,7 +29,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol};
 
-use openflow_core::engine::{Engine, EngineEvent, EngineEvents, Spawner};
+use openflow_core::engine::{Engine, EngineEvent, EngineEvents, Failure, RecordingState, Spawner};
 
 use crate::events::{NativeEvents, PreviewGate};
 use crate::hotkeys::Hotkeys;
@@ -119,6 +119,10 @@ impl App {
 
     pub fn overlay(&self) -> &Overlay {
         &self.overlay
+    }
+
+    pub fn tray(&self) -> &Tray {
+        &self.tray
     }
 
     pub fn tts(&self) -> &TtsPlayer {
@@ -212,6 +216,12 @@ impl App {
                 // that is not Recording or Transcribing as the resting state
                 // rather than inventing a fourth pill.
                 self.overlay.set_state(state);
+                // Starting a take answers the last one: the user has seen the
+                // failure and is trying again, and a menu bar still reporting
+                // it would be reporting the wrong take.
+                if state == RecordingState::Recording {
+                    self.clear_problem();
+                }
                 self.tray.set_status(state);
                 self.with_main(|window| window.set_state(state));
             }
@@ -221,6 +231,13 @@ impl App {
                     .as_deref()
                     .unwrap_or(&transcription.raw_text);
                 self.notify("OpenFlow", &first_line(text));
+                // Deliberately not clearing the standing problem here. A take
+                // can arrive *with* one -- "not saved to history" is the take
+                // being handed over and the write having failed -- and this
+                // event is emitted after the warning that says so. Clearing
+                // here wiped the warning with the very take it was about. The
+                // capture that starts the next take clears it instead, which is
+                // also the point at which it stops being about this one.
                 self.overlay.show_outcome(Outcome::Done);
                 // The web screen's result button, which says the text is on the
                 // clipboard because the pipeline has just put it there.
@@ -231,14 +248,17 @@ impl App {
             EngineEvent::TranscriptionPartial(partial) => {
                 self.overlay.set_partial(&partial.text, partial.held)
             }
-            EngineEvent::TranscriptionWarning(warning) => self.notify("OpenFlow", &warning),
+            // A take that arrived with something wrong with it. The text is
+            // the user's and has been handed over; the problem still stands,
+            // and stands in the same place a failure would.
+            EngineEvent::TranscriptionWarning(warning) => self.show_problem(warning),
             // Report it and stop there. The engine decides when the pill rests,
             // through `emit_idle_if_quiescent`, which only says "idle" once no
             // capture is running and no job is left. Forcing idle here would
             // blank the pill mid-recording whenever a previous take failed
             // while the user was already holding the key down again.
             EngineEvent::TranscriptionError(error) => {
-                self.notify("OpenFlow could not finish", &error);
+                self.show_problem(error);
                 self.overlay.show_outcome(Outcome::Error);
             }
             EngineEvent::RecopySuccess(message) => self.notify("OpenFlow", &message),
@@ -304,8 +324,37 @@ impl App {
     /// A one-line status message. There is no notification centre entitlement in
     /// this build, so the status item's tooltip carries it: visible, free, and
     /// it cannot steal focus from whatever the user is dictating into.
+    ///
+    /// For anything that went wrong use [`App::show_problem`] instead. A
+    /// tooltip written here lasts until the next thing writes one, and the
+    /// settling that follows every take is one of those. It is also refused
+    /// outright while a failure is standing.
     fn notify(&self, title: &str, body: &str) {
         self.tray.set_tooltip(&format!("{}: {}", title, body));
+    }
+
+    /// Put a failure where the user can still find it a minute later, and next
+    /// to the thing that answers it.
+    ///
+    /// Three surfaces, because a `LSUIElement` app has no one place a user is
+    /// certain to be looking: the menu bar line (always there), the item under
+    /// it that opens the group in Settings that answers this failure, and the
+    /// result card on Dictate for whoever has the window open.
+    fn show_problem(self: &Rc<Self>, problem: Failure) {
+        let target = problem.remedy.map(|remedy| remedy.target());
+        let message = problem.message.clone();
+        if self.tray.set_problem(Some(problem)) {
+            self.tray.rebuild(&self.engine);
+        }
+        self.with_main(|window| window.dictate().set_problem(&message, target));
+    }
+
+    /// Take the standing failure down, once it has been answered.
+    fn clear_problem(self: &Rc<Self>) {
+        if self.tray.set_problem(None) {
+            self.tray.rebuild(&self.engine);
+        }
+        self.with_main(|window| window.dictate().clear_problem());
     }
 }
 

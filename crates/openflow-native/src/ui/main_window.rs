@@ -706,6 +706,7 @@ fn build_sidebar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openflow_core::engine::Remedy;
 
     /// Every name the tray and `Navigate` send has a page behind it. These are
     /// the literals in `tray.rs` and in `App::handle_event`, so a page renamed
@@ -746,6 +747,33 @@ mod tests {
     fn the_settings_index_names_the_settings_page() {
         assert_eq!(PAGES[SETTINGS].0, "Settings");
         assert_eq!(page_index("settings"), Some(SETTINGS));
+    }
+
+    /// Every remedy the engine can attach to a failure has to name something
+    /// this window opens, in the same two vocabularies `show_named` tries.
+    ///
+    /// The tray offers "Fix this in ..." only when a remedy exists, so a target
+    /// nothing answers to would be an item that opens the window and leaves it
+    /// wherever the user last was -- an offer of help that lands nowhere. This
+    /// is the seam between a core enum and a native screen, and nothing else
+    /// checks it.
+    #[test]
+    fn every_remedy_the_engine_can_attach_opens_something() {
+        for remedy in [
+            Remedy::Microphone,
+            Remedy::Providers,
+            Remedy::Plugins,
+            Remedy::History,
+        ] {
+            let target = remedy.target();
+            assert!(
+                page_index(target).is_some()
+                    || crate::ui::settings::section_index(target).is_some(),
+                "{:?} names {:?}, which this window cannot open",
+                remedy,
+                target
+            );
+        }
     }
 
     /// The group names inside Settings must not collide with page names, or
