@@ -18,14 +18,26 @@
 //!
 //! It answers the keyboard for the same reason the web screen does. A control
 //! whose only gesture is "hold the mouse down on it" cannot be operated from
-//! the keyboard at all, and `AXPress` -- which is what assistive technology and
-//! every scripted click send -- fires an action this button does not have, so
-//! it would do nothing. Space and Return press and release it, `isARepeat`
+//! the keyboard at all. Space and Return press and release it, `isARepeat`
 //! drops the auto-repeat of a held key so the press is not delivered twice, and
 //! the Dictate page takes first responder when it comes forward so the key
 //! reaches the button without a Tab first.
+//!
+//! The keyboard is not enough for VoiceOver, which walks the screen with its
+//! own cursor and never moves the first responder, so the Space key above is
+//! not a way in for it. What VoiceOver sends -- and what every scripted click
+//! sends -- is `AXPress`, and `NSButton` answers that by asking its cell to
+//! `performClick:`, which sends the button's *action*. This button has no
+//! action; its overrides send two selectors of their own to the target. So the
+//! press was accepted, reported as handled, and did nothing at all.
+//!
+//! [`HoldButton::accessibility_perform_press`] closes that. It does not try to
+//! make `AXPress` hold, which one instant cannot express: it hands the two
+//! edges out one press at a time, so the first press starts the capture and the
+//! next one ends it, and `accessibilityHelp` says so out loud because the
+//! visible title still reads "Hold to record".
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use objc2::rc::Retained;
@@ -62,13 +74,23 @@ const RESULT_CHARS: usize = 220;
 
 // ── The hold button ───────────────────────────────────────
 
+/// Whether the button is mid-hold. Only the `AXPress` path reads it: the mouse
+/// and the keyboard each bring their own down edge and up edge, but a press is
+/// a single instant with no "still held", so that path has to remember which
+/// half it owes. `Cell<bool>` so the class still implements no Drop.
+#[derive(Default)]
+pub struct HoldButtonIvars {
+    holding: Cell<bool>,
+}
+
 define_class!(
-    // SAFETY: `NSButton` is designed for subclassing, this class adds no ivars
-    // and implements no Drop, and both methods are ones AppKit already defines
-    // with this signature.
+    // SAFETY: `NSButton` is designed for subclassing, this class holds only a
+    // `Cell<bool>` and implements no Drop, and every method here is one AppKit
+    // already defines with this signature.
     #[unsafe(super(NSButton))]
     #[thread_kind = MainThreadOnly]
     #[name = "OpenFlowHoldButton"]
+    #[ivars = HoldButtonIvars]
     pub struct HoldButton;
 
     impl HoldButton {
@@ -81,14 +103,12 @@ define_class!(
             if !self.isEnabled() {
                 return;
             }
-            self.setHighlighted(true);
-            self.send(sel!(holdBegan:));
+            self.begin_hold();
         }
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
-            self.setHighlighted(false);
-            self.send(sel!(holdEnded:));
+            self.end_hold();
         }
 
         /// Focusable, so Space and Return can reach it. A disabled button is
@@ -112,8 +132,7 @@ define_class!(
             if event.isARepeat() || !self.isEnabled() {
                 return;
             }
-            self.setHighlighted(true);
-            self.send(sel!(holdBegan:));
+            self.begin_hold();
         }
 
         #[unsafe(method(keyUp:))]
@@ -122,11 +141,49 @@ define_class!(
                 let _: () = unsafe { msg_send![super(self), keyUp: event] };
                 return;
             }
-            self.setHighlighted(false);
-            self.send(sel!(holdEnded:));
+            self.end_hold();
+        }
+
+        /// The only way in that does not need a mouse or the first responder.
+        /// VoiceOver's VO-Space and every scripted click arrive here, and
+        /// `NSButton`'s own answer -- `performClick:`, which sends the action --
+        /// is a no-op on a button whose action is nil, which this one's is.
+        ///
+        /// A press is one instant and a hold is two edges, so one press cannot
+        /// be both: the press alternates instead, starting the capture and then
+        /// ending it. Returning false while disabled is how the transcribing
+        /// state refuses a second capture, the same as `mouseDown:` does.
+        ///
+        /// Written without an early return: `define_class!` rewrites the body
+        /// to hand AppKit an ObjC `BOOL`, and only the tail expression is
+        /// converted for it.
+        #[unsafe(method(accessibilityPerformPress))]
+        fn accessibility_perform_press(&self) -> bool {
+            if !self.isEnabled() {
+                false
+            } else {
+                if self.ivars().holding.get() {
+                    self.end_hold();
+                } else {
+                    self.begin_hold();
+                }
+                true
+            }
+        }
+
+        /// Said out loud because the visible title cannot be: it reads "Hold to
+        /// record", and holding is exactly what this path does not do.
+        #[unsafe(method_id(accessibilityHelp))]
+        fn accessibility_help(&self) -> Retained<NSString> {
+            NSString::from_str(PRESS_HELP)
         }
     }
 );
+
+/// What VoiceOver reads after the button's title. Spelled as two presses
+/// because that is what `accessibilityPerformPress` above actually does.
+const PRESS_HELP: &str =
+    "Press to start recording, then press again to stop. Holding the button works too.";
 
 /// Space or Return, the two keys the web screen's `record-button` listens for.
 /// Read from the key code rather than the characters so a non-Latin keyboard
@@ -141,6 +198,23 @@ const KEY_SPACE: u16 = 49;
 const KEY_ENTER: u16 = 76;
 
 impl HoldButton {
+    /// The down edge, whichever of the three gestures brought it. Recording the
+    /// hold here rather than in each of them is what keeps the `AXPress` toggle
+    /// in step with a mouse or a key that got there first.
+    fn begin_hold(&self) {
+        self.ivars().holding.set(true);
+        self.setHighlighted(true);
+        self.send(sel!(holdBegan:));
+    }
+
+    /// The up edge. Unconditional, like `mouseUp:` has always been: a release
+    /// with no press behind it is the engine's to ignore, not this button's.
+    fn end_hold(&self) {
+        self.ivars().holding.set(false);
+        self.setHighlighted(false);
+        self.send(sel!(holdEnded:));
+    }
+
     /// Send `selector` to whatever this button's target is. The target is
     /// `NSControl`'s ordinary weak property, so the page owns the button and
     /// the button does not own the page.
@@ -633,16 +707,75 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
 
 impl HoldButton {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
-        let this = Self::alloc(mtm);
+        let this = Self::alloc(mtm).set_ivars(HoldButtonIvars::default());
         // SAFETY: `initWithFrame:` is `NSView`'s designated initialiser, which
         // `NSButton` inherits.
-        unsafe { msg_send![this, initWithFrame: frame] }
+        unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2::ClassType;
+
+    /// Whether `OpenFlowHoldButton` implements `selector` itself rather than
+    /// inheriting it. `class_copyMethodList`, which is what this reads, lists
+    /// only a class's own methods, so it answers exactly that question without
+    /// needing an instance -- and an instance would need the main thread and a
+    /// window, which a test does not have.
+    fn overrides(selector: objc2::runtime::Sel) -> bool {
+        HoldButton::class()
+            .instance_methods()
+            .iter()
+            .any(|method| method.name() == selector)
+    }
+
+    /// The button has to answer `AXPress` itself. Inheriting it is not
+    /// harmless: `NSButton` answers `AXPress` by asking its cell to
+    /// `performClick:`, which sends the button's action, and this button has no
+    /// action -- so the press is accepted, reported as handled, and does
+    /// nothing. VoiceOver sends nothing else, because its cursor never moves
+    /// the first responder and so never reaches the Space key path below, which
+    /// leaves the whole Dictate page unusable with VoiceOver on.
+    #[test]
+    fn the_hold_button_answers_press_itself() {
+        assert!(
+            overrides(sel!(accessibilityPerformPress)),
+            "HoldButton inherits NSButton's accessibilityPerformPress, which \
+             clicks a nil action and does nothing"
+        );
+    }
+
+    /// A press cannot be a hold, so the press has to be spelled out. The
+    /// visible title says "Hold to record" and cannot say anything else.
+    #[test]
+    fn the_press_help_names_both_presses() {
+        assert!(
+            overrides(sel!(accessibilityHelp)),
+            "HoldButton has no accessibilityHelp, so VoiceOver reads only the \
+             title, which describes a gesture the press path does not use"
+        );
+        let help = PRESS_HELP.to_lowercase();
+        assert!(help.contains("press to start"), "{PRESS_HELP}");
+        assert!(help.contains("press again"), "{PRESS_HELP}");
+    }
+
+    /// The press is an addition, not a replacement: the mouse and the keyboard
+    /// are still the two gestures that carry a real hold, and a control that
+    /// stopped taking first responder would lose the keyboard entirely.
+    #[test]
+    fn the_hold_button_keeps_the_mouse_and_the_keyboard() {
+        for selector in [
+            sel!(mouseDown:),
+            sel!(mouseUp:),
+            sel!(keyDown:),
+            sel!(keyUp:),
+            sel!(acceptsFirstResponder),
+        ] {
+            assert!(overrides(selector), "{selector:?} is no longer overridden");
+        }
+    }
 
     /// The card shows one line, so newlines and runs of spaces collapse.
     #[test]
