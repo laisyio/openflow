@@ -49,6 +49,7 @@ impl EngineEvents for TauriEvents {
             // host), but the event is forwarded rather than dropped so a
             // console or a future screen can see it without a new plumbing pass.
             EngineEvent::RunnerState(payload) => self.app.emit("runner-state", &payload),
+            EngineEvent::PreviewAgreement(payload) => self.app.emit("preview-agreement", &payload),
             EngineEvent::Navigate(target) => self.app.emit("navigate", target),
         };
         sent.map_err(|error| error.to_string())

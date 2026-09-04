@@ -66,6 +66,22 @@ pub struct PartialTranscript {
     pub held: bool,
 }
 
+/// What the last live preview turned out to be worth, once the take it was
+/// previewing came back.
+///
+/// Reported, never acted on: see [`crate::agreement`] for what the two numbers
+/// are and why they only mean anything together.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PreviewAgreement {
+    /// How much of the take the preview had heard, 0.0 to 1.0. Below about 0.75
+    /// the disagreement number stops separating anything.
+    pub coverage: f64,
+    /// How much of the take the preview does not account for, 0.0 to 1.0.
+    pub disagreement: f64,
+    /// The preview itself, so a host showing this can show what changed.
+    pub preview: String,
+}
+
 /// Everything the engine tells its host about.
 pub enum EngineEvent {
     RecordingState(RecordingState),
@@ -89,6 +105,10 @@ pub enum EngineEvent {
     RunnerState(RunnerStatus),
     /// Ask the host to show a particular screen.
     Navigate(String),
+    /// How far the take ended up from the preview that ran alongside it.
+    /// Emitted after [`EngineEvent::TranscriptionResult`], and only when there
+    /// was a preview to compare against.
+    PreviewAgreement(PreviewAgreement),
 }
 
 /// Where engine events go. The Tauri host forwards them to the webview; the
@@ -163,6 +183,30 @@ pub fn should_hold(elapsed: Duration, interval: Duration) -> bool {
     elapsed > interval
 }
 
+/// The arithmetic behind [`EngineEvent::PreviewAgreement`], kept out of the
+/// engine so it can be checked without one.
+///
+/// Coverage is a byte ratio rather than a duration: both sides are the same
+/// recorder's WAV at the same rate, so the ratio of their data is the ratio of
+/// their seconds, and no header has to be parsed for it to be right. It is
+/// clamped because a snapshot taken as the key came up can carry the header
+/// bytes of a frame the take then ended before finishing.
+fn weigh(
+    preview: String,
+    preview_bytes: usize,
+    take: &str,
+    take_bytes: usize,
+) -> Option<PreviewAgreement> {
+    if take_bytes == 0 {
+        return None;
+    }
+    Some(PreviewAgreement {
+        coverage: (preview_bytes as f64 / take_bytes as f64).min(1.0),
+        disagreement: crate::agreement::disagreement(&preview, take),
+        preview,
+    })
+}
+
 /// A capture that has run this long is a stuck flag, not a real recording.
 pub const MAX_RECORDING: Duration = Duration::from_secs(300);
 
@@ -210,6 +254,10 @@ pub struct Engine {
     /// and compares before every emit, so a reading still in the air when the
     /// key comes up cannot paint over the capture that follows it.
     partial_generation: AtomicU64,
+    /// The last reading a preview loop got, and how many bytes of audio it had
+    /// been given. Cleared when a capture starts, so a take can only ever be
+    /// compared against its own preview.
+    last_preview: Mutex<Option<(String, usize)>>,
     events: Arc<dyn EngineEvents>,
     /// The local transcription sidecar. Constructed always and started never,
     /// until the user picks the local backend: an idle supervisor holds a
@@ -267,6 +315,7 @@ impl Engine {
             transcription_jobs: Mutex::new(HashMap::new()),
             speech_jobs: Mutex::new(HashMap::new()),
             partial_generation: AtomicU64::new(0),
+            last_preview: Mutex::new(None),
             events,
             runner,
             spawn,
@@ -499,6 +548,12 @@ impl Engine {
     /// and retires the preview entirely once one reading runs over the interval
     /// (see [`should_hold`]).
     fn start_partials(self: &Arc<Self>) {
+        // Before the early return, not after: with previewing off there is no
+        // reading to come, and a take must never be weighed against the last
+        // capture's preview.
+        if let Ok(mut last) = self.last_preview.lock() {
+            *last = None;
+        }
         if !self.settings.live_preview() {
             return;
         }
@@ -571,6 +626,20 @@ impl Engine {
         }));
     }
 
+    /// Weigh the take against the last preview of it, if there was one.
+    ///
+    /// Compared against `raw_text`, not the formatted text: cleanup rewrites
+    /// wording on purpose, and a preview disagreeing with an edit it never saw
+    /// says nothing about the transcription.
+    ///
+    /// Coverage is a byte ratio rather than a duration because both sides are
+    /// the same recorder's WAV at the same rate, so the ratio of their data is
+    /// the ratio of their seconds -- and it needs no header parsing to be right.
+    fn weigh_preview(&self, take: &str, take_bytes: usize) -> Option<PreviewAgreement> {
+        let (preview, preview_bytes) = self.last_preview.lock().ok()?.take()?;
+        weigh(preview, preview_bytes, take, take_bytes)
+    }
+
     /// Leave the last reading on screen, marked as no longer tracking.
     fn retire_preview(&self, last: &str) {
         if last.is_empty() {
@@ -599,6 +668,7 @@ impl Engine {
             }
         }
         let wav_bytes = self.recorder.snapshot()?;
+        let audio_bytes = wav_bytes.len();
         // On the local backend the endpoint is whichever port the sidecar came
         // up on, and it may not be up yet. Skip the reading rather than wait:
         // the loop treats a failed reading as a reading skipped, and the take
@@ -632,7 +702,11 @@ impl Engine {
         .await?;
         // The same post-pass the take gets, so a preview does not show one
         // spelling and the transcript another.
-        Ok(crate::postpass::apply(&text, config.dictionary.as_deref()))
+        let text = crate::postpass::apply(&text, config.dictionary.as_deref());
+        if let Ok(mut last) = self.last_preview.lock() {
+            *last = Some((text.clone(), audio_bytes));
+        }
+        Ok(text)
     }
 
     /// Stop and transcribe, handing the transcript back to the caller. The
@@ -712,14 +786,19 @@ impl Engine {
         self.emit_state(RecordingState::Transcribing);
 
         let engine = Arc::clone(self);
+        let take_bytes = wav_bytes.len();
         (self.spawn)(Box::pin(async move {
             match engine
                 .run_pipeline(wav_bytes, request_id, cancellation)
                 .await
             {
                 Ok(transcription) => {
+                    let agreement = engine.weigh_preview(&transcription.raw_text, take_bytes);
                     engine.emit(EngineEvent::TranscriptionResult(transcription));
                     engine.emit(EngineEvent::HistoryChanged);
+                    if let Some(agreement) = agreement {
+                        engine.emit(EngineEvent::PreviewAgreement(agreement));
+                    }
                 }
                 Err(e) => engine.emit(EngineEvent::TranscriptionError(e)),
             }
@@ -1038,6 +1117,33 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Coverage is how much of the take the preview had heard, and it is the
+    /// half that decides whether the other half means anything: below about
+    /// three quarters the disagreement number stops separating a bad take from
+    /// a good one, so a host that ignores it would be worse off than one with
+    /// no signal at all.
+    #[test]
+    fn coverage_is_how_much_of_the_take_the_preview_heard() {
+        let full = weigh("hello there".into(), 32_000, "hello there", 32_000).unwrap();
+        assert_eq!(full.coverage, 1.0);
+        assert_eq!(full.disagreement, 0.0);
+
+        let half = weigh("hello".into(), 16_000, "hello there", 32_000).unwrap();
+        assert_eq!(half.coverage, 0.5);
+
+        // A snapshot taken as the key came up can be a frame ahead of the take
+        // it is weighed against; that is not 120% of a recording.
+        let over = weigh("hello there".into(), 32_400, "hello there", 32_000).unwrap();
+        assert_eq!(over.coverage, 1.0);
+    }
+
+    /// Nothing to weigh against is not a disagreement of zero, which a host
+    /// would read as "the preview agreed".
+    #[test]
+    fn a_take_with_no_audio_is_not_weighed() {
+        assert!(weigh("hello".into(), 16_000, "hello", 0).is_none());
+    }
 
     #[test]
     fn recording_slot_frees_itself_after_the_watchdog_window() {

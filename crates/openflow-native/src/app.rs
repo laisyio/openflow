@@ -286,6 +286,15 @@ impl App {
                 crate::trace!("runner {} {}", status.phase.as_str(), status.detail);
                 self.with_settings(|window| window.set_runner_state(&status));
             }
+            // Nothing on screen yet, on purpose: what a low-confidence take
+            // should do to the insert is a product decision, and this only
+            // measures. The trace makes it observable in real use, which is the
+            // part the numbers so far do not have.
+            EngineEvent::PreviewAgreement(agreement) => crate::trace!(
+                "preview agreement: {:.0}% of the take, {:.0}% apart from it",
+                agreement.coverage * 100.0,
+                agreement.disagreement * 100.0
+            ),
             EngineEvent::Navigate(target) => match target.as_str() {
                 "quit" => {
                     let app = NSApplication::sharedApplication(self.mtm);
