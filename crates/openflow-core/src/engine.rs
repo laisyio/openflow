@@ -637,8 +637,21 @@ impl Engine {
 
     /// Stop and transcribe, handing the transcript back to the caller. The
     /// on-demand path: the caller is waiting on the return value.
+    /// Say that the take was cut short by the capture ceiling, if it was.
+    ///
+    /// Both take-ending paths call this rather than inlining the emit: one
+    /// home for the message and for the channel it rides, and one place to
+    /// change when that channel gets a surface the user can actually read.
+    fn report_truncated_capture(&self, truncated: bool) {
+        if truncated {
+            self.emit(EngineEvent::TranscriptionWarning(
+                crate::audio::CAPTURE_CEILING_WARNING.to_string(),
+            ));
+        }
+    }
+
     pub async fn stop_and_transcribe_now(&self) -> Result<Transcription, String> {
-        let wav_result = {
+        let (wav_result, truncated) = {
             let mut recording = self
                 .recording
                 .lock()
@@ -647,9 +660,14 @@ impl Engine {
                 return Err("No recording is active".to_string());
             }
             let result = self.recorder.stop();
+            // Read under the recording lock, which is the lock a new capture
+            // must take before `start` clears the flag. Outside it, a second
+            // press landing between `stop` and the read would answer for the
+            // wrong take.
+            let truncated = self.recorder.capture_truncated();
             *recording = None;
             self.ended_capturing();
-            result
+            (result, truncated)
         };
         let wav_bytes = match wav_result {
             Ok(bytes) => bytes,
@@ -658,6 +676,7 @@ impl Engine {
                 return Err(error);
             }
         };
+        self.report_truncated_capture(truncated);
         let (request_id, cancellation) = match self.register_transcription_job() {
             Ok(job) => job,
             Err(error) => {
@@ -677,7 +696,7 @@ impl Engine {
     /// The hold-to-talk release. Nobody is waiting on a return value, so the
     /// transcript and any failure arrive as events.
     pub fn hotkey_released(self: &Arc<Self>) {
-        let wav_bytes = {
+        let (wav_bytes, truncated) = {
             let Ok(mut recording) = self.recording.lock() else {
                 self.emit(EngineEvent::TranscriptionError(
                     "Recording state is unavailable".to_string(),
@@ -688,9 +707,12 @@ impl Engine {
                 return;
             }
             let result = self.recorder.stop();
+            // See `stop_and_transcribe_now`: the flag belongs to the take that
+            // just ended, and only the recording lock keeps it that way.
+            let truncated = self.recorder.capture_truncated();
             *recording = None;
             self.ended_capturing();
-            result
+            (result, truncated)
         };
 
         let wav_bytes = match wav_bytes {
@@ -701,6 +723,7 @@ impl Engine {
                 return;
             }
         };
+        self.report_truncated_capture(truncated);
         let (request_id, cancellation) = match self.register_transcription_job() {
             Ok(job) => job,
             Err(error) => {
