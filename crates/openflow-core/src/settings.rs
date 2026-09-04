@@ -75,8 +75,12 @@ impl Settings {
         // that has never touched the toggle leaves the guard at its default,
         // which is the same answer and does not have a second `Settings` in the
         // process (a test's scratch store, say) overwrite a live one.
-        if let Some(stored) = settings.db.get_setting("local_only") {
-            crate::transcribe::set_local_only(stored == "true");
+        match settings.db.get_setting("local_only") {
+            Ok(Some(stored)) => crate::transcribe::set_local_only(stored == "true"),
+            Ok(None) => {}
+            // A store that cannot be read has not said "off"; it has said
+            // nothing, and the guard reads that the same way `local_only` does.
+            Err(_) => crate::transcribe::set_local_only(true),
         }
         settings
     }
@@ -94,7 +98,7 @@ impl Settings {
         if is_secret_setting(key) {
             self.secrets.get(key)
         } else {
-            Ok(self.db.get_setting(key))
+            self.db.get_setting(key)
         }
     }
 
@@ -118,7 +122,7 @@ impl Settings {
     /// plaintext where it is rather than losing the user's key.
     pub fn migrate_secrets(&self) {
         for key in SECRET_SETTINGS {
-            let Some(plaintext) = self.db.get_setting(key) else {
+            let Ok(Some(plaintext)) = self.db.get_setting(key) else {
                 continue;
             };
             let secure_write_succeeded = match self.secrets.get(key) {
@@ -143,33 +147,32 @@ impl Settings {
         }
     }
 
+    /// A key whose absence and whose unreadability mean the same thing: use
+    /// the shipped default. Every setting where being wrong costs the user no
+    /// more than a fresh install would reads through here, which is all of them
+    /// except the two that protect the user.
+    fn stored(&self, key: &str) -> Option<String> {
+        self.db.get_setting(key).unwrap_or_default()
+    }
+
     /// A toggle that is on until the user writes the literal "false".
     fn flag_on_by_default(&self, key: &str) -> bool {
-        self.db
-            .get_setting(key)
-            .map(|v| v != "false")
-            .unwrap_or(true)
+        self.stored(key).map(|v| v != "false").unwrap_or(true)
     }
 
     /// A toggle that is off until the user writes the literal "true".
     fn flag_off_by_default(&self, key: &str) -> bool {
-        self.db
-            .get_setting(key)
-            .map(|v| v == "true")
-            .unwrap_or(false)
+        self.stored(key).map(|v| v == "true").unwrap_or(false)
     }
 
     /// A text setting where blank is the same as unset.
     fn non_empty(&self, key: &str) -> Option<String> {
-        self.db
-            .get_setting(key)
-            .filter(|value| !value.trim().is_empty())
+        self.stored(key).filter(|value| !value.trim().is_empty())
     }
 
     // ── Providers and models ──────────────────────────────
     pub fn provider_name(&self) -> String {
-        self.db
-            .get_setting("provider")
+        self.stored("provider")
             .unwrap_or_else(|| DEFAULT_PROVIDER.to_string())
     }
 
@@ -180,7 +183,7 @@ impl Settings {
     /// The formatting endpoint as stored. `None` means "the same one we
     /// transcribe with", which is what the caller substitutes.
     pub fn formatting_provider_name(&self) -> Option<String> {
-        self.db.get_setting("formatting_provider")
+        self.stored("formatting_provider")
     }
 
     pub fn formatting_provider(&self) -> Provider {
@@ -192,8 +195,7 @@ impl Settings {
     }
 
     pub fn tts_provider_name(&self) -> String {
-        self.db
-            .get_setting("tts_provider")
+        self.stored("tts_provider")
             .unwrap_or_else(|| DEFAULT_TTS_PROVIDER.to_string())
     }
 
@@ -228,27 +230,24 @@ impl Settings {
     ///   bills roughly the sum of 0.8 s, 1.6 s ... 20 s -- about 4 minutes of
     ///   audio for 20 seconds of speech, on top of the take itself.
     pub fn live_preview(&self) -> bool {
-        live_preview_allowed(
-            self.db.get_setting("live_preview").as_deref(),
-            &self.provider(),
-        )
+        live_preview_allowed(self.stored("live_preview").as_deref(), &self.provider())
     }
 
     pub fn stt_model(&self) -> Option<String> {
-        self.db.get_setting("stt_model")
+        self.stored("stt_model")
     }
 
     pub fn chat_model(&self) -> Option<String> {
-        self.db.get_setting("chat_model")
+        self.stored("chat_model")
     }
 
     pub fn language(&self) -> Option<String> {
-        self.db.get_setting("language")
+        self.stored("language")
     }
 
     /// Names and terms sent to the transcriber as a spelling hint.
     pub fn dictionary(&self) -> Option<String> {
-        self.db.get_setting("dictionary")
+        self.stored("dictionary")
     }
 
     // ── Secrets ───────────────────────────────────────────
@@ -279,23 +278,22 @@ impl Settings {
     }
 
     pub fn tts_response_format(&self) -> String {
-        self.db
-            .get_setting("tts_response_format")
+        self.stored("tts_response_format")
             .unwrap_or_else(|| DEFAULT_TTS_RESPONSE_FORMAT.to_string())
             .to_ascii_lowercase()
     }
 
     // ── Capture and insertion ─────────────────────────────
     pub fn microphone(&self) -> Option<String> {
-        self.db.get_setting("microphone")
+        self.stored("microphone")
     }
 
     pub fn insert_method(&self) -> InsertMethod {
-        InsertMethod::from_setting(self.db.get_setting("insert_method"))
+        InsertMethod::from_setting(self.stored("insert_method"))
     }
 
     pub fn clipboard_policy(&self) -> ClipboardPolicy {
-        ClipboardPolicy::from_setting(self.db.get_setting("preserve_clipboard"))
+        ClipboardPolicy::from_setting(self.stored("preserve_clipboard"))
     }
 
     pub fn preserve_clipboard(&self) -> bool {
@@ -306,7 +304,7 @@ impl Settings {
     /// Where transcription happens. `remote` unless the user chose otherwise,
     /// because the local runner needs a Python and a model download first.
     pub fn transcription_backend(&self) -> TranscriptionBackend {
-        match self.db.get_setting("transcription_backend").as_deref() {
+        match self.stored("transcription_backend").as_deref() {
             Some("local") => TranscriptionBackend::Local,
             _ => TranscriptionBackend::Remote,
         }
@@ -318,8 +316,7 @@ impl Settings {
 
     /// Which local model, as a key into [`crate::runner::LOCAL_MODELS`].
     pub fn local_model(&self) -> String {
-        self.db
-            .get_setting("local_model")
+        self.stored("local_model")
             .unwrap_or_else(|| DEFAULT_LOCAL_MODEL.to_string())
     }
 
@@ -329,8 +326,7 @@ impl Settings {
     /// the dictation it was warming for, and an unbounded value would leave
     /// gigabytes resident for a value the user cannot see the effect of.
     pub fn local_idle_minutes(&self) -> u64 {
-        self.db
-            .get_setting("local_idle_minutes")
+        self.stored("local_idle_minutes")
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(DEFAULT_LOCAL_IDLE_MINUTES)
             .clamp(1, 240)
@@ -341,19 +337,33 @@ impl Settings {
     /// The guard that enforces it lives in [`crate::transcribe`] and is armed
     /// by [`Settings::new`] and [`Settings::set`], so the toggle binds the next
     /// request rather than the next launch.
+    ///
+    /// Off until the user writes "true", but a store that cannot be read is not
+    /// a store that said "off". The engine re-arms the guard from this answer
+    /// on every take, so a settings table that has stopped answering would
+    /// otherwise take the switch off mid-session and start letting audio leave
+    /// the machine -- with nothing on the path able to say so.
     pub fn local_only(&self) -> bool {
-        self.flag_off_by_default("local_only")
+        match self.db.get_setting("local_only") {
+            Ok(stored) => stored.as_deref() == Some("true"),
+            Err(_) => true,
+        }
     }
 
     // ── History ───────────────────────────────────────────
+    /// On until the user writes "false", and off when the answer cannot be
+    /// read: the same reasoning as `local_only` in the other direction, since
+    /// what gets written here is whatever the user said out loud.
     pub fn save_history(&self) -> bool {
-        self.flag_on_by_default("save_history")
+        match self.db.get_setting("save_history") {
+            Ok(stored) => stored.as_deref() != Some("false"),
+            Err(_) => false,
+        }
     }
 
     /// `None` means keep everything.
     pub fn history_retention_days(&self) -> Option<i64> {
-        self.db
-            .get_setting("history_retention_days")
+        self.stored("history_retention_days")
             .and_then(|value| value.parse::<i64>().ok())
     }
 
@@ -362,8 +372,7 @@ impl Settings {
     pub fn hotkey(&self, action: &str) -> Option<String> {
         let default = hotkey::default_shortcut(action)?;
         Some(
-            self.db
-                .get_setting(&hotkey::setting_key(action))
+            self.stored(&hotkey::setting_key(action))
                 .unwrap_or_else(|| default.to_string()),
         )
     }
@@ -374,8 +383,7 @@ impl Settings {
         let default =
             hotkey::default_shortcut(action).ok_or("Unknown hotkey action".to_string())?;
         let shortcut_str = self
-            .db
-            .get_setting(&hotkey::setting_key(action))
+            .stored(&hotkey::setting_key(action))
             .unwrap_or_else(|| default.to_string());
         hotkey::parse_shortcut(&shortcut_str).or_else(|_| hotkey::parse_shortcut(default))
     }
@@ -389,8 +397,7 @@ impl Settings {
     /// `None` means follow the system, which is what the UI does when the key
     /// holds neither "dark" nor "light".
     pub fn theme(&self) -> Option<String> {
-        self.db
-            .get_setting("theme")
+        self.stored("theme")
             .filter(|value| value == "dark" || value == "light")
     }
 
@@ -399,8 +406,7 @@ impl Settings {
     }
 
     pub fn overlay_position(&self) -> String {
-        self.db
-            .get_setting("overlay_position")
+        self.stored("overlay_position")
             .unwrap_or_else(|| DEFAULT_OVERLAY_POSITION.to_string())
     }
 
@@ -410,7 +416,7 @@ impl Settings {
     /// who chose on-device transcription has no provider at all, so choosing
     /// that counts too.
     pub fn onboarding_complete(&self) -> bool {
-        self.db.get_setting("provider").is_some() || self.is_local_backend()
+        self.stored("provider").is_some() || self.is_local_backend()
     }
 }
 
@@ -635,6 +641,59 @@ mod tests {
         reopened
             .set("local_only", "false")
             .expect("leave the process as we found it");
+    }
+
+    /// The two settings that protect the user have a wrong side to fail on,
+    /// and a settings table can stop answering for the rest of the process's
+    /// life without anything on the read path being able to report it. Both
+    /// have to end up on the side the user was promised, while the settings
+    /// that only shape behaviour keep falling back to their defaults.
+    #[test]
+    fn a_store_that_cannot_answer_fails_toward_privacy() {
+        let settings = scratch_settings();
+        assert!(!settings.local_only(), "off on a fresh install");
+        assert!(settings.save_history(), "on on a fresh install");
+
+        crate::db::tests::poison_the_connection_lock(settings.db());
+
+        assert!(
+            settings.local_only(),
+            "a guard that promises nothing leaves this machine cannot take itself off"
+        );
+        assert!(
+            !settings.save_history(),
+            "speech must not be written to disk on the strength of a read that failed"
+        );
+        assert!(
+            settings.get("provider").is_err(),
+            "the failure is now something a caller can see"
+        );
+        assert_eq!(settings.provider_name(), DEFAULT_PROVIDER);
+        assert!(settings.format_enabled());
+        assert_eq!(settings.local_idle_minutes(), DEFAULT_LOCAL_IDLE_MINUTES);
+    }
+
+    /// The guard is armed from the same answer at construction, and that branch
+    /// is reachable in the case that matters most: the store was already
+    /// unreadable before this process ever asked it anything.
+    #[test]
+    fn a_store_that_cannot_answer_at_startup_arms_the_guard() {
+        let _serialized = crate::transcribe::tests::LOCAL_ONLY_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::transcribe::set_local_only(false);
+
+        let dir = std::env::temp_dir().join(format!("openflow-settings-{}", uuid::Uuid::new_v4()));
+        let db = Database::new(dir.clone()).expect("a scratch database");
+        crate::db::tests::poison_the_connection_lock(&db);
+        let settings = Settings::new(db, SecretStore::new(dir));
+
+        assert!(
+            crate::transcribe::local_only(),
+            "a store that could not be read at startup has not said the guard is off"
+        );
+        assert!(settings.local_only());
+        crate::transcribe::set_local_only(false);
     }
 
     /// A blank voice model or voice means "the provider's own default", not an

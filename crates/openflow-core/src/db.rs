@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -200,15 +200,21 @@ impl Database {
         .map_err(|e| format!("Prune failed: {}", e))
     }
 
-    pub fn get_setting(&self, key: &str) -> Option<String> {
-        self.connection()
-            .ok()?
+    /// A key the user never set and a database that cannot answer are two
+    /// different facts, and the settings that protect the user decide which way
+    /// to fail from the difference. `Ok(None)` is "no such row"; `Err` is "we
+    /// do not know what the row says" -- and a poisoned lock keeps saying so
+    /// for the rest of the process's life, not just for the panic that caused
+    /// it.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, String> {
+        self.connection()?
             .query_row(
                 "SELECT value FROM settings WHERE key = ?1",
                 params![key],
                 |row| row.get(0),
             )
-            .ok()
+            .optional()
+            .map_err(|e| format!("Setting read failed: {}", e))
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
@@ -226,5 +232,51 @@ impl Database {
             .execute("DELETE FROM settings WHERE key = ?1", params![key])
             .map_err(|e| format!("Setting delete failed: {}", e))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn scratch_database() -> Database {
+        let dir = std::env::temp_dir().join(format!("openflow-db-{}", uuid::Uuid::new_v4()));
+        Database::new(dir).expect("a scratch database")
+    }
+
+    /// Leave the connection lock in the state a panic taken while holding it
+    /// leaves it in. Nothing in the app poisons the lock deliberately, but any
+    /// panic on a thread that holds it does, and from then on every read is a
+    /// failure rather than an answer -- which is the case the settings above it
+    /// have to survive.
+    pub(crate) fn poison_the_connection_lock(db: &Database) {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = db.conn.lock().expect("the lock is still good");
+            panic!("poisoning the connection lock on purpose");
+        }));
+        assert!(panicked.is_err(), "the fixture has to panic to poison");
+        assert!(
+            db.connection().is_err(),
+            "the lock is poisoned from here on"
+        );
+    }
+
+    /// The distinction the privacy flags are built on: a key nobody wrote reads
+    /// as absent, while a database that cannot be reached reads as a failure
+    /// even for a key that is certainly there.
+    #[test]
+    fn an_absent_row_and_an_unreachable_database_read_differently() {
+        let db = scratch_database();
+        assert_eq!(db.get_setting("never_written"), Ok(None));
+        db.set_setting("provider", "groq").expect("write a row");
+        assert_eq!(db.get_setting("provider"), Ok(Some("groq".to_string())));
+
+        poison_the_connection_lock(&db);
+
+        assert!(
+            db.get_setting("provider").is_err(),
+            "a stored row that cannot be read must not come back as if unset"
+        );
+        assert!(db.get_setting("never_written").is_err());
     }
 }
