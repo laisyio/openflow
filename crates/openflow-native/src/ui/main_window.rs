@@ -78,12 +78,12 @@ use crate::ui::settings::SettingsPage;
 const WINDOW_WIDTH: f64 = 880.0;
 const WINDOW_HEIGHT: f64 = 580.0;
 /// The sidebar's resting width, and the range the user may drag it to.
-const SIDEBAR_WIDTH: f64 = 196.0;
+pub(crate) const SIDEBAR_WIDTH: f64 = 196.0;
 const SIDEBAR_MIN: f64 = 168.0;
 const SIDEBAR_MAX: f64 = 260.0;
 /// Never smaller than the narrowest page can stand. The pages spring, but the
 /// History table's columns do not, and below this they start eating each other.
-const MIN_WIDTH: f64 = 720.0;
+pub(crate) const MIN_WIDTH: f64 = 720.0;
 const MIN_HEIGHT: f64 = 440.0;
 
 const SIDEBAR_COLUMN: &str = "page";

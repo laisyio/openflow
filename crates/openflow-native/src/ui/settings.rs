@@ -40,8 +40,8 @@ use crate::overlay;
 use crate::ui::card::{Card, Flipped, GAP, MARGIN, PADDING};
 use crate::ui::recorder::ChordRecorder;
 use crate::ui::{
-    allow_wrapping, button, combo, label, note, popup, secure_field, switch_control, text_field,
-    text_view, wire, Form, ROW,
+    button, combo, label, note, popup, secure_field, switch_control, text_field, text_view, wire,
+    Form, ROW,
 };
 
 /// The height of the swappable transcription panel on the Providers tab.
@@ -51,6 +51,16 @@ use crate::ui::{
 /// the cleanup rows below either into a scroll view or off the tab. Sized for
 /// the taller of the two so nothing reflows when the choice changes.
 const BOX_HEIGHT: f64 = 300.0;
+
+/// How many lines every status line in this page reserves.
+///
+/// Three, because the longest message the app itself writes into one needs
+/// three: `speech::resolve_speech_key`'s answer when the voice provider has no
+/// key of its own is 638 pt of text in a 288 pt column. Two lines held the
+/// first two thirds of that sentence and dropped the third, which is the half
+/// that says what to do about it. Messages from further away -- a `reqwest`
+/// connection error is four lines -- are truncated with an ellipsis instead.
+const STATUS_LINES: usize = 3;
 /// The dictionary is sent to the transcriber as a spelling hint and the web
 /// settings screen caps it here.
 pub const DICTIONARY_LIMIT: usize = 800;
@@ -1553,10 +1563,7 @@ fn build_sections(
     );
     let stop = button(mtm, stop_frame, "Stop", 0);
     form.add(&stop);
-    let n = form.control_only(28.0);
-    let voice_status = note(mtm, "", n);
-    allow_wrapping(&voice_status, n.size.width);
-    form.add(&voice_status);
+    let voice_status = form.status_row(mtm, STATUS_LINES);
     let voice = form.fit();
 
     // Privacy
@@ -1594,10 +1601,7 @@ fn build_sections(
         0,
     );
     form.add(&clear);
-    let n = form.control_only(28.0);
-    let history_status = note(mtm, "", n);
-    allow_wrapping(&history_status, n.size.width);
-    form.add(&history_status);
+    let history_status = form.status_row(mtm, STATUS_LINES);
     let privacy = form.fit();
 
     let controls = Controls {
@@ -1701,6 +1705,28 @@ const FORM_SPACE: f64 = 2400.0;
 /// Settings keeps as its own window grows.
 const MAX_FORM_WIDTH: f64 = 430.0;
 
+/// The width the two-column form is built at inside a pane `pane` wide.
+///
+/// Extracted from the layout so the tests can ask the same question the window
+/// asks, rather than restating the arithmetic and drifting from it.
+fn form_width(pane: f64) -> f64 {
+    let available = (pane - MARGIN * 2.0).max(320.0);
+    (available - PADDING * 2.0).clamp(280.0, MAX_FORM_WIDTH)
+}
+
+/// The width a [`Form::status_row`] gets on this page at its narrowest.
+///
+/// The pane is the window minus the sidebar, and the window has a minimum, so
+/// this is a real floor rather than a hypothetical one: the status lines are
+/// never laid out in less room than this.
+#[cfg(test)]
+fn narrowest_status_width() -> f64 {
+    use crate::ui::main_window::{MIN_WIDTH, SIDEBAR_WIDTH};
+    use crate::ui::CONTROL_X;
+
+    form_width(MIN_WIDTH - SIDEBAR_WIDTH) - CONTROL_X
+}
+
 /// The column keeps its width and stays centred as the window grows, rather
 /// than stretching with it.
 const CENTRED_COLUMN: NSAutoresizingMaskOptions = NSAutoresizingMaskOptions(
@@ -1721,8 +1747,7 @@ fn build_page(
     Vec<NSRect>,
     Controls,
 ) {
-    let available = (size.width - MARGIN * 2.0).max(320.0);
-    let form_width = (available - PADDING * 2.0).clamp(280.0, MAX_FORM_WIDTH);
+    let form_width = form_width(size.width);
     let card_width = form_width + PADDING * 2.0;
     let card_x = ((size.width - card_width) / 2.0).max(MARGIN);
     let (forms, controls) = build_sections(mtm, form_width, FORM_SPACE);
@@ -1860,9 +1885,7 @@ fn build_remote_panel(
         TAG_FETCH_MODELS,
     );
     form.add(&fetch);
-    let n = form.control_only(28.0);
-    let models_status = note(mtm, "", n);
-    form.add(&models_status);
+    let models_status = form.status_row(mtm, STATUS_LINES);
 
     (
         form.view.clone(),
@@ -1894,9 +1917,11 @@ fn build_local_panel(
     Retained<objc2_app_kit::NSButton>,
 ) {
     let mut form = Form::new(mtm, width, BOX_HEIGHT);
-    let n = form.full(28.0);
-    let local_status = note(mtm, "", n);
-    form.add(&local_status);
+    // Two lines, not three: this panel already fills `BOX_HEIGHT` exactly, so
+    // there is nowhere to grow. What it was missing was not room but the cap --
+    // without one a runner message four times this wide drew as a single line
+    // and lost most of itself off the right edge.
+    let local_status = form.status_full(mtm, 2);
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Model", l));
@@ -2004,6 +2029,84 @@ fn titles(table: &'static [(&'static str, &'static str)]) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::wrapped_lines;
+
+    /// `NOTE_LINE` has to be what a line of note text actually measures, since
+    /// every status line's height is a multiple of it.
+    #[test]
+    fn note_line_is_the_height_of_one_line_of_note_text() {
+        assert_eq!(
+            wrapped_lines("Ag", narrowest_status_width()),
+            1,
+            "a short note is one line, or NOTE_LINE disagrees with the font"
+        );
+    }
+
+    /// The message that tells the user how to fix a missing voice key is
+    /// written in `openflow-core`, and drawn here in a column `openflow-core`
+    /// knows nothing about. Ask the real function for it rather than keeping a
+    /// copy: a sentence lengthened over there is the way this regresses.
+    ///
+    /// It was three lines in a box that had two. The line that fell off the
+    /// bottom was the one naming the way out ("or point the speech endpoint at
+    /// a self-hosted server"), and nothing marked it as missing.
+    #[test]
+    fn the_speech_key_messages_fit_the_status_line() {
+        let width = narrowest_status_width();
+        for same_endpoint in [true, false] {
+            let message = openflow_core::speech::resolve_speech_key(
+                &openflow_core::transcribe::Provider::Groq,
+                None,
+                None,
+                same_endpoint,
+            )
+            .expect_err("no key anywhere is an error, and the error is the message");
+            let lines = wrapped_lines(&message, width);
+            assert!(
+                lines <= STATUS_LINES,
+                "{lines} lines in {width}pt, but the status line reserves {STATUS_LINES}: {message:?}"
+            );
+        }
+    }
+
+    /// Every message this page writes into the voice status line, read out of
+    /// this file rather than listed again here, so one added tomorrow is
+    /// measured tomorrow.
+    #[test]
+    fn every_voice_status_message_this_page_writes_fits() {
+        let width = narrowest_status_width();
+        let messages = status_literals(include_str!("settings.rs"));
+        assert!(
+            messages.len() >= 3,
+            "the scan found {} messages, so it has stopped matching the call sites",
+            messages.len()
+        );
+        for message in messages {
+            let lines = wrapped_lines(message, width);
+            assert!(
+                lines <= STATUS_LINES,
+                "{lines} lines in {width}pt, but the status line reserves {STATUS_LINES}: {message:?}"
+            );
+        }
+    }
+
+    /// Pull the string literals handed to `set_voice_status` out of the source.
+    ///
+    /// A call whose argument is not a literal (the one that forwards an error
+    /// from the speech stream) has nothing to measure and is skipped; that one
+    /// is covered by the cap instead.
+    fn status_literals(source: &str) -> Vec<&str> {
+        // Written split so this needle does not match itself in the scan.
+        let needle: &str = concat!("set_voice_status", "(");
+        source
+            .match_indices(needle)
+            .filter_map(|(at, _)| {
+                let rest = source[at + needle.len()..].trim_start();
+                let rest = rest.strip_prefix('"')?;
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect()
+    }
 
     /// The provider setting packs a kind and a URL into one string. Both halves
     /// have to survive a round trip, or a custom endpoint silently becomes Groq

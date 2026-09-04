@@ -4,6 +4,16 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### The status lines that report a failure are the ones that got cut off
+By: Ford (with Claude)
+Impact: `crates/openflow-native/src/ui/{mod.rs,settings.rs,main_window.rs}`
+
+- **A box reserved for two lines was given messages that need three, and said nothing about the third.** Settings has four status lines that are built empty and filled at run time -- under Preview, under Fetch models, under Clear history, and above the on-this-Mac panel. Each reserved 28 pt, and none capped what it drew, so a message that outgrew the box simply stopped: no ellipsis, no scroll, nothing to tell the reader a sentence had been docked.
+- **One of them was a fixed string, not a hypothetical.** `speech::resolve_speech_key` answers a voice provider with no key of its own with 638 pt of text; in the 288 pt control column that is three lines. The two that fit told the user what was wrong. The one that did not was `or point the speech endpoint at a self-hosted server` -- the half that says what to do about it. It is reached by choosing a voice provider you do not transcribe with and pressing Preview.
+- `Form::status_row` and `Form::status_full` replace the four hand-rolled fields with one shape: `NOTE_LINE` per line, wrapping on, and `maximumNumberOfLines` with `ByTruncatingTail` at the same count, so a message from a server or from macOS -- a `reqwest` connection error is four lines -- ends in an ellipsis instead of vanishing. The models line never called `allow_wrapping` at all and had been losing its tail sideways, the way the wizard's provider note did before #26.
+- The three in the control column now reserve three lines. The on-this-Mac line keeps two, because that panel already fills `BOX_HEIGHT` exactly and has nowhere to grow; what it was missing was the cap, not the room.
+- **The invariant is a test, not a habit.** `wrapped_lines` measures through `NSAttributedString`, which needs neither a main thread nor an `NSApplication` and agrees to the point with what `wrap` gets from a real `NSTextField`. One test asks `openflow-core` for the speech-key message rather than keeping a copy of it, since a sentence lengthened over there is how this comes back; another reads this file's own `set_voice_status` call sites. Both fail on the old two-line reservation, naming the string and the line count.
+
 ### Windows CI: gate the shell stand-in test to unix
 By: Titan (with Claude)
 Impact: `crates/openflow-core/src/runner.rs`
