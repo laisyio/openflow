@@ -4,6 +4,17 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Open at login, in Settings General
+By: Titan (with Claude)
+Impact: `crates/openflow-native/src/login_item.rs` (new), `crates/openflow-native/src/{main.rs,ui/settings.rs}`, `crates/openflow-native/Cargo.toml`
+
+- **A menu bar app the user has to remember to start is a menu bar app they will forget.** General grows an "Open at login" switch, off by default, backed by `SMAppService` from macOS 13. The launch-time Settings window is untouched: this is about the next login, not about this one.
+- **The OS is the record, so there is no setting for it.** Nothing goes into the database. The switch is a view of `SMAppService.status`, read fresh every time the page is shown, and every flip calls `register` or `unregister` and then re-reads. A stored copy would go stale the moment the user turned the item off in System Settings, and there would be no way afterwards to tell which of the two was telling the truth.
+- **A refused write puts the switch back.** `set_enabled` returns the error's `localizedDescription` rather than panicking or leaving a switch claiming something macOS never agreed to; the page then re-reads the status, applies it, and prints the message in the note under the row.
+- **`RequiresApproval` is a fourth state, not a failure.** macOS remembers a login item the user once disabled and will register it into a pending state instead of an enabled one. The switch shows on, because the app is registered and the user did ask, and the note says where to approve it. `NotFound` shows off, because nothing is registered.
+- `login_item.rs` is the only file that talks to ServiceManagement, and the state-to-screen mapping is a pure function beside those calls, so the four cases are unit-tested by a workspace test run on any platform rather than only on the one that can run the app. A status the SDK grows later reads as off and names its raw value under `OPENFLOW_TRACE=1`.
+- Verified against a bundle: registering puts `2.io.laisy.openflow` in the background task database with disposition `enabled`, and unregistering takes the record out again. The `RequiresApproval` and refusal branches are proven by review only, since neither could be reached on the machine this was built on: an ad hoc bundle registered without complaint, and so, on macOS 26, did an unbundled `cargo run`.
+
 ### Windows CI: gate the shell stand-in test to unix
 By: Titan (with Claude)
 Impact: `crates/openflow-core/src/runner.rs`

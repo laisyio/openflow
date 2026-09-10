@@ -30,6 +30,11 @@ tokio = { workspace = true }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["block2"] }
 objc2-foundation = { version = "0.3", features = ["block2"] }
+# `SMAppService`, the macOS 13+ way to register the app as a login item. Same
+# objc2 generation as the two above, so it shares their `objc2` 0.6 runtime
+# rather than pulling a second one in. Default features already carry
+# `SMAppService`; nothing else in the framework is used.
+objc2-service-management = "0.3"
 block2 = "0.6"
 # Main-thread hops for events raised on tokio workers and the hotkey thread.
 dispatch2 = "0.3"
