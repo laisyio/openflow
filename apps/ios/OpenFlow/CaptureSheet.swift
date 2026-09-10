@@ -16,6 +16,12 @@ struct CaptureSheet: View {
                 case .idle:
                     Text("Tap record and speak.")
                         .foregroundStyle(.secondary)
+                case .starting:
+                    ProgressView("Opening the microphone")
+                case .stopping:
+                    ProgressView("Preparing your recording")
+                case .cancelling:
+                    ProgressView("Finishing cancellation")
                 case .recording:
                     RecordingIndicator(stopsOnSilence: controller.settings.stopOnSilence)
                 case .transcribing:
@@ -104,10 +110,20 @@ struct CaptureSheet: View {
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(!controller.canStart)
                 }
             }
 
+        case .starting, .stopping, .transcribing, .cancelling:
+            EmptyView()
+
         default:
+            if controller.canRetry {
+                Button("Retry transcription") {
+                    Task { await controller.retryTranscription() }
+                }
+                .buttonStyle(.bordered)
+            }
             Button {
                 Task { await controller.startRecording() }
             } label: {
@@ -116,6 +132,7 @@ struct CaptureSheet: View {
                     .padding(.vertical, 12)
             }
             .buttonStyle(.borderedProminent)
+            .disabled(!controller.canStart)
         }
     }
 

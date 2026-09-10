@@ -10,19 +10,11 @@ struct ModelDownloadView: View {
     @Environment(DictationController.self) private var controller
     @Environment(\.dismiss) private var dismiss
 
-    @State private var state: Phase = .idle
-    @State private var received: Int64 = 0
-    @State private var expected: Int64 = 0
+    @State private var download: ModelDownloadController?
+    @State private var configurationError: String?
 
-    enum Phase: Equatable {
-        case idle
-        case downloading
-        /// Named, because verifying is three passes over three files and a
-        /// spinner that says nothing for a minute looks like a hang.
-        case verifying(String)
-        case installing
-        case installed
-        case failed(String)
+    private var state: ModelDownloadController.Phase {
+        configurationError.map(ModelDownloadController.Phase.failed) ?? download?.phase ?? .checking
     }
 
     private var pin: ModelDownloader.ModelPin {
@@ -66,7 +58,7 @@ struct ModelDownloadView: View {
                 }
 
                 Section {
-                    Text("Each of the \(fileCount) files is checked against a fingerprint built into the app. If any of them does not match, OpenFlow deletes the lot and refuses to use them.")
+                    Text("Each of the \(fileCount) files is checked against a fingerprint built into the app. Only a complete, verified recogniser is installed. Cancelling keeps verified files so you can resume.")
                     Text("This is the only network request OpenFlow ever makes. After it finishes, the app works with the phone in Airplane Mode.")
                         .foregroundStyle(.secondary)
                 } header: {
@@ -75,16 +67,25 @@ struct ModelDownloadView: View {
 
                 Section {
                     switch state {
+                    case .checking:
+                        ProgressView("Checking installed recogniser")
                     case .idle:
-                        Button("Download the recogniser") { start() }
+                        Button("Download the recogniser") { download?.start() }
+                    case .paused:
+                        Text("The download is paused. Verified files are kept; unfinished transfers resume when the server supports it.")
+                            .font(.caption)
+                        Button("Resume download") { download?.start() }
+                    case .cancelling:
+                        ProgressView("Pausing download")
                     case .downloading:
                         VStack(alignment: .leading, spacing: 6) {
                             ProgressView(value: fraction)
                             Text(progressLabel).font(.caption).foregroundStyle(.secondary)
-                            Button("Cancel", role: .destructive) { state = .idle }
+                            Button("Cancel", role: .destructive) { Task { await download?.cancel() } }
                         }
                     case .verifying(let file):
                         ProgressView("Checking \(file)")
+                        Button("Cancel", role: .destructive) { Task { await download?.cancel() } }
                     case .installing:
                         ProgressView("Putting it in place")
                     case .installed:
@@ -94,10 +95,10 @@ struct ModelDownloadView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             Label(reason, systemImage: "exclamationmark.triangle")
                                 .foregroundStyle(.red)
-                            Text("Nothing was installed. You can try again on a different network.")
+                            Text("Your existing recogniser is unchanged. You can retry the download.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            Button("Try again") { start() }
+                            Button("Try again") { download?.start() }
                         }
                     }
                 }
@@ -107,47 +108,27 @@ struct ModelDownloadView: View {
                 ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
             }
         }
+        .task {
+            do {
+                if download == nil {
+                    let store = try ModelStore.applicationSupport()
+                    download = ModelDownloadController(downloader: ModelDownloader(store: store), pin: pin)
+                }
+                await download?.refresh()
+            } catch { configurationError = error.localizedDescription }
+        }
+        .onDisappear { Task { await download?.cancel() } }
     }
 
     private var fraction: Double {
-        expected > 0 ? min(1, Double(received) / Double(expected)) : 0
+        let expected = download?.expected ?? pin.expectedBytes
+        return expected > 0 ? min(1, Double(download?.received ?? 0) / Double(expected)) : 0
     }
 
     private var progressLabel: String {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
-        return "\(formatter.string(fromByteCount: received)) of \(formatter.string(fromByteCount: expected))"
+        return "\(formatter.string(fromByteCount: download?.received ?? 0)) of \(formatter.string(fromByteCount: download?.expected ?? pin.expectedBytes))"
     }
 
-    private func start() {
-        state = .downloading
-        received = 0
-        expected = pin.expectedBytes
-        let pin = self.pin
-        Task {
-            do {
-                let store = try ModelStore.applicationSupport()
-                let downloader = ModelDownloader(store: store)
-                for try await progress in await downloader.download(pin: pin) {
-                    switch progress {
-                    case .downloading(let got, let want):
-                        received = got
-                        expected = want
-                    case .verifying(let file):
-                        state = .verifying(file)
-                    case .installing:
-                        state = .installing
-                    case .finished:
-                        state = .installed
-                    }
-                }
-            } catch ModelDownloader.DownloadError.placeholderPin {
-                state = .failed("This build has no recogniser pinned yet.")
-            } catch ModelDownloader.DownloadError.checksumMismatch(let file, _, _) {
-                state = .failed("\(file) did not match its fingerprint, so nothing was installed.")
-            } catch {
-                state = .failed((error as NSError).localizedDescription)
-            }
-        }
-    }
 }

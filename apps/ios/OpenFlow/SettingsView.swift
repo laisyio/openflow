@@ -28,6 +28,11 @@ struct SettingsView: View {
                         }
                     }
                     LabeledContent("State", value: controller.modelState.describedForUI)
+                    if controller.activeEngine != engine {
+                        Text("The selected recogniser will be used after this dictation finishes.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     LabeledContent("Memory in use", value: residentLabel)
                     Button("Diagnostics") { showDiagnostics = true }
                 }

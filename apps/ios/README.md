@@ -90,6 +90,11 @@ what stands between a fresh install and the first take.
 
 ## Tests
 
+Capture/session cancellation, live engine replacement, download cancellation and
+resume, retention, and the Simulator/Release gates are documented in
+[PERFORMANCE.md](PERFORMANCE.md). The iOS CI workflow runs core/engine tests and
+builds the real-engine Release path as well as the app controller tests.
+
 Both packages build and test with the Command Line Tools alone -- no Xcode, no
 simulator, no Metal toolchain:
 
