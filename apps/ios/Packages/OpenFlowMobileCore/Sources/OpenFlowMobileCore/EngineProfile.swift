@@ -52,20 +52,29 @@ public struct EngineProfile: Sendable, Equatable {
         )
     }
 
-    /// "about 700 MB", in the user's units.
+    /// "about 700 MB", decimal, English.
     public var downloadDescription: String { Self.approximate(downloadBytes) }
 
-    /// "about 1 GB", in the user's units.
+    /// "about 1 GB", decimal, English.
     public var residentDescription: String { Self.approximate(residentBytes) }
 
     /// Decimal units, matching the download screen's progress line and the way a
     /// model card quotes a size. The hedge is part of the string because the
     /// resident figure is an estimate and the download figure is what the server
     /// said last time somebody pinned it.
+    ///
+    /// Formatted by hand rather than through `ByteCountFormatter`: the hedge is
+    /// English, so the unit is too, and a locale-formatted "1 Go" after an
+    /// English "about" would be the worse of the two. It also keeps the strings
+    /// the same on every machine that runs the tests.
     private static func approximate(_ bytes: Int64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        formatter.allowedUnits = [.useMB, .useGB]
-        return "about " + formatter.string(fromByteCount: bytes)
+        let megabytes = Double(bytes) / 1_000_000
+        guard megabytes >= 1_000 else {
+            return "about \(Int(megabytes.rounded())) MB"
+        }
+        let gigabytes = (megabytes / 100).rounded() / 10
+        let whole = gigabytes.rounded()
+        let text = gigabytes == whole ? String(Int(whole)) : String(gigabytes)
+        return "about \(text) GB"
     }
 }
