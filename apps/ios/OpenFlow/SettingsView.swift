@@ -87,7 +87,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Memory")
                 } footer: {
-                    Text("The model needs about 1 GB while it is loaded. OpenFlow drops it when you stop using it, when iOS asks for memory, and when the phone gets hot. Loading it again takes a couple of seconds.")
+                    Text("The model needs \(EngineProfile.profile(for: engine).residentDescription) while it is loaded. OpenFlow drops it when you stop using it, when iOS asks for memory, and when the phone gets hot. Loading it again takes a couple of seconds.")
                 }
 
                 Section {

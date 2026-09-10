@@ -27,14 +27,21 @@ struct ModelDownloadView: View {
         ModelDownloader.pin(for: controller.settings.engine)
     }
 
+    /// What the selected recogniser costs. The figures below used to be typed
+    /// into this file, so picking the lighter engine still read the heavier
+    /// engine's numbers, and moving a pin left them quietly wrong.
+    private var profile: EngineProfile {
+        EngineProfile.profile(for: controller.settings.engine)
+    }
+
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     Text("OpenFlow recognises speech on this phone. To do that it needs the recogniser itself, which is a large file.")
-                    LabeledContent("Download size", value: "about 700 MB, once")
-                    LabeledContent("Space on disk", value: "about 700 MB, kept out of your backups")
-                    LabeledContent("Memory while dictating", value: "about 1 GB")
+                    LabeledContent("Download size", value: "\(profile.downloadDescription), once")
+                    LabeledContent("Space on disk", value: "\(profile.downloadDescription), kept out of your backups")
+                    LabeledContent("Memory while dictating", value: profile.residentDescription)
                 } header: {
                     Text("What this costs")
                 }

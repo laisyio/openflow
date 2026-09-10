@@ -21,10 +21,21 @@ struct CaptureSheet: View {
                 case .transcribing:
                     ProgressView("Transcribing on this device")
                 case .finished(let text):
-                    ScrollView {
-                        Text(text)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
+                    VStack(alignment: .leading, spacing: 10) {
+                        ScrollView {
+                            Text(text)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                        }
+                        // Only set when the take hit the length ceiling. It sits
+                        // with the transcript rather than replacing it: the
+                        // words are still the point, and a take missing its
+                        // opening otherwise reads as one that started late.
+                        if let notice = controller.captureNotice {
+                            Label(notice, systemImage: "clock.badge.exclamationmark")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 case .failed(let reason):
                     Label(reason, systemImage: "exclamationmark.triangle")

@@ -97,3 +97,27 @@ Every commit: CHANGELOG.md entry under Unreleased (By:, Impact:), attribution tr
 ## 7. What the implementer must not do
 
 Do not add a server, an account, analytics, or any SDK. Do not put the model in the keyboard extension. Do not use CPU inference as a silent fallback. Do not bundle weights. Do not claim background residency the OS does not grant; the state machine in section 2 is the contract.
+
+## 8. Lightweight audit, 2026-09-10
+
+The desktop discipline this is measured against: do only what the caller is about to use, do it in O(n) where a sort would do, allocate outside the audio callback and never inside it, tell the user when a limit changed what they got, and keep a cost the user is quoted in one place next to the thing that sets it.
+
+Already met before this branch:
+
+- Capture allocates its ring once per take and never grows it, per section 5.
+- The keyboard extension reads `last.json` alone, so a month of history is never parsed to insert one line.
+- The Live Activity is updated on state changes only, with no timer of its own.
+- The model unloads on idle, on background, on memory pressure and on thermal pressure, per section 2.
+- `OpenFlowMobileCore` has no dependencies, so the whole brain builds and tests under the Command Line Tools.
+
+Fixed on this branch:
+
+- `SilenceGate.speechLevel` selects the 95th percentile in O(n) instead of sorting the block, matching `select_nth_unstable_by` in the desktop's `audio.rs`.
+- The per-block level is computed only when stop-on-silence is on, since nothing else reads it, and the whole-take gate at stop is unchanged.
+- The ring takes a block in at most two bulk copies rather than one indexed write with a modulo per sample.
+- The microphone tap mixes to mono, converts and measures through buffers the capture owns, so the steady state of a take allocates nothing on the audio thread.
+- A take that hits the ten-minute ceiling now says so on the capture sheet, and says that the beginning is the half that was dropped, which is the opposite end from the desktop because this is a ring.
+- History is read from disk when the History tab appears and not on every take, scene change, memory warning and thermal notification.
+- `history.json` has a documented ceiling of 500 records, so the file the append path decodes cannot grow without limit inside the retention window.
+- The download size and the memory figure both come from `EngineProfile`, derived from the selected engine's pin, instead of being typed into two screens.
+- Release builds compile at `-Osize` and every configuration strips dead code.

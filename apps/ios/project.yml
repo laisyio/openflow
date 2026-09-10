@@ -42,6 +42,17 @@ settings:
     SWIFT_UPCOMING_FEATURE_CONCISE_MAGIC_FILE: YES
     # No third-party SDKs, so nothing needs a module cache exception.
     CLANG_ENABLE_MODULES: YES
+    # An app whose whole pitch is that it runs on the phone should not also ask
+    # the phone to carry code nothing calls. On for every configuration: a debug
+    # build that strips differently is a debug build that tests something else.
+    DEAD_CODE_STRIPPING: YES
+  configs:
+    # Size, not speed, on the shipping build. The work that has to be fast here
+    # is the model's, and that runs in Metal and the Neural Engine rather than in
+    # anything this flag touches; what the app's own code costs is download size
+    # and pages resident next to a model that wants a gigabyte of them.
+    Release:
+      SWIFT_OPTIMIZATION_LEVEL: "-Osize"
 
 packages:
   # The whole brain of the app. Builds and tests with the Command Line Tools

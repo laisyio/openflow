@@ -110,7 +110,7 @@ final class KeyboardViewController: UIInputViewController {
 
     @objc private func insertLast() {
         guard let store = try? TranscriptStore.shared(),
-              case .record(let record) = store.readLast() else {
+              let record = store.lastEntry() else {
             // The button is disabled in both other cases; if we get here the
             // state changed underneath us, so re-read and say why.
             refresh()
