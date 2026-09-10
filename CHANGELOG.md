@@ -4,6 +4,13 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Benchmark: Cohere Transcribe measured
+By: Titan (with Claude)
+Impact: `docs/native-port/local-runner-benchmark.md`
+
+- Cohere Transcribe measured through the canonical gated weights after the terms were accepted: at 8-bit it costs what Qwen 1.7B costs and runs 2.4 times faster, with the best proper nouns and casing of any local engine. First inference in a fresh process pays a 12.7 s Metal compile, and the published repo is gated, so an accurate tier on Cohere needs an ungated 8-bit conversion of our own first.
+- Recommendation revised: Moonshine base-en light tier, Cohere 8-bit accurate tier once converted, Qwen 0.6B dropped.
+
 ### The status lines that report a failure are the ones that got cut off
 By: Ford (with Claude)
 Impact: `crates/openflow-native/src/ui/{mod.rs,settings.rs,main_window.rs}`
