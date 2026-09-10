@@ -207,6 +207,17 @@ pub enum EngineEvent {
 ///   after its own hop, never inside `emit`.
 pub trait EngineEvents: Send + Sync + 'static {
     fn emit(&self, event: EngineEvent) -> Result<(), String>;
+
+    /// Audio sinks may apply asynchronous backpressure. Unlike `emit`, this
+    /// method is never called while an engine lock is held. Dropping the future
+    /// must cancel a pending delivery, so cancelling speech cannot wait on a
+    /// slow player or block a runtime/UI thread.
+    fn emit_speech_chunk(
+        &self,
+        chunk: crate::speech::SpeechChunk,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move { self.emit(EngineEvent::TtsChunk(chunk)) })
+    }
 }
 
 /// A future the engine wants run to completion in the background.
@@ -335,6 +346,7 @@ pub struct Engine {
     /// and compares before every emit, so a reading still in the air when the
     /// key comes up cannot paint over the capture that follows it.
     partial_generation: AtomicU64,
+    partial_cancellation: Mutex<Option<CancellationToken>>,
     /// The last reading a preview loop got, and how many bytes of audio it had
     /// been given. Cleared when a capture starts, so a take can only ever be
     /// compared against its own preview.
@@ -396,6 +408,7 @@ impl Engine {
             transcription_jobs: Mutex::new(HashMap::new()),
             speech_jobs: Mutex::new(HashMap::new()),
             partial_generation: AtomicU64::new(0),
+            partial_cancellation: Mutex::new(None),
             last_preview: Mutex::new(None),
             events,
             runner,
@@ -623,6 +636,11 @@ impl Engine {
     /// ends a capture, before the take is transcribed for real.
     fn ended_capturing(&self) {
         self.partial_generation.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut pending) = self.partial_cancellation.lock() {
+            if let Some(token) = pending.take() {
+                token.cancel();
+            }
+        }
     }
 
     /// Read the recording every [`PARTIAL_INTERVAL`] and report what it says.
@@ -632,6 +650,7 @@ impl Engine {
     /// and retires the preview entirely once one reading runs over the interval
     /// (see [`should_hold`]).
     fn start_partials(self: &Arc<Self>) {
+        self.ended_capturing();
         // Before the early return, not after: with previewing off there is no
         // reading to come, and a take must never be weighed against the last
         // capture's preview.
@@ -660,12 +679,19 @@ impl Engine {
             local: self.settings.is_local_backend(),
         };
         let generation = self.partial_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let cancellation = CancellationToken::new();
+        if let Ok(mut pending) = self.partial_cancellation.lock() {
+            *pending = Some(cancellation.clone());
+        }
         let engine = Arc::clone(self);
         (self.spawn)(Box::pin(async move {
             let until = Instant::now() + PARTIAL_WINDOW;
             let mut last = String::new();
             loop {
-                tokio::time::sleep(PARTIAL_INTERVAL).await;
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    _ = tokio::time::sleep(PARTIAL_INTERVAL) => {},
+                }
                 if engine.partial_generation.load(Ordering::SeqCst) != generation {
                     return;
                 }
@@ -674,7 +700,9 @@ impl Engine {
                     return;
                 }
                 let started = Instant::now();
-                let reading = engine.read_recording_so_far(&config).await;
+                let reading = engine
+                    .read_recording_so_far(&config, &cancellation, generation)
+                    .await;
                 let over_budget = should_hold(started.elapsed(), PARTIAL_INTERVAL);
                 // A reading that fails is a reading skipped, never an error the
                 // user sees: too little audio yet, a window that carried no
@@ -741,7 +769,12 @@ impl Engine {
     /// history row and nothing typed into the focused app. One dictation reads
     /// itself many times, and anything with a side effect would fire that many
     /// times with it.
-    async fn read_recording_so_far(&self, config: &PartialConfig) -> Result<String, String> {
+    async fn read_recording_so_far(
+        &self,
+        config: &PartialConfig,
+        cancellation: &CancellationToken,
+        generation: u64,
+    ) -> Result<String, String> {
         {
             let recording = self
                 .recording
@@ -751,7 +784,10 @@ impl Engine {
                 return Err("No recording is active".to_string());
             }
         }
-        let wav_bytes = self.recorder.snapshot()?;
+        let recorder = self.recorder.clone();
+        let wav_bytes = tokio::task::spawn_blocking(move || recorder.snapshot())
+            .await
+            .map_err(|error| format!("Could not snapshot audio: {error}"))??;
         let audio_bytes = wav_bytes.len();
         // On the local backend the endpoint is whichever port the sidecar came
         // up on, and it may not be up yet. Skip the reading rather than wait:
@@ -775,22 +811,52 @@ impl Engine {
             )
         };
         let model = (!model.is_empty()).then_some(model);
-        let text = transcribe::transcribe_audio(
-            wav_bytes,
-            &key,
-            config.language.as_deref(),
-            &provider,
-            model.as_deref(),
-            config.dictionary.as_deref(),
-        )
-        .await?;
+        let text = if config.local {
+            let port = self
+                .runner
+                .ready_port()
+                .ok_or("The local runner is not ready yet")?;
+            transcribe::transcribe_local_audio(
+                wav_bytes,
+                port,
+                config.language.as_deref(),
+                model.as_deref(),
+                &transcribe::LocalJob {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    preview: true,
+                    cancellation: cancellation.clone(),
+                },
+            )
+            .await?
+        } else {
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err("Preview cancelled".to_string()),
+                result = transcribe::transcribe_audio(
+                wav_bytes,
+                &key,
+                config.language.as_deref(),
+                &provider,
+                model.as_deref(),
+                config.dictionary.as_deref(),
+            ) => result?,
+            }
+        };
         // The same post-pass the take gets, so a preview does not show one
         // spelling and the transcript another.
         let text = crate::postpass::apply(&text, config.dictionary.as_deref());
-        if let Ok(mut last) = self.last_preview.lock() {
-            *last = Some((text.clone(), audio_bytes));
-        }
+        self.remember_preview(generation, &text, audio_bytes);
         Ok(text)
+    }
+
+    fn remember_preview(&self, generation: u64, text: &str, audio_bytes: usize) {
+        if let Ok(mut last) = self.last_preview.lock() {
+            // The UI check in the caller does not protect this cache. Check
+            // while holding its lock so a stale completion cannot replace a
+            // new capture's cleared preview baseline.
+            if self.partial_generation.load(Ordering::SeqCst) == generation {
+                *last = Some((text.to_string(), audio_bytes));
+            }
+        }
     }
 
     /// Stop and transcribe, handing the transcript back to the caller. The
@@ -979,7 +1045,9 @@ impl Engine {
         request_id: String,
         cancellation: CancellationToken,
     ) -> Result<Transcription, Failure> {
-        let result = self.run_pipeline_inner(cancellation, wav_bytes).await;
+        let result = self
+            .run_pipeline_inner(cancellation, wav_bytes, &request_id)
+            .await;
         if let Ok(mut active) = self.transcription_jobs.lock() {
             active.remove(&request_id);
         }
@@ -998,6 +1066,7 @@ impl Engine {
         &self,
         cancellation: CancellationToken,
         wav_bytes: Vec<u8>,
+        request_id: &str,
     ) -> Result<(Transcription, Vec<Failure>), Failure> {
         self.arm_local_only();
         let duration_ms = wav_duration_ms(&wav_bytes);
@@ -1036,9 +1105,29 @@ impl Engine {
             resolved = self.stt_endpoint(&remote_provider, &remote_key, &remote_provider_name) => resolved.map_err(|e| Failure::at(e, Remedy::Providers))?,
         };
 
-        let raw_text = tokio::select! {
-            _ = cancellation.cancelled() => return Err(Failure::plain("Transcription cancelled")),
-            result = transcribe::transcribe_audio(wav_bytes, &stt_key, language.as_deref(), &stt_provider, stt_model.as_deref(), dictionary.as_deref()) => result.map_err(|e| Failure::at(e, Remedy::Providers))?,
+        let raw_text = if local {
+            let port = self
+                .runner
+                .ready_port()
+                .ok_or_else(|| Failure::at("The local runner is not ready", Remedy::Providers))?;
+            transcribe::transcribe_local_audio(
+                wav_bytes,
+                port,
+                language.as_deref(),
+                stt_model.as_deref(),
+                &transcribe::LocalJob {
+                    id: request_id.to_string(),
+                    preview: false,
+                    cancellation: cancellation.clone(),
+                },
+            )
+            .await
+            .map_err(|e| Failure::at(e, Remedy::Providers))?
+        } else {
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(Failure::plain("Transcription cancelled")),
+                result = transcribe::transcribe_audio(wav_bytes, &stt_key, language.as_deref(), &stt_provider, stt_model.as_deref(), dictionary.as_deref()) => result.map_err(|e| Failure::at(e, Remedy::Providers))?,
+            }
         };
         // The dictionary as a deterministic replacement, once, before anything
         // else reads the text. The local runner needs it because Qwen ignores
@@ -1048,9 +1137,12 @@ impl Engine {
         // after cleanup means plugins and the formatting model both see the
         // spellings the user asked for.
         let raw_text = crate::postpass::apply(&raw_text, dictionary.as_deref());
-        let raw_text = self
-            .plugin_manager
-            .run_hook(
+        let manager = self.plugin_manager.clone();
+        let plugins = tokio::task::spawn_blocking(move || manager.list_plugins())
+            .await
+            .map_err(|e| Failure::at(format!("Could not read plugins: {e}"), Remedy::Plugins))?;
+        let (after_transcribe, remaining_plugin_budget) = self
+            .run_plugin_stage(
                 "after_transcribe",
                 HookPayload {
                     raw_text: Some(raw_text),
@@ -1058,8 +1150,13 @@ impl Engine {
                     provider: Some(provider_str.clone()),
                     language: language.clone(),
                 },
+                plugins.clone(),
+                cancellation.clone(),
+                Duration::from_secs(10),
             )
-            .map_err(|e| Failure::at(e, Remedy::Plugins))?
+            .await
+            .map_err(|e| Failure::at(e, Remedy::Plugins))?;
+        let raw_text = after_transcribe
             .raw_text
             .ok_or_else(|| Failure::at("Plugin removed the transcription text", Remedy::Plugins))?;
 
@@ -1093,9 +1190,8 @@ impl Engine {
         } else {
             raw_text.clone()
         };
-        formatted = self
-            .plugin_manager
-            .run_hook(
+        let (after_format, _) = self
+            .run_plugin_stage(
                 "after_format",
                 HookPayload {
                     raw_text: Some(raw_text.clone()),
@@ -1103,8 +1199,13 @@ impl Engine {
                     provider: Some(provider_str.clone()),
                     language: language.clone(),
                 },
+                plugins,
+                cancellation.clone(),
+                remaining_plugin_budget,
             )
-            .map_err(|e| Failure::at(e, Remedy::Plugins))?
+            .await
+            .map_err(|e| Failure::at(e, Remedy::Plugins))?;
+        formatted = after_format
             .formatted_text
             .ok_or_else(|| Failure::at("Plugin removed the formatted text", Remedy::Plugins))?;
 
@@ -1120,6 +1221,24 @@ impl Engine {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         self.finish_take(&cancellation, transcription)
+    }
+
+    async fn run_plugin_stage(
+        &self,
+        hook: &'static str,
+        payload: HookPayload,
+        plugins: Vec<crate::plugins::PluginInfo>,
+        cancellation: CancellationToken,
+        budget: Duration,
+    ) -> Result<(HookPayload, Duration), String> {
+        let manager = self.plugin_manager.clone();
+        let started = Instant::now();
+        let payload = tokio::task::spawn_blocking(move || {
+            manager.run_hook_cancellable(hook, payload, &plugins, &cancellation, budget)
+        })
+        .await
+        .map_err(|error| format!("Plugin worker failed: {error}"))??;
+        Ok((payload, budget.saturating_sub(started.elapsed())))
     }
 
     /// Write the take down and put it where the user is typing: the two steps
@@ -1272,6 +1391,14 @@ impl Engine {
         self.settings.db().search_history(query, limit)
     }
 
+    pub fn history_page(
+        &self,
+        limit: usize,
+        before: Option<&crate::db::HistoryCursor>,
+    ) -> Result<Vec<Transcription>, String> {
+        self.settings.db().get_history_page(limit, before)
+    }
+
     pub fn transcription(&self, id: &str) -> Result<Option<Transcription>, String> {
         self.settings.db().get_transcription(id)
     }
@@ -1406,6 +1533,24 @@ mod tests {
 
     fn scratch_engine() -> Arc<Engine> {
         scratch_engine_and_events().0
+    }
+
+    #[test]
+    fn stale_preview_cannot_replace_the_next_captures_baseline() {
+        let engine = scratch_engine();
+        let old = engine.partial_generation.load(Ordering::SeqCst);
+        engine.remember_preview(old, "first capture", 123);
+        engine.ended_capturing();
+        *engine.last_preview.lock().unwrap() = None;
+        engine.remember_preview(old, "late completion", 456);
+        assert!(engine.last_preview.lock().unwrap().is_none());
+        let current = engine.partial_generation.load(Ordering::SeqCst);
+        engine.remember_preview(current, "new capture", 789);
+        engine.remember_preview(old, "another old completion", 999);
+        assert_eq!(
+            *engine.last_preview.lock().unwrap(),
+            Some(("new capture".to_string(), 789))
+        );
     }
 
     fn stored_take(id: &str, text: &str, created_at: &str) -> Transcription {

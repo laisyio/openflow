@@ -257,6 +257,7 @@ pub struct DictateIvars {
     /// where in the app that failure is answered. The card is the page's
     /// "what just happened", and what just happened was the failure.
     problem: RefCell<Option<String>>,
+    refresh: Arc<crate::ui::refresh::RefreshGate>,
 }
 
 define_class!(
@@ -274,12 +275,12 @@ define_class!(
         /// method are all decided downstream of here.
         #[unsafe(method(holdBegan:))]
         fn hold_began(&self, _sender: &AnyObject) {
-            self.ivars().engine.hotkey_pressed();
+            crate::hotkeys::capture_edge(&self.ivars().engine, true);
         }
 
         #[unsafe(method(holdEnded:))]
         fn hold_ended(&self, _sender: &AnyObject) {
-            self.ivars().engine.hotkey_released();
+            crate::hotkeys::capture_edge(&self.ivars().engine, false);
         }
 
         #[unsafe(method(cancelTranscription:))]
@@ -335,6 +336,7 @@ impl DictatePage {
             last: RefCell::new(None),
             state: Cell::new(RecordingState::Idle),
             problem: RefCell::new(None),
+            refresh: Arc::new(crate::ui::refresh::RefreshGate::default()),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -347,7 +349,6 @@ impl DictatePage {
         crate::ui::wire(&controls.result, target, sel!(copyLast:));
 
         this.set_state(RecordingState::Idle);
-        this.load();
         this
     }
 
@@ -370,6 +371,9 @@ impl DictatePage {
     /// bindings, which Settings can change, and the newest transcription.
     pub fn load(&self) {
         let ivars = self.ivars();
+        if !ivars.refresh.visible() {
+            return;
+        }
         let settings = ivars.engine.settings();
         let record = binding_text(settings, "record");
         let recopy = binding_text(settings, "recopy");
@@ -392,11 +396,51 @@ impl DictatePage {
             return;
         }
 
-        let newest = ivars
-            .engine
-            .history(1)
-            .ok()
-            .and_then(|rows| rows.into_iter().next());
+        let generation = ivars.refresh.invalidate();
+        let engine = Arc::clone(&ivars.engine);
+        let gate = Arc::clone(&ivars.refresh);
+        crate::app::spawn(async move {
+            let newest = tokio::task::spawn_blocking(move || {
+                if !gate.accepts(generation) {
+                    return Ok(Vec::new());
+                }
+                engine.history(1)
+            })
+            .await;
+            crate::events::on_main(move || {
+                crate::app::with_app(|app| {
+                    app.with_main(|window| {
+                        let page = window.dictate();
+                        if page.ivars().refresh.accepts(generation) {
+                            if let Ok(Ok(rows)) = newest {
+                                page.loaded(rows.into_iter().next());
+                            }
+                        }
+                    });
+                });
+            });
+        });
+
+        self.set_state(ivars.state.get());
+    }
+
+    pub fn on_shown(&self) {
+        self.ivars().refresh.show();
+        self.load();
+        self.focus_record();
+    }
+
+    pub fn on_hidden(&self) {
+        self.ivars().refresh.hide();
+    }
+
+    pub fn invalidate(&self) {
+        self.ivars().refresh.invalidate();
+        self.load();
+    }
+
+    fn loaded(&self, newest: Option<openflow_core::db::Transcription>) {
+        let ivars = self.ivars();
         match newest {
             Some(row) => {
                 let text = row.formatted_text.unwrap_or(row.raw_text);
@@ -425,6 +469,7 @@ impl DictatePage {
     /// or `None` when there is nowhere useful to go.
     pub fn set_problem(&self, message: &str, target: Option<&str>) {
         let ivars = self.ivars();
+        ivars.refresh.invalidate();
         *ivars.problem.borrow_mut() = target.map(str::to_string);
         ivars
             .controls
@@ -452,6 +497,7 @@ impl DictatePage {
 
     /// Show `text` on the result card, with `caption` above it.
     pub fn set_last(&self, text: &str, caption: &str) {
+        self.ivars().refresh.invalidate();
         let ivars = self.ivars();
         *ivars.problem.borrow_mut() = None;
         *ivars.last.borrow_mut() = Some(text.to_string());

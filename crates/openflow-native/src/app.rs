@@ -267,14 +267,12 @@ impl App {
             // re-runs its own search, so a filtered list stays filtered, and
             // Dictate re-reads the newest row for its result card.
             EngineEvent::HistoryChanged => {
-                self.tray.rebuild(&self.engine);
-                self.with_main(|window| {
-                    window.history().load();
-                    window.dictate().load();
-                });
+                self.tray.refresh_history(&self.engine);
+                self.with_main(|window| window.history_changed());
             }
             EngineEvent::TtsStarted(started) => self.tts.started(&started),
-            EngineEvent::TtsChunk(chunk) => self.tts.chunk(&chunk),
+            // Native audio bypasses AppKit through the bounded async ingress.
+            EngineEvent::TtsChunk(_) => {}
             // Both of these are written against the request id, never
             // unconditionally: with one id per preview, a stream that was
             // cancelled reports back after the next preview is already on
@@ -338,7 +336,7 @@ impl App {
     /// tooltip written here lasts until the next thing writes one, and the
     /// settling that follows every take is one of those. It is also refused
     /// outright while a failure is standing.
-    fn notify(&self, title: &str, body: &str) {
+    pub(crate) fn notify(&self, title: &str, body: &str) {
         self.tray.set_tooltip(&format!("{}: {}", title, body));
     }
 
@@ -529,6 +527,7 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
         mtm,
     });
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));
+    app.tray.refresh_history(&app.engine);
 
     // Key equivalents only exist if there is a main menu to route them
     // through, even though an accessory app never draws one.

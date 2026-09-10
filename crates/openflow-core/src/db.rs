@@ -20,6 +20,22 @@ pub struct Database {
     conn: Mutex<Connection>,
 }
 
+/// Stable continuation for history, including rows sharing one timestamp.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct HistoryCursor {
+    pub created_at: String,
+    pub id: String,
+}
+
+impl From<&Transcription> for HistoryCursor {
+    fn from(row: &Transcription) -> Self {
+        Self {
+            created_at: row.created_at.clone(),
+            id: row.id.clone(),
+        }
+    }
+}
+
 impl Database {
     pub fn new(app_dir: PathBuf) -> Result<Self, String> {
         std::fs::create_dir_all(&app_dir)
@@ -55,6 +71,8 @@ impl Database {
                 language TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS transcriptions_recency
+                ON transcriptions(created_at DESC, id DESC);
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -121,28 +139,49 @@ impl Database {
     }
 
     pub fn get_history(&self, limit: usize) -> Result<Vec<Transcription>, String> {
+        self.get_history_page(limit, None)
+    }
+
+    pub fn get_history_page(
+        &self,
+        limit: usize,
+        before: Option<&HistoryCursor>,
+    ) -> Result<Vec<Transcription>, String> {
         let limit = limit.min(500);
         let conn = self.connection()?;
-        let mut stmt = conn.prepare(
+        let sql = if before.is_some() {
             "SELECT id, raw_text, formatted_text, provider, duration_ms, context_type, window_title, language, created_at
-             FROM transcriptions ORDER BY created_at DESC LIMIT ?1"
-        ).map_err(|e| format!("Query failed: {}", e))?;
+             FROM transcriptions WHERE (created_at, id) < (?2, ?3)
+             ORDER BY created_at DESC, id DESC LIMIT ?1"
+        } else {
+            "SELECT id, raw_text, formatted_text, provider, duration_ms, context_type, window_title, language, created_at
+             FROM transcriptions ORDER BY created_at DESC, id DESC LIMIT ?1"
+        };
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| format!("Query failed: {}", e))?;
+        stmt.raw_bind_parameter(1, limit as i64)
+            .map_err(|e| e.to_string())?;
+        if let Some(cursor) = before {
+            stmt.raw_bind_parameter(2, &cursor.created_at)
+                .map_err(|e| e.to_string())?;
+            stmt.raw_bind_parameter(3, &cursor.id)
+                .map_err(|e| e.to_string())?;
+        }
 
-        let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok(Transcription {
-                    id: row.get(0)?,
-                    raw_text: row.get(1)?,
-                    formatted_text: row.get(2)?,
-                    provider: row.get(3)?,
-                    duration_ms: row.get(4)?,
-                    context_type: row.get(5)?,
-                    window_title: row.get(6)?,
-                    language: row.get(7)?,
-                    created_at: row.get(8)?,
-                })
+        let rows = stmt.raw_query().mapped(|row| {
+            Ok(Transcription {
+                id: row.get(0)?,
+                raw_text: row.get(1)?,
+                formatted_text: row.get(2)?,
+                provider: row.get(3)?,
+                duration_ms: row.get(4)?,
+                context_type: row.get(5)?,
+                window_title: row.get(6)?,
+                language: row.get(7)?,
+                created_at: row.get(8)?,
             })
-            .map_err(|e| format!("Query map failed: {}", e))?;
+        });
 
         let mut results = Vec::new();
         for row in rows {
@@ -158,7 +197,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, raw_text, formatted_text, provider, duration_ms, context_type, window_title, language, created_at
              FROM transcriptions WHERE raw_text LIKE ?1 OR formatted_text LIKE ?1
-             ORDER BY created_at DESC LIMIT ?2"
+             ORDER BY created_at DESC, id DESC LIMIT ?2"
         ).map_err(|e| format!("Search failed: {}", e))?;
 
         let rows = stmt
@@ -330,6 +369,40 @@ pub(crate) mod tests {
     }
 
     use std::path::Path;
+
+    #[test]
+    fn history_pages_use_the_recency_index_and_do_not_skip_timestamp_ties() {
+        let directory = scratch_dir();
+        let db = Database::new(directory.clone()).unwrap();
+        for id in ["a", "c", "b"] {
+            let mut row = transcription(id, "page");
+            row.created_at = "2026-09-10T10:00:00Z".to_string();
+            db.save_transcription(&row).unwrap();
+        }
+        let first = db.get_history_page(2, None).unwrap();
+        assert_eq!(
+            first.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["c", "b"]
+        );
+        let cursor = HistoryCursor::from(first.last().unwrap());
+        // A newer row arriving between pages must not shift the continuation.
+        let mut new = transcription("new", "page");
+        new.created_at = "2026-09-11T10:00:00Z".to_string();
+        db.save_transcription(&new).unwrap();
+        let second = db.get_history_page(2, Some(&cursor)).unwrap();
+        assert_eq!(
+            second.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["a"]
+        );
+        let conn = db.connection().unwrap();
+        let plan = conn.prepare("EXPLAIN QUERY PLAN SELECT id FROM transcriptions ORDER BY created_at DESC, id DESC LIMIT 200")
+            .unwrap().query_map([], |row| row.get::<_, String>(3)).unwrap().collect::<Result<Vec<_>, _>>().unwrap().join(" ");
+        assert!(plan.contains("transcriptions_recency"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        drop(conn);
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn scratch_dir() -> PathBuf {
         std::env::temp_dir().join(format!("openflow-db-{}", uuid::Uuid::new_v4()))

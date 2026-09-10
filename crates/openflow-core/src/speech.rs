@@ -45,7 +45,22 @@ pub struct SpeechStarted {
 pub struct SpeechChunk {
     pub request_id: String,
     pub sequence: u64,
-    pub data_base64: String,
+    // Native hosts receive the bytes directly. Only a serializing host (the
+    // Tauri bridge) pays for base64, retaining the existing webview wire format.
+    #[serde(rename = "data_base64", serialize_with = "serialize_audio")]
+    pub data: Vec<u8>,
+}
+
+fn serialize_audio<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+fn append_bounded(audio: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<(), String> {
+    if chunk.len() > limit.saturating_sub(audio.len()) {
+        return Err("Generated speech is too large".to_string());
+    }
+    audio.extend_from_slice(chunk);
+    Ok(())
 }
 
 #[derive(Serialize, Clone)]
@@ -152,12 +167,17 @@ pub async fn synthesize(
     let response =
         transcribe::request_speech(&request.text, &api_key, &provider, &model, &voice, &format)
             .await?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("Could not read speech audio: {}", error))?;
-    if bytes.len() as u64 > MAX_SPEECH_BYTES {
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_SPEECH_BYTES)
+    {
         return Err("Generated speech is too large".to_string());
+    }
+    let mut bytes = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|error| format!("Could not read speech audio: {}", error))?;
+        append_bounded(&mut bytes, &chunk, MAX_SPEECH_BYTES as usize)?;
     }
     Ok(SpeechAudio {
         data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -226,13 +246,22 @@ pub async fn stream(
             let chunk = chunk.map_err(|error| format!("Speech stream failed: {}", error))?;
             total = total.saturating_add(chunk.len() as u64);
             if total > MAX_SPEECH_BYTES { return Err("Generated speech is too large".to_string()); }
-            let payload = SpeechChunk {
-                request_id: request_id.clone(),
-                sequence,
-                data_base64: base64::engine::general_purpose::STANDARD.encode(chunk),
-            };
-            events.emit(EngineEvent::TtsChunk(payload)).map_err(|error| format!("Could not deliver speech audio: {}", error))?;
-            sequence += 1;
+            // A bounded native channel can now budget a slot as at most 64 KiB,
+            // independent of how a provider or HTTP implementation frames data.
+            for data in chunk.chunks(64 * 1024) {
+                let payload = SpeechChunk {
+                    request_id: request_id.clone(),
+                    sequence,
+                    data: data.to_vec(),
+                };
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Err("Speech generation cancelled".to_string()),
+                    delivered = events.emit_speech_chunk(payload) => {
+                        delivered.map_err(|error| format!("Could not deliver speech audio: {}", error))?;
+                    }
+                }
+                sequence += 1;
+            }
         }
         let result = SpeechResult {
             request_id: request_id.clone(),
@@ -279,6 +308,29 @@ pub fn cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_chunks_preserve_the_webview_wire_format() {
+        let chunk = SpeechChunk {
+            request_id: "a".into(),
+            sequence: 2,
+            data: vec![0, 1, 255],
+        };
+        let json = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(json["data_base64"], "AAH/");
+        assert!(json.get("data").is_none());
+        assert_eq!(chunk.data, [0, 1, 255]);
+    }
+
+    #[test]
+    fn whole_speech_limit_is_checked_before_copying() {
+        let mut audio = vec![1, 2];
+        append_bounded(&mut audio, &[3, 4], 4).unwrap();
+        let capacity = audio.capacity();
+        assert!(append_bounded(&mut audio, &[5; 100], 4).is_err());
+        assert_eq!(audio, [1, 2, 3, 4]);
+        assert_eq!(audio.capacity(), capacity);
+    }
 
     #[test]
     fn speech_key_never_leaks_across_endpoints() {

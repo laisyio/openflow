@@ -37,6 +37,7 @@ use openflow_core::db::Transcription;
 use openflow_core::engine::Engine;
 
 use crate::ui::card::{Card, GAP, MARGIN};
+use crate::ui::refresh::RefreshGate;
 use crate::ui::{button, empty_state, note};
 
 /// Gap between a table card's edge and the table inside it. Smaller than a
@@ -163,6 +164,8 @@ pub struct HistoryIvars {
     view: Retained<NSView>,
     controls: Controls,
     rows: RefCell<Vec<Transcription>>,
+    refresh: Arc<RefreshGate>,
+    query_slot: Arc<tokio::sync::Semaphore>,
 }
 
 define_class!(
@@ -226,12 +229,22 @@ define_class!(
         /// the clipboard, because the user is looking at their editor.
         #[unsafe(method(pasteRow:))]
         fn paste_row(&self, _sender: &NSControl) {
-            let Some(item) = self.selected() else {
+            let Some(id) = self.selected_id() else {
                 self.say("Select a row first.");
                 return;
             };
-            let problem = self.ivars().engine.paste_transcription(&item.id);
-            self.say(&paste_caption(problem));
+            let engine = Arc::clone(&self.ivars().engine);
+            self.say("Pasting...");
+            if let Err(error) = crate::hotkeys::insert_off_main(move || {
+                let problem = engine.paste_transcription(&id);
+                crate::events::on_main(move || {
+                    crate::app::with_app(|app| {
+                        app.with_main(|window| window.history().say(&paste_caption(problem)));
+                    });
+                });
+            }) {
+                self.say(error);
+            }
         }
 
         #[unsafe(method(deleteRow:))]
@@ -242,10 +255,9 @@ define_class!(
             };
             // The engine emits `HistoryChanged`, which reloads this window
             // through the ordinary event path. Nothing to refresh here.
-            match self.ivars().engine.delete_transcription(&item.id) {
-                Ok(()) => self.say("Deleted."),
-                Err(error) => self.say(&error),
-            }
+            self.mutate(move |engine| {
+                engine.delete_transcription(&item.id).map(|()| "Deleted.".to_string())
+            });
         }
 
         #[unsafe(method(clearAll:))]
@@ -253,14 +265,13 @@ define_class!(
             if !self.confirm_clear() {
                 return;
             }
-            match self.ivars().engine.clear_history() {
-                Ok(removed) => self.say(&format!(
+            self.mutate(|engine| {
+                engine.clear_history().map(|removed| format!(
                     "Deleted {} stored transcription{}.",
                     removed,
                     if removed == 1 { "" } else { "s" }
-                )),
-                Err(error) => self.say(&error),
-            }
+                ))
+            });
         }
     }
 );
@@ -282,6 +293,8 @@ impl HistoryPage {
             view,
             controls,
             rows: RefCell::new(Vec::new()),
+            refresh: Arc::new(RefreshGate::default()),
+            query_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -291,13 +304,27 @@ impl HistoryPage {
         // because a cell-based table needs none.
         unsafe { table.setDataSource(Some(ProtocolObject::from_ref(&*this))) };
         this.wire_actions();
-        this.load();
         this
     }
 
     /// The view the main window installs in its content pane.
     pub fn view(&self) -> Retained<NSView> {
         self.ivars().view.clone()
+    }
+
+    fn mutate(&self, action: impl FnOnce(&Engine) -> Result<String, String> + Send + 'static) {
+        let engine = Arc::clone(&self.ivars().engine);
+        crate::app::spawn(async move {
+            let message = tokio::task::spawn_blocking(move || action(&engine))
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+                .unwrap_or_else(|error| error);
+            crate::events::on_main(move || {
+                crate::app::with_app(|app| {
+                    app.with_main(|window| window.history().say(&message));
+                });
+            });
+        });
     }
 
     fn wire_actions(&self) {
@@ -320,13 +347,62 @@ impl HistoryPage {
     /// page is shown, when a search is submitted, and on `HistoryChanged`.
     pub fn load(&self) {
         let ivars = self.ivars();
+        if !ivars.refresh.visible() {
+            return;
+        }
         let query = ivars.controls.search.stringValue().to_string();
-        let trimmed = query.trim();
-        let result = if trimmed.is_empty() {
-            ivars.engine.history(LIMIT)
-        } else {
-            ivars.engine.search_history(trimmed, LIMIT)
-        };
+        let generation = ivars.refresh.invalidate();
+        let gate = Arc::clone(&ivars.refresh);
+        let slot = Arc::clone(&ivars.query_slot);
+        let engine = Arc::clone(&ivars.engine);
+        crate::app::spawn(async move {
+            if !query.trim().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            }
+            let Ok(permit) = slot.acquire_owned().await else {
+                return;
+            };
+            if !gate.accepts(generation) {
+                return;
+            }
+            let search = query.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                if search.trim().is_empty() {
+                    engine.history(LIMIT)
+                } else {
+                    engine.search_history(search.trim(), LIMIT)
+                }
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("History query failed: {error}")));
+            crate::events::on_main(move || {
+                crate::app::with_app(|app| {
+                    app.with_main(|window| window.history().loaded(generation, &query, result));
+                });
+            });
+        });
+    }
+
+    pub fn on_shown(&self) {
+        self.ivars().refresh.show();
+        self.load();
+    }
+
+    pub fn on_hidden(&self) {
+        self.ivars().refresh.hide();
+    }
+
+    pub fn invalidate(&self) {
+        self.ivars().refresh.invalidate();
+        self.load();
+    }
+
+    fn loaded(&self, generation: u64, query: &str, result: Result<Vec<Transcription>, String>) {
+        let ivars = self.ivars();
+        if !ivars.refresh.accepts(generation) {
+            return;
+        }
         match result {
             Ok(rows) => {
                 let count = rows.len();
@@ -347,7 +423,7 @@ impl HistoryPage {
                     // would only say it again.
                     self.say("");
                 } else {
-                    self.say(&status_line(count, &query));
+                    self.say(&status_line(count, query));
                 }
                 self.show_rows(count > 0);
             }
@@ -379,6 +455,14 @@ impl HistoryPage {
         let row = ivars.controls.table.selectedRow();
         let index = usize::try_from(row).ok()?;
         ivars.rows.borrow().get(index).cloned()
+    }
+
+    /// Paste admission only needs an ID, not a potentially large transcript
+    /// clone that would immediately be dropped when another paste is active.
+    fn selected_id(&self) -> Option<String> {
+        let ivars = self.ivars();
+        let index = usize::try_from(ivars.controls.table.selectedRow()).ok()?;
+        ivars.rows.borrow().get(index).map(|item| item.id.clone())
     }
 
     fn confirm_clear(&self) -> bool {
