@@ -46,6 +46,26 @@ public struct ModelStore: Sendable {
         ModelStore(directory: directory.appendingPathComponent(relativePath, isDirectory: true))
     }
 
+    /// The same store, for a caller with nowhere to put an error.
+    ///
+    /// `DictationController.init` is not throwing and constructs the engine
+    /// before anything is downloaded, so it needs a store rather than a
+    /// decision. Application Support is missing only on a system that is already
+    /// broken; falling back to the temporary directory keeps the app launchable
+    /// and lets the failure surface where it can be reported, at `load()`, as
+    /// weights that are not there.
+    ///
+    /// It exists so the `OpenFlow/Models` path stays written down once. A caller
+    /// spelling the fallback itself is how the app and the downloader end up
+    /// looking in two different places.
+    public static func applicationSupportOrTemporary() -> ModelStore {
+        (try? applicationSupport())
+            ?? ModelStore(
+                directory: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("OpenFlow/Models", isDirectory: true)
+            )
+    }
+
     public func url(for name: String) -> URL {
         directory.appendingPathComponent(name)
     }

@@ -17,13 +17,15 @@ struct ModelDownloadView: View {
     enum Phase: Equatable {
         case idle
         case downloading
-        case verifying
+        /// Named, because verifying is three passes over three files and a
+        /// spinner that says nothing for a minute looks like a hang.
+        case verifying(String)
         case installing
         case installed
         case failed(String)
     }
 
-    private var pin: ModelDownloader.Pin {
+    private var pin: ModelDownloader.ModelPin {
         ModelDownloader.pin(for: controller.settings.engine)
     }
 
@@ -34,12 +36,29 @@ struct ModelDownloadView: View {
         EngineProfile.profile(for: controller.settings.engine)
     }
 
+    /// "three", from the pin, rather than typed into three sentences. A Moonshine
+    /// model is an encoder, a decoder and a tokenizer today; the day one is
+    /// pinned that is not, the copy follows instead of lying.
+    ///
+    /// Spelled out rather than run through a number formatter, for the same
+    /// reason `EngineProfile` formats its sizes by hand: the sentence around it
+    /// is English, and a localised digit in the middle of it would be the worse
+    /// of the two.
+    private var fileCount: String {
+        switch profile.fileCount {
+        case 1: return "one"
+        case 2: return "two"
+        case 3: return "three"
+        default: return String(profile.fileCount)
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    Text("OpenFlow recognises speech on this phone. To do that it needs the recogniser itself, which is a large file.")
-                    LabeledContent("Download size", value: "\(profile.downloadDescription), once")
+                    Text("OpenFlow recognises speech on this phone. To do that it needs the recogniser itself, which is \(fileCount) files.")
+                    LabeledContent("Download size", value: "\(profile.downloadDescription) in \(fileCount) files, once")
                     LabeledContent("Space on disk", value: "\(profile.downloadDescription), kept out of your backups")
                     LabeledContent("Memory while dictating", value: profile.residentDescription)
                 } header: {
@@ -47,7 +66,7 @@ struct ModelDownloadView: View {
                 }
 
                 Section {
-                    Text("The file is checked against a fingerprint built into the app. If it does not match, OpenFlow deletes it and refuses to use it.")
+                    Text("Each of the \(fileCount) files is checked against a fingerprint built into the app. If any of them does not match, OpenFlow deletes the lot and refuses to use them.")
                     Text("This is the only network request OpenFlow ever makes. After it finishes, the app works with the phone in Airplane Mode.")
                         .foregroundStyle(.secondary)
                 } header: {
@@ -64,8 +83,8 @@ struct ModelDownloadView: View {
                             Text(progressLabel).font(.caption).foregroundStyle(.secondary)
                             Button("Cancel", role: .destructive) { state = .idle }
                         }
-                    case .verifying:
-                        ProgressView("Checking the fingerprint")
+                    case .verifying(let file):
+                        ProgressView("Checking \(file)")
                     case .installing:
                         ProgressView("Putting it in place")
                     case .installed:
@@ -114,8 +133,8 @@ struct ModelDownloadView: View {
                     case .downloading(let got, let want):
                         received = got
                         expected = want
-                    case .verifying:
-                        state = .verifying
+                    case .verifying(let file):
+                        state = .verifying(file)
                     case .installing:
                         state = .installing
                     case .finished:
@@ -123,9 +142,9 @@ struct ModelDownloadView: View {
                     }
                 }
             } catch ModelDownloader.DownloadError.placeholderPin {
-                state = .failed("This build has no recogniser pinned yet. Milestone M2 adds it.")
-            } catch ModelDownloader.DownloadError.checksumMismatch {
-                state = .failed("The downloaded file did not match its fingerprint, so it was deleted.")
+                state = .failed("This build has no recogniser pinned yet.")
+            } catch ModelDownloader.DownloadError.checksumMismatch(let file, _, _) {
+                state = .failed("\(file) did not match its fingerprint, so nothing was installed.")
             } catch {
                 state = .failed((error as NSError).localizedDescription)
             }

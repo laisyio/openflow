@@ -71,7 +71,7 @@ What Moonshine does not do: languages other than English under a commercial lice
 
 ## 4. Settings (all local, UserDefaults in the App Group)
 
-`engine` (qwen06 | whisper), `stopOnSilence` (bool, default false), `silenceHoldMs` (default 1200), `dictionary` (800 chars), `clipboardExpirySeconds` (default 60, 0 = never), `saveHistory` (default true), `historyRetentionDays` (default 30), `unloadAfterMinutes` (default 5), `prewarmOnCapture` (default true), `hapticOnStop` (default true), `onboardingComplete`.
+`engine` (moonshineBase | moonshineTiny, default moonshineBase), `stopOnSilence` (bool, default false), `silenceHoldMs` (default 1200), `dictionary` (800 chars), `clipboardExpirySeconds` (default 60, 0 = never), `saveHistory` (default true), `historyRetentionDays` (default 30), `unloadAfterMinutes` (default 5), `prewarmOnCapture` (default true), `hapticOnStop` (default true), `onboardingComplete`.
 
 No analytics, no crash reporter, no remote config, no third-party SDK. The privacy manifest declares no collected data types. App Transport Security stays default and the only host the app contacts is the model host, listed in the manifest and in the download screen.
 

@@ -302,6 +302,17 @@ import Testing
         #expect(!store.exists("weights.bin"))
     }
 
+    /// The engine is constructed in a non-throwing initialiser, so it needs a
+    /// store rather than a decision. What matters is that it is the same
+    /// directory the downloader installs into whenever Application Support is
+    /// available, which on any working system is always.
+    @Test func testTheNonThrowingStoreIsTheRealOneWhenTheSystemIsHealthy() throws {
+        let store = ModelStore.applicationSupportOrTemporary()
+        let real = try ModelStore.applicationSupport()
+        #expect(store.directory == real.directory)
+        #expect(store.directory.path.hasSuffix("OpenFlow/Models"))
+    }
+
     /// A model that is a set of files gets its own directory, and the flag that
     /// keeps 141 MB out of iCloud is set once at the top and inherited.
     @Test func testASubdirectoryIsRootedUnderTheStoreAndPreparesItsParents() throws {

@@ -150,8 +150,11 @@ public enum SilenceGate {
     }
 
     /// The desktop refuses to upload a dead take rather than let Whisper
-    /// hallucinate over it. On the phone there is no upload, but the same take
-    /// would make Qwen invent a sentence, so the sheet says so instead.
+    /// hallucinate over it. On the phone there is no upload, and Moonshine
+    /// answers silence with nothing rather than an invented sentence, which the
+    /// engine turns into `noSpeechRecognised`. The gate still runs first,
+    /// because "no sound reached OpenFlow from this microphone" tells the user
+    /// what to fix and "nothing was recognised" does not.
     public static func rejectionMessage(deviceName: String) -> String {
         "No sound reached OpenFlow from \"\(deviceName)\". Check the microphone permission in Settings."
     }
