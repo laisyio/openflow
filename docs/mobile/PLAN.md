@@ -4,13 +4,13 @@ Status: plan v1, 2026-09-02. Author: Titan (with Claude). Base: origin/main 9c8b
 
 ## 0. The offer, and what iOS lets us build
 
-The pitch: your voice never leaves the phone. Recognition runs on the device with Qwen3-ASR-0.6B (or the fallback engine in section 3), the app has no backend, and the only network request it ever makes is the one-time model download. The cost is honesty about overhead: the model needs about 1 GB of memory while loaded and about 700 MB on disk, and the app says so on the download screen.
+The pitch: your voice never leaves the phone. Recognition runs on the device with Moonshine (section 3), the app has no backend, and the only network request it ever makes is the one-time model download. The cost is honesty about overhead: the model needs a few hundred MB of memory while loaded and 141 MB on disk (44 MB for the tiny model), and the app says so on the download screen.
 
 iOS changes the shape of the product compared with the desktop app. Three constraints drive everything below; the plan does not try to work around them with tricks that get apps rejected:
 
 1. No system-wide insertion. A third-party app cannot type into another app. The desktop's hotkey-hold-paste loop does not exist. Text reaches other apps through the clipboard, the Share sheet, or our own keyboard extension.
 2. Keyboard extensions cannot use the microphone and live under a small memory cap (tens of MB). The model can never run inside the keyboard. The keyboard is only a one-key "insert my last dictation" surface.
-3. Background execution does not keep a 1 GB model resident. A suspended app that holds that much memory is the first thing jetsam kills. So "runs in the background" means the app loads the model on demand, fast, and drops it when the system asks, without losing the user's text.
+3. Background execution does not keep a large model resident for free. A suspended app that holds hundreds of MB is high on jetsam's list, and at 1 GB (the original Qwen plan) it was first. So "runs in the background" means the app loads the model on demand, fast, and drops it when the system asks, without losing the user's text.
 
 The resulting interaction: the user triggers dictation from the Action Button, Back Tap, a Control Center control, a Lock Screen widget, or the app icon. A minimal capture sheet appears with the Dynamic Island showing the recording state. The user speaks, taps stop (or the sheet stops on silence if that setting is on). The text appears, is copied to the clipboard, and can be inserted with one key from the OpenFlow keyboard in whatever app they switch to. That is one trigger, one speak, one paste. It is the closest iOS allows to the desktop loop, and it is faster than Apple's dictation for anyone who dictates long passages, because there is no per-app permission dance and no cloud round trip.
 
@@ -39,8 +39,7 @@ apps/ios/
         ClipboardWriter.swift               UIPasteboard, localOnly = true, expiration 60 s (setting)
         Settings.swift                      keys + defaults (section 4)
       Tests/OpenFlowMobileCoreTests/        FakeEngine, ModelManager transitions, silence gate vectors, post-pass, store
-    OpenFlowQwenEngine/                     SpeechEngine on MLX Swift; needs Xcode (Metal toolchain); excluded from the CLT gate
-    OpenFlowWhisperEngine/                  fallback SpeechEngine on WhisperKit (CoreML); Milestone M2 decides which ships
+    OpenFlowMoonshineEngine/                SpeechEngine on the official Moonshine Swift package; in the CLT gate through the macOS slice
 ```
 
 Nothing from the desktop Rust is linked into the phone app. What is shared is the specification: the silence gate constants and test vectors, the dictionary semantics, and the load/unload policy, which the desktop local runner (docs/native-port/PLAN.md section 7) adopts as well.
@@ -64,9 +63,11 @@ Weights are memory-mapped safetensors, so a reload after an unload is served fro
 
 ## 3. Engine choice
 
-Target: Qwen3-ASR-0.6B, 8-bit, via MLX Swift. Measured on an M4 laptop 2026-09-02: 0.40 s warm for an 8.7 s clip, 1.0 GB resident, 3 s load from disk. Phone numbers will be worse; the A17 Pro and A18 class GPUs are the floor, and the first Milestone M2 task is to measure on a real iPhone. Known quality cost from the same measurement: 0.6B wrote "intro dot lie" for "entro.ly", and Qwen ignores the Whisper-style prompt, so the dictionary is a post-pass.
+Decided 2026-09-10: Moonshine, base-en by default and tiny-en for older phones, through the official Swift package (`moonshine-swift`, pinned by revision). The full spec, the measured numbers and the pins are in `M2-MOONSHINE.md`. In short: 62M and 27M parameters, 141 MB and 44 MB of weights, 0.44 s and 0.30 s warm on an M4 CPU, and on the reference clip both spelled "entro.ly" the way Qwen 1.7B does and Qwen 0.6B did not.
 
-Fallback: WhisperKit (CoreML on the Neural Engine). It is lighter on battery than a GPU decoder, has an on-device large-v3-turbo, honors the prompt, and is proven in shipping iOS apps. If the Qwen port to MLX Swift is not sound by the end of M2 or the phone measurement is worse than WhisperKit's, WhisperKit ships first and Qwen becomes the "fast" option later. Both sit behind `SpeechEngine`, so the app does not care.
+Qwen3-ASR-0.6B on MLX Swift is no longer the target; it returns later as an "accurate" option behind the same `SpeechEngine` seam if a phone measurement earns it. WhisperKit is dropped. Both stub packages are deleted in M2.
+
+What Moonshine does not do: languages other than English under a commercial licence, and GPU or Neural Engine execution. Neither is part of the offer in section 0.
 
 ## 4. Settings (all local, UserDefaults in the App Group)
 
@@ -76,17 +77,17 @@ No analytics, no crash reporter, no remote config, no third-party SDK. The priva
 
 ## 5. Lightweight budget
 
-- Binary under 15 MB before weights. Weights are downloaded once (about 700 MB), never bundled, stored under Application Support with `isExcludedFromBackup = true`, integrity checked with SHA-256 against a pinned value in the app.
+- Binary under 15 MB of our own code plus the 34 MB Moonshine static library for the device slice. Weights are downloaded once (141 MB base, 44 MB tiny, three files each), never bundled, stored under Application Support with `isExcludedFromBackup = true`, every file integrity checked with SHA-256 against a pinned value in the app.
 - Zero idle work: no timers while the sheet is closed, no background modes except `audio` during a capture. The Live Activity is updated only on state changes.
-- Capture pipeline allocates once per take; 16 kHz Float32 in a preallocated ring of 10 minutes maximum (the watchdog from the desktop).
-- Memory: model resident only per section 2. UI is plain SwiftUI, no image assets beyond the icon and SF Symbols.
-- Battery: prewarm rules above; recognition runs on GPU or ANE, never on CPU fallback (fail loudly instead).
+- Capture pipeline allocates once per take; 16 kHz Float32 in a preallocated ring of 10 minutes maximum (the watchdog from the desktop). No allocation on the audio thread after the first block (section 8).
+- Memory: model resident only per section 2. Expect a few hundred MB while loaded, measured as a footprint delta and shown in Settings, not typed into the copy. UI is plain SwiftUI, no image assets beyond the icon and SF Symbols.
+- Battery: prewarm rules above. Recognition runs on the CPU, where it was measured; a Core ML execution provider is a later opt-in measurement, never a silent change.
 
 ## 6. Milestones and gates
 
 **M1 (this unit):** `OpenFlowMobileCore` complete with tests, the app target, keyboard and widget targets scaffolded with real Swift files and a `project.yml` that generates a building Xcode project, `FakeEngine` wired so the whole app can be exercised in the Simulator before any model exists, ModelDownloader with a pinned URL and checksum placeholder, README under `apps/ios/`. Gate on this machine: `swift build` and `swift test` inside `Packages/OpenFlowMobileCore` (Swift 6 language mode, strict concurrency). Xcode gates run on Titan's machine: `xcodegen generate && xcodebuild -scheme OpenFlow -destination 'generic/platform=iOS Simulator' build`.
 
-**M2:** engine spike. Port Qwen3-ASR-0.6B to MLX Swift in `OpenFlowQwenEngine` (audio encoder plus Qwen3 decoder, mlx-swift-examples has the decoder) and measure on an iPhone; wire WhisperKit in `OpenFlowWhisperEngine`; pick per section 3.
+**M2:** the Moonshine engine, per `M2-MOONSHINE.md`: `OpenFlowMoonshineEngine` on the pinned Swift package, multi-file pinned downloads for base-en and tiny-en, the engine tested against the reference clip on this Mac, then measured on an iPhone (load time, footprint delta, the four-hour reload).
 
 **M3:** keyboard insert, Live Activity, Control Center control, Action Button intent end to end; onboarding with the download screen; TestFlight.
 
@@ -96,7 +97,7 @@ Every commit: CHANGELOG.md entry under Unreleased (By:, Impact:), attribution tr
 
 ## 7. What the implementer must not do
 
-Do not add a server, an account, analytics, or any SDK. Do not put the model in the keyboard extension. Do not use CPU inference as a silent fallback. Do not bundle weights. Do not claim background residency the OS does not grant; the state machine in section 2 is the contract.
+Do not add a server, an account, analytics, or any SDK. Do not put the model in the keyboard extension. Do not change where inference runs without a measurement in this file. Do not bundle weights. Do not claim background residency the OS does not grant; the state machine in section 2 is the contract.
 
 ## 8. Lightweight audit, 2026-09-10
 
