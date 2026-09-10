@@ -1,0 +1,1125 @@
+{
+  "schema_version": 1,
+  "seed": 20260910,
+  "selection": "six F and six M readers sampled before recognition; two 3–16s utterances each",
+  "source_archive_sha256": "39fde525e59672dc6d1551919b1478f724438a95aa55f874b576be21967e6c23",
+  "sample_rate": 16000,
+  "clips": [
+    {
+      "id": "ls-1580-141083-0031",
+      "path": "human/ls-1580-141083-0031.wav",
+      "sha256": "3e9dd454c1c416dd1492af71b3e5802c6a379756ddd0e2c4c4a9f110c1218bad",
+      "duration_s": 6.25,
+      "reference": "HOLMES HELD OUT A SMALL CHIP WITH THE LETTERS N N AND A SPACE OF CLEAR WOOD AFTER THEM YOU SEE",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/1580/141083/1580-141083-0031.flac",
+      "source_sha256": "d205f5ea0914934fd3fc1389882944ff12404e87372d6ca38d059a973cce2bae",
+      "speaker": "1580",
+      "reader": "TinyPines",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-1580-141084-0023",
+      "path": "human/ls-1580-141084-0023.wav",
+      "sha256": "7bdd9fc4f47b883beb865ab1e3e7a854b88e00f212ac1cdb017eed3edab1d54b",
+      "duration_s": 8.735,
+      "reference": "IN A FEW HOURS THE EXAMINATION WOULD COMMENCE AND HE WAS STILL IN THE DILEMMA BETWEEN MAKING THE FACTS PUBLIC AND ALLOWING THE CULPRIT TO COMPETE FOR THE VALUABLE SCHOLARSHIP",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/1580/141084/1580-141084-0023.flac",
+      "source_sha256": "50555f1d6e13bf3617519364dfc73008d5ec91b44dbcc3e977d16e413f8b48c2",
+      "speaker": "1580",
+      "reader": "TinyPines",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-3570-5694-0017",
+      "path": "human/ls-3570-5694-0017.wav",
+      "sha256": "cb4d1d2a214a411c4c77e304298e212cac7841d709b08d9e94493f8571c52094",
+      "duration_s": 8.335,
+      "reference": "THE WEARING OF UNIFORMS OR LIVERIES IMPLIES A CONSIDERABLE DEGREE OF DEPENDENCE AND MAY EVEN BE SAID TO BE A MARK OF SERVITUDE REAL OR OSTENSIBLE",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/3570/5694/3570-5694-0017.flac",
+      "source_sha256": "3648bf7b5df4737e651bed4790b9f743801f6d438205255d3ddac23521dfcda2",
+      "speaker": "3570",
+      "reader": "sarac",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-3570-5695-0010",
+      "path": "human/ls-3570-5695-0010.wav",
+      "sha256": "0e8201d7eda9b16aa997c02092d38f00cdcb57c16c2e22b01627e35e999c2c08",
+      "duration_s": 4.665,
+      "reference": "THE MODERN ORGANIZATION OF INDUSTRY WORKS IN THE SAME DIRECTION ALSO BY ANOTHER LINE",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/3570/5695/3570-5695-0010.flac",
+      "source_sha256": "1b5637a4108158c889a764ebdf0ec1bf25383f38924777c3b9dcc3143d0176f6",
+      "speaker": "3570",
+      "reader": "sarac",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-1284-1181-0000",
+      "path": "human/ls-1284-1181-0000.wav",
+      "sha256": "e1f16b731bfaf99f5918069b4a2681482abf4bca5cfc99175fc3411376136bad",
+      "duration_s": 3.965,
+      "reference": "OJO EXAMINED THIS CURIOUS CONTRIVANCE WITH WONDER",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/1284/1181/1284-1181-0000.flac",
+      "source_sha256": "326d6429d760f9a8e8bcb13993db768e25cead1ac08995e970921f2cf003664d",
+      "speaker": "1284",
+      "reader": "Daniel Anaya",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-1284-1180-0028",
+      "path": "human/ls-1284-1180-0028.wav",
+      "sha256": "09ed791c51de980efa935f5aacc32425653fa4b2b014167e5be50c6c5a81ed9d",
+      "duration_s": 6.045,
+      "reference": "A BED QUILT MADE OF PATCHES OF DIFFERENT KINDS AND COLORS OF CLOTH ALL NEATLY SEWED TOGETHER",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/1284/1180/1284-1180-0028.flac",
+      "source_sha256": "1ee65c4ba89a7fe76bef27dade9b0ab41fe2109b77c8e68d5b80e34194031ee4",
+      "speaker": "1284",
+      "reader": "Daniel Anaya",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-2094-142345-0005",
+      "path": "human/ls-2094-142345-0005.wav",
+      "sha256": "ade78d2f10d8da361ae0ccb9e7e56eb139d4b06b6da1467ac509060d09fc0bc5",
+      "duration_s": 9.09,
+      "reference": "SEVERAL CLOTHES HORSES A PILLION A SPINNING WHEEL AND AN OLD BOX WIDE OPEN AND STUFFED FULL OF COLOURED RAGS",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/2094/142345/2094-142345-0005.flac",
+      "source_sha256": "d49d15ab4ba625ea6afaf5fcd9d7acc384d8817023f75c824083b9f4cb5c21a5",
+      "speaker": "2094",
+      "reader": "amycsj",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-2094-142345-0029",
+      "path": "human/ls-2094-142345-0029.wav",
+      "sha256": "7c16f1a39aeee99f348cd3991c07ebc15bfab2360d9969a86ed8d37d60bd9767",
+      "duration_s": 8.525,
+      "reference": "DID EVER ANYBODY SEE THE LIKE SCREAMED MISSUS POYSER RUNNING TOWARDS THE TABLE WHEN HER EYE HAD FALLEN ON THE BLUE STREAM",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/2094/142345/2094-142345-0029.flac",
+      "source_sha256": "7a1eb568e49ccc9c4c172d384768614e745519174719f5ca984094a07faf60ef",
+      "speaker": "2094",
+      "reader": "amycsj",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-4446-2275-0034",
+      "path": "human/ls-4446-2275-0034.wav",
+      "sha256": "98ced9f181248f36666c27ab7ee66b0739a5a7dfa03d4e01dcbb14e75ac53fba",
+      "duration_s": 3.08,
+      "reference": "KEEP AWAY IF YOU WISH WHEN HAVE I EVER FOLLOWED YOU",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/4446/2275/4446-2275-0034.flac",
+      "source_sha256": "4e0573d92dc7f9491af270304a213d11aa66e098a09aea76947b6011cb63257a",
+      "speaker": "4446",
+      "reader": "Jen Maxwell",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-4446-2273-0016",
+      "path": "human/ls-4446-2273-0016.wav",
+      "sha256": "82a0e4f156c79b60f92ed323cb6a64690f46c8ebdabe3d4daecf1838a30632ac",
+      "duration_s": 9.645,
+      "reference": "HER HAIR IS STILL LIKE FLAX AND HER BLUE EYES ARE JUST LIKE A BABY'S AND SHE HAS THE SAME THREE FRECKLES ON HER LITTLE NOSE AND TALKS ABOUT GOING BACK TO HER BAINS DE MER",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/4446/2273/4446-2273-0016.flac",
+      "source_sha256": "a68cca66d96e5a915758a786ad11744895cd87050bb23d2c3b4f0a8f32358de2",
+      "speaker": "4446",
+      "reader": "Jen Maxwell",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-5142-36377-0000",
+      "path": "human/ls-5142-36377-0000.wav",
+      "sha256": "88e187b259fdcde9af1ac0eba8689a34056b9b32f1da321bb0b48dfc1bc8b690",
+      "duration_s": 3.38,
+      "reference": "IT WAS ONE OF THE MASTERLY AND CHARMING STORIES OF DUMAS THE ELDER",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/5142/36377/5142-36377-0000.flac",
+      "source_sha256": "baad1a53bcc5b733cc858f6b35df91bc426df5a37c234edf99831fc762c80147",
+      "speaker": "5142",
+      "reader": "Mary Ballard-Johansson",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-5142-36377-0006",
+      "path": "human/ls-5142-36377-0006.wav",
+      "sha256": "3a61ff90ba9e7fab28c5403803aa50b84d983b21a7b402d0c9c4a4e35f77cda1",
+      "duration_s": 4.635,
+      "reference": "A NEW MEMBER OF THE FAMILY CIRCLE WHO INSTANTLY ATTRACTED MY ATTENTION ENTERED THE ROOM",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/5142/36377/5142-36377-0006.flac",
+      "source_sha256": "3e5b8ea7cb7a43299cd1a99ffab3cba80247c67ac5ad033b987b385231df24a7",
+      "speaker": "5142",
+      "reader": "Mary Ballard-Johansson",
+      "sex": "F",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-6930-75918-0000",
+      "path": "human/ls-6930-75918-0000.wav",
+      "sha256": "103c3f15eb3715ebc6243d142244128a3ac39b6bfae315baa6b8dc4a8be14aa8",
+      "duration_s": 3.505,
+      "reference": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/6930/75918/6930-75918-0000.flac",
+      "source_sha256": "9ce35224156f071ab58eb7feb8a5ceae600f6f9f353da2a6cbf797b6b1ac8a23",
+      "speaker": "6930",
+      "reader": "Nolan Fout",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-6930-81414-0021",
+      "path": "human/ls-6930-81414-0021.wav",
+      "sha256": "cb1a5e73f0b2d17c44c755901ac926b5db0d98e0d412ac40f7c973fbfcd7a5b7",
+      "duration_s": 3.225,
+      "reference": "A TERRIBLE THOUGHT FLASHED INTO MY MIND",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/6930/81414/6930-81414-0021.flac",
+      "source_sha256": "aa6ca39905cd3a4b998ee5801778878d1bf50434246d01229950783e6c84960c",
+      "speaker": "6930",
+      "reader": "Nolan Fout",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-8455-210777-0028",
+      "path": "human/ls-8455-210777-0028.wav",
+      "sha256": "9f4ec23f805b2f9f67671a780864c8ea4d40d678da2edd65f8f24e799c085641",
+      "duration_s": 7.735,
+      "reference": "JACK WOULD BECOME EVA'S HAPPY HUSBAND AND WOULD REMAIN AMIDST THE HURRIED DUTIES OF THE EAGER WORLD",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/8455/210777/8455-210777-0028.flac",
+      "source_sha256": "61e1697bdc0de5142e0cd76c4a14ed38086b66b9a0ab7722bd1c02aa3cebd261",
+      "speaker": "8455",
+      "reader": "thecheops",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-8455-210777-0042",
+      "path": "human/ls-8455-210777-0042.wav",
+      "sha256": "48623abf760b33b9bea5542aad0df45e6231958d0ff1d36421e37869309355f8",
+      "duration_s": 4.78,
+      "reference": "YOU HEAR WHAT SIR FERDINANDO BROWN HAS SAID REPLIED CAPTAIN BATTLEAX",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/8455/210777/8455-210777-0042.flac",
+      "source_sha256": "f3d237374b0225ad30ab0b87f80b7eee4657614b9eae317d4c873b0c8bba4793",
+      "speaker": "8455",
+      "reader": "thecheops",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-5639-40744-0019",
+      "path": "human/ls-5639-40744-0019.wav",
+      "sha256": "78dffe136105b9a7b40d7050f50b0117185a3c8e0900228c97360da1c39556a4",
+      "duration_s": 12.06,
+      "reference": "WHAT YOU HAD BEST DO MY CHILD IS TO KEEP IT AND PRAY TO IT THAT SINCE IT WAS A WITNESS TO YOUR UNDOING IT WILL DEIGN TO VINDICATE YOUR CAUSE BY ITS RIGHTEOUS JUDGMENT",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/5639/40744/5639-40744-0019.flac",
+      "source_sha256": "3d9fe3a36fac8caa700b41e535de819e79c1e16c472befd3d8be76fc8be5abd8",
+      "speaker": "5639",
+      "reader": "Ulf Bjorklund",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-5639-40744-0018",
+      "path": "human/ls-5639-40744-0018.wav",
+      "sha256": "99297c951c9abd9b6c4edc39b26f4863258142b99e01c787b708efab53f62349",
+      "duration_s": 15.4149375,
+      "reference": "THAT WOULD BE VERY WELL MY CHILD REPLIED HER FATHER IF YOUR PLAN WERE NOT LIABLE TO BE FRUSTRATED BY ORDINARY CUNNING BUT NO DOUBT THIS IMAGE HAS BEEN ALREADY MISSED BY ITS OWNER AND HE WILL HAVE SET IT DOWN FOR CERTAIN THAT IT WAS TAKEN OUT OF THE ROOM BY THE PERSON HE LOCKED UP THERE",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/5639/40744/5639-40744-0018.flac",
+      "source_sha256": "a90075fb41e79b86c999ff4c4b4af2b553804e4e80a555a9981a53509fa98ef4",
+      "speaker": "5639",
+      "reader": "Ulf Bjorklund",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-1089-134691-0012",
+      "path": "human/ls-1089-134691-0012.wav",
+      "sha256": "1cdf1d64c16725a4fb84499cf7226c18f9817e8371c94f4b559a7b8341083755",
+      "duration_s": 15.03,
+      "reference": "IT WAS IDLE FOR HIM TO MOVE HIMSELF TO BE GENEROUS TOWARDS THEM TO TELL HIMSELF THAT IF HE EVER CAME TO THEIR GATES STRIPPED OF HIS PRIDE BEATEN AND IN BEGGAR'S WEEDS THAT THEY WOULD BE GENEROUS TOWARDS HIM LOVING HIM AS THEMSELVES",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/1089/134691/1089-134691-0012.flac",
+      "source_sha256": "80d508b2ebb0089ecfdaf9572bf3d04f84133030e3d8c1b08638f4a14f2443de",
+      "speaker": "1089",
+      "reader": "Peter Bobbe",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-1089-134686-0017",
+      "path": "human/ls-1089-134686-0017.wav",
+      "sha256": "9a4c744cc9da355f44b77dfb20c535d20f87391f94d5798d082f25d539ddb7a7",
+      "duration_s": 8.87,
+      "reference": "STEPHEN LEANING BACK AND DRAWING IDLY ON HIS SCRIBBLER LISTENED TO THE TALK ABOUT HIM WHICH HERON CHECKED FROM TIME TO TIME BY SAYING",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/1089/134686/1089-134686-0017.flac",
+      "source_sha256": "4f268e938bf51a214ccad50e38bab32117b0a73708669999302a3d61a239a2d6",
+      "speaker": "1089",
+      "reader": "Peter Bobbe",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-1320-122617-0039",
+      "path": "human/ls-1320-122617-0039.wav",
+      "sha256": "e2aaeb9c88da2fa1aace89588bca71d0baeb742c89a3c141d446f625384a22dc",
+      "duration_s": 7.055,
+      "reference": "THE MOHICAN STARTED ON HIS FEET AND SHOOK HIS SHAGGY COVERING AS THOUGH THE ANIMAL HE COUNTERFEITED WAS ABOUT TO MAKE SOME DESPERATE EFFORT",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/1320/122617/1320-122617-0039.flac",
+      "source_sha256": "264a53a8c31bd50758ba7eeeb3b5efa9c5bc7908757d44a635bec4c9a4f2c3c0",
+      "speaker": "1320",
+      "reader": "number6",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-1320-122617-0018",
+      "path": "human/ls-1320-122617-0018.wav",
+      "sha256": "5afb0c715ec4edf53357616131b4789c530577d90e2860b6fb73028b72dd4491",
+      "duration_s": 9.695,
+      "reference": "IT WAS SILENT AND GLOOMY BEING TENANTED SOLELY BY THE CAPTIVE AND LIGHTED BY THE DYING EMBERS OF A FIRE WHICH HAD BEEN USED FOR THE PURPOSED OF COOKERY",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/1320/122617/1320-122617-0018.flac",
+      "source_sha256": "94a7552b383ab86286d169f850770e803d80f83d46c9da9d947dccb29c889c45",
+      "speaker": "1320",
+      "reader": "number6",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-7729-102255-0001",
+      "path": "human/ls-7729-102255-0001.wav",
+      "sha256": "a4e032b319a4ac5933a29a090ad23431f334528564eb381017da2692e56ec45f",
+      "duration_s": 3.45,
+      "reference": "THIS WAS AT THE MARCH ELECTION EIGHTEEN FIFTY FIVE",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/7729/102255/7729-102255-0001.flac",
+      "source_sha256": "6d89403ed443907226129942df0cb8a59099d042a12554df29a18f27f0e586d1",
+      "speaker": "7729",
+      "reader": "Tim Bower",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "ls-7729-102255-0015",
+      "path": "human/ls-7729-102255-0015.wav",
+      "sha256": "928c54d28553caa10f903c497e27efda4b3b055dc39b28fc01fc70b25d874e26",
+      "duration_s": 14.99,
+      "reference": "ONE OF HIS MILITIA GENERALS SUGGESTED THAT THE GOVERNOR SHOULD REQUIRE THE OUTLAWS AT LAWRENCE AND ELSEWHERE TO SURRENDER THE SHARPS RIFLES ANOTHER WROTE ASKING HIM TO CALL OUT THE GOVERNMENT TROOPS AT FORT LEAVENWORTH",
+      "group": "human-clean",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source": "https://www.openslr.org/12/",
+      "source_member": "LibriSpeech/test-clean/7729/102255/7729-102255-0015.flac",
+      "source_sha256": "187daa8557282d10b9e189471d4f4a6b70586642b440d396061a410e262a9c92",
+      "speaker": "7729",
+      "reader": "Tim Bower",
+      "sex": "M",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "FLAC decoded to 16-bit PCM WAV; no trimming"
+      ]
+    },
+    {
+      "id": "stress-noise-10db",
+      "path": "generated/stress-noise-10db.wav",
+      "sha256": "e1dee73166014c3ed26fa544d019dc781a24927ffd417ce1c9f69770ce115150",
+      "duration_s": 6.25,
+      "reference": "HOLMES HELD OUT A SMALL CHIP WITH THE LETTERS N N AND A SPACE OF CLEAR WOOD AFTER THEM YOU SEE",
+      "group": "human-derived",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source_id": "ls-1580-141083-0031",
+      "speaker": "1580",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "noise-10db"
+      ]
+    },
+    {
+      "id": "stress-quiet",
+      "path": "generated/stress-quiet.wav",
+      "sha256": "55ea668019be155f7a7c7f1bbd6ff869fef1603123d83ead58a0d1a3f6bb48c2",
+      "duration_s": 4.665,
+      "reference": "THE MODERN ORGANIZATION OF INDUSTRY WORKS IN THE SAME DIRECTION ALSO BY ANOTHER LINE",
+      "group": "human-derived",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source_id": "ls-3570-5695-0010",
+      "speaker": "3570",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "quiet"
+      ]
+    },
+    {
+      "id": "stress-clipped",
+      "path": "generated/stress-clipped.wav",
+      "sha256": "ef5fbdd66ad6f8cf4324077bdf4e48a389e6730eb96c3c35683cb8b0144af6fd",
+      "duration_s": 9.09,
+      "reference": "SEVERAL CLOTHES HORSES A PILLION A SPINNING WHEEL AND AN OLD BOX WIDE OPEN AND STUFFED FULL OF COLOURED RAGS",
+      "group": "human-derived",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source_id": "ls-2094-142345-0005",
+      "speaker": "2094",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "clipped"
+      ]
+    },
+    {
+      "id": "stress-leading-silence",
+      "path": "generated/stress-leading-silence.wav",
+      "sha256": "9b9f055d3b86a73032c697965e3457521280bf9a675a0de580ea8a35dd27c62d",
+      "duration_s": 11.645,
+      "reference": "HER HAIR IS STILL LIKE FLAX AND HER BLUE EYES ARE JUST LIKE A BABY'S AND SHE HAS THE SAME THREE FRECKLES ON HER LITTLE NOSE AND TALKS ABOUT GOING BACK TO HER BAINS DE MER",
+      "group": "human-derived",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source_id": "ls-4446-2273-0016",
+      "speaker": "4446",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "leading-silence"
+      ]
+    },
+    {
+      "id": "stress-noise-5db",
+      "path": "generated/stress-noise-5db.wav",
+      "sha256": "ef731359606a866c94ab22e44c842afea8d5d7a37d48ca00e2f46e3b3d2cd4f6",
+      "duration_s": 3.505,
+      "reference": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS",
+      "group": "human-derived",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source_id": "ls-6930-75918-0000",
+      "speaker": "6930",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "noise-5db"
+      ]
+    },
+    {
+      "id": "stress-trailing-silence",
+      "path": "generated/stress-trailing-silence.wav",
+      "sha256": "e00cd8d0533f5f44f9e2bd21d0e5a0bbcdcfdf529d1a7514db4cfc798883a8ee",
+      "duration_s": 7.78,
+      "reference": "YOU HEAR WHAT SIR FERDINANDO BROWN HAS SAID REPLIED CAPTAIN BATTLEAX",
+      "group": "human-derived",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source_id": "ls-8455-210777-0042",
+      "speaker": "8455",
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "trailing-silence"
+      ]
+    },
+    {
+      "id": "long-60s",
+      "path": "generated/long-60s.wav",
+      "sha256": "7da7001853f218b58075f898435da7c7fa828b6a93281c169d532ed3c06e77f8",
+      "duration_s": 60.94,
+      "reference": "HOLMES HELD OUT A SMALL CHIP WITH THE LETTERS N N AND A SPACE OF CLEAR WOOD AFTER THEM YOU SEE IN A FEW HOURS THE EXAMINATION WOULD COMMENCE AND HE WAS STILL IN THE DILEMMA BETWEEN MAKING THE FACTS PUBLIC AND ALLOWING THE CULPRIT TO COMPETE FOR THE VALUABLE SCHOLARSHIP THE WEARING OF UNIFORMS OR LIVERIES IMPLIES A CONSIDERABLE DEGREE OF DEPENDENCE AND MAY EVEN BE SAID TO BE A MARK OF SERVITUDE REAL OR OSTENSIBLE THE MODERN ORGANIZATION OF INDUSTRY WORKS IN THE SAME DIRECTION ALSO BY ANOTHER LINE OJO EXAMINED THIS CURIOUS CONTRIVANCE WITH WONDER A BED QUILT MADE OF PATCHES OF DIFFERENT KINDS AND COLORS OF CLOTH ALL NEATLY SEWED TOGETHER SEVERAL CLOTHES HORSES A PILLION A SPINNING WHEEL AND AN OLD BOX WIDE OPEN AND STUFFED FULL OF COLOURED RAGS DID EVER ANYBODY SEE THE LIKE SCREAMED MISSUS POYSER RUNNING TOWARDS THE TABLE WHEN HER EYE HAD FALLEN ON THE BLUE STREAM KEEP AWAY IF YOU WISH WHEN HAVE I EVER FOLLOWED YOU",
+      "group": "human-stitched",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source_ids": [
+        "ls-1580-141083-0031",
+        "ls-1580-141084-0023",
+        "ls-3570-5694-0017",
+        "ls-3570-5695-0010",
+        "ls-1284-1181-0000",
+        "ls-1284-1180-0028",
+        "ls-2094-142345-0005",
+        "ls-2094-142345-0029",
+        "ls-4446-2275-0034"
+      ],
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "whole utterances joined with 250ms silence; not a natural conversation"
+      ]
+    },
+    {
+      "id": "long-180s",
+      "path": "generated/long-180s.wav",
+      "sha256": "5a3c0af824b2690345e3f4b99d0b89323b6a531dcddf993f38246d0d7a8aa670",
+      "duration_s": 188.1599375,
+      "reference": "HOLMES HELD OUT A SMALL CHIP WITH THE LETTERS N N AND A SPACE OF CLEAR WOOD AFTER THEM YOU SEE IN A FEW HOURS THE EXAMINATION WOULD COMMENCE AND HE WAS STILL IN THE DILEMMA BETWEEN MAKING THE FACTS PUBLIC AND ALLOWING THE CULPRIT TO COMPETE FOR THE VALUABLE SCHOLARSHIP THE WEARING OF UNIFORMS OR LIVERIES IMPLIES A CONSIDERABLE DEGREE OF DEPENDENCE AND MAY EVEN BE SAID TO BE A MARK OF SERVITUDE REAL OR OSTENSIBLE THE MODERN ORGANIZATION OF INDUSTRY WORKS IN THE SAME DIRECTION ALSO BY ANOTHER LINE OJO EXAMINED THIS CURIOUS CONTRIVANCE WITH WONDER A BED QUILT MADE OF PATCHES OF DIFFERENT KINDS AND COLORS OF CLOTH ALL NEATLY SEWED TOGETHER SEVERAL CLOTHES HORSES A PILLION A SPINNING WHEEL AND AN OLD BOX WIDE OPEN AND STUFFED FULL OF COLOURED RAGS DID EVER ANYBODY SEE THE LIKE SCREAMED MISSUS POYSER RUNNING TOWARDS THE TABLE WHEN HER EYE HAD FALLEN ON THE BLUE STREAM KEEP AWAY IF YOU WISH WHEN HAVE I EVER FOLLOWED YOU HER HAIR IS STILL LIKE FLAX AND HER BLUE EYES ARE JUST LIKE A BABY'S AND SHE HAS THE SAME THREE FRECKLES ON HER LITTLE NOSE AND TALKS ABOUT GOING BACK TO HER BAINS DE MER IT WAS ONE OF THE MASTERLY AND CHARMING STORIES OF DUMAS THE ELDER A NEW MEMBER OF THE FAMILY CIRCLE WHO INSTANTLY ATTRACTED MY ATTENTION ENTERED THE ROOM CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS A TERRIBLE THOUGHT FLASHED INTO MY MIND JACK WOULD BECOME EVA'S HAPPY HUSBAND AND WOULD REMAIN AMIDST THE HURRIED DUTIES OF THE EAGER WORLD YOU HEAR WHAT SIR FERDINANDO BROWN HAS SAID REPLIED CAPTAIN BATTLEAX WHAT YOU HAD BEST DO MY CHILD IS TO KEEP IT AND PRAY TO IT THAT SINCE IT WAS A WITNESS TO YOUR UNDOING IT WILL DEIGN TO VINDICATE YOUR CAUSE BY ITS RIGHTEOUS JUDGMENT THAT WOULD BE VERY WELL MY CHILD REPLIED HER FATHER IF YOUR PLAN WERE NOT LIABLE TO BE FRUSTRATED BY ORDINARY CUNNING BUT NO DOUBT THIS IMAGE HAS BEEN ALREADY MISSED BY ITS OWNER AND HE WILL HAVE SET IT DOWN FOR CERTAIN THAT IT WAS TAKEN OUT OF THE ROOM BY THE PERSON HE LOCKED UP THERE IT WAS IDLE FOR HIM TO MOVE HIMSELF TO BE GENEROUS TOWARDS THEM TO TELL HIMSELF THAT IF HE EVER CAME TO THEIR GATES STRIPPED OF HIS PRIDE BEATEN AND IN BEGGAR'S WEEDS THAT THEY WOULD BE GENEROUS TOWARDS HIM LOVING HIM AS THEMSELVES STEPHEN LEANING BACK AND DRAWING IDLY ON HIS SCRIBBLER LISTENED TO THE TALK ABOUT HIM WHICH HERON CHECKED FROM TIME TO TIME BY SAYING THE MOHICAN STARTED ON HIS FEET AND SHOOK HIS SHAGGY COVERING AS THOUGH THE ANIMAL HE COUNTERFEITED WAS ABOUT TO MAKE SOME DESPERATE EFFORT IT WAS SILENT AND GLOOMY BEING TENANTED SOLELY BY THE CAPTIVE AND LIGHTED BY THE DYING EMBERS OF A FIRE WHICH HAD BEEN USED FOR THE PURPOSED OF COOKERY THIS WAS AT THE MARCH ELECTION EIGHTEEN FIFTY FIVE ONE OF HIS MILITIA GENERALS SUGGESTED THAT THE GOVERNOR SHOULD REQUIRE THE OUTLAWS AT LAWRENCE AND ELSEWHERE TO SURRENDER THE SHARPS RIFLES ANOTHER WROTE ASKING HIM TO CALL OUT THE GOVERNMENT TROOPS AT FORT LEAVENWORTH",
+      "group": "human-stitched",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "source_ids": [
+        "ls-1580-141083-0031",
+        "ls-1580-141084-0023",
+        "ls-3570-5694-0017",
+        "ls-3570-5695-0010",
+        "ls-1284-1181-0000",
+        "ls-1284-1180-0028",
+        "ls-2094-142345-0005",
+        "ls-2094-142345-0029",
+        "ls-4446-2275-0034",
+        "ls-4446-2273-0016",
+        "ls-5142-36377-0000",
+        "ls-5142-36377-0006",
+        "ls-6930-75918-0000",
+        "ls-6930-81414-0021",
+        "ls-8455-210777-0028",
+        "ls-8455-210777-0042",
+        "ls-5639-40744-0019",
+        "ls-5639-40744-0018",
+        "ls-1089-134691-0012",
+        "ls-1089-134686-0017",
+        "ls-1320-122617-0039",
+        "ls-1320-122617-0018",
+        "ls-7729-102255-0001",
+        "ls-7729-102255-0015"
+      ],
+      "license": "CC-BY-4.0",
+      "transforms": [
+        "whole utterances joined with 250ms silence; not a natural conversation"
+      ]
+    },
+    {
+      "id": "silence",
+      "path": "generated/silence.wav",
+      "sha256": "262d1f34f300560a4c82ba8127ddea9e1d72946f187fdbd3e8f70ee096077aec",
+      "duration_s": 5.0,
+      "reference": "",
+      "group": "non-speech",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "license": "MIT",
+      "transforms": [
+        "silence"
+      ]
+    },
+    {
+      "id": "noise-only",
+      "path": "generated/noise-only.wav",
+      "sha256": "927d74c2a77b920642d8572d6028b7a3ec26575901c8a3734eb314ccc5b2306d",
+      "duration_s": 5.0,
+      "reference": "",
+      "group": "non-speech",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "license": "MIT",
+      "transforms": [
+        "noise-only"
+      ]
+    },
+    {
+      "id": "tone-only",
+      "path": "generated/tone-only.wav",
+      "sha256": "3541c4c9ac3278a9072fa08bbad90889e2e9256eff9eb82c098237d52f781814",
+      "duration_s": 3.0,
+      "reference": "",
+      "group": "non-speech",
+      "language": "en",
+      "tags": [],
+      "terms": [],
+      "license": "MIT",
+      "transforms": [
+        "tone-only"
+      ]
+    },
+    {
+      "id": "tts-schedule-us",
+      "path": "generated/tts-schedule-us.wav",
+      "sha256": "33b197f9f3d06ddbd28a99fb5dd70ca75a490dc2db7a17c8b43904041b3c3be7",
+      "duration_s": 5.5824375,
+      "reference": "Please move the design review to Thursday at nine thirty. Invite Maya Chen and reserve room twenty four.",
+      "group": "synthetic-dictation",
+      "language": "en",
+      "tags": [
+        "dates",
+        "numbers"
+      ],
+      "terms": [
+        [
+          "Thursday"
+        ],
+        [
+          "nine thirty",
+          "9 30"
+        ],
+        [
+          "Maya Chen"
+        ],
+        [
+          "twenty four",
+          "24"
+        ]
+      ],
+      "voice": "Samantha",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-shopping-uk",
+      "path": "generated/tts-shopping-uk.wav",
+      "sha256": "0a7af45c004003bf5da3882e4d95942e5ddaba9bfc94a4df679d5900c769b67c",
+      "duration_s": 5.587625,
+      "reference": "Add two cartons of oat milk, six lemons, and a loaf of sourdough to the shopping list.",
+      "group": "synthetic-dictation",
+      "language": "en",
+      "tags": [
+        "everyday",
+        "numbers"
+      ],
+      "terms": [
+        [
+          "two",
+          "2"
+        ],
+        [
+          "six",
+          "6"
+        ],
+        [
+          "sourdough"
+        ]
+      ],
+      "voice": "Daniel",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-email-us",
+      "path": "generated/tts-email-us.wav",
+      "sha256": "991fcce82b527c48f1a45f97eec4f7bbc67cc2508d98e97f16357bfcd39d39c6",
+      "duration_s": 7.6471875,
+      "reference": "Hi Priya, thanks for the update. I have reviewed the proposal and will send my comments tomorrow morning. Best regards, Alex.",
+      "group": "synthetic-dictation",
+      "language": "en",
+      "tags": [
+        "email",
+        "names"
+      ],
+      "terms": [
+        [
+          "Priya"
+        ],
+        [
+          "Alex"
+        ]
+      ],
+      "voice": "Samantha",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-engineering-in",
+      "path": "generated/tts-engineering-in.wav",
+      "sha256": "ac07185abc5bcfb4a4a98c6f37e9d29feab7c28b595477164073fdadbbf2dd68",
+      "duration_s": 7.8575,
+      "reference": "The PostgreSQL migration failed because the customer identifier was null. Add a regression test before deploying the Kubernetes service.",
+      "group": "synthetic-dictation",
+      "language": "en",
+      "tags": [
+        "technical",
+        "names"
+      ],
+      "terms": [
+        [
+          "PostgreSQL",
+          "Postgres Q L"
+        ],
+        [
+          "Kubernetes"
+        ],
+        [
+          "null"
+        ]
+      ],
+      "voice": "Rishi",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-budget-uk",
+      "path": "generated/tts-budget-uk.wav",
+      "sha256": "9f3a8263d18f1b00df8d7426636167908715fcea04f90bf254f0af668f2b306e",
+      "duration_s": 7.26775,
+      "reference": "The revised budget is twelve thousand five hundred dollars, not fifteen thousand. Keep the contingency at seven percent.",
+      "group": "synthetic-dictation",
+      "language": "en",
+      "tags": [
+        "numbers",
+        "negation"
+      ],
+      "terms": [
+        [
+          "twelve thousand five hundred",
+          "12500",
+          "12 500"
+        ],
+        [
+          "not fifteen thousand",
+          "not 15000",
+          "not 15 000"
+        ],
+        [
+          "seven percent",
+          "7 percent"
+        ]
+      ],
+      "voice": "Daniel",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-correction-us",
+      "path": "generated/tts-correction-us.wav",
+      "sha256": "5ca050efbbc1cfc04511f6ad897789f88284a3ba25a9dad5448f1671868a159b",
+      "duration_s": 7.890875,
+      "reference": "Um, please book the train for Friday. Actually, scratch that, make it Saturday afternoon. Uh, and choose a window seat.",
+      "group": "synthetic-dictation",
+      "language": "en",
+      "tags": [
+        "disfluency",
+        "correction"
+      ],
+      "terms": [
+        [
+          "Friday"
+        ],
+        [
+          "Saturday afternoon"
+        ],
+        [
+          "window seat"
+        ]
+      ],
+      "voice": "Samantha",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-address-in",
+      "path": "generated/tts-address-in.wav",
+      "sha256": "4445be2ee2f2ca6626de555f6b93fcda980c7fa98c583fae2fcc3d4a76d82df3",
+      "duration_s": 6.7875,
+      "reference": "Send the parcel to apartment sixteen at forty two Maple Street. The access code is eight zero three nine.",
+      "group": "synthetic-dictation",
+      "language": "en",
+      "tags": [
+        "address",
+        "numbers"
+      ],
+      "terms": [
+        [
+          "sixteen",
+          "16"
+        ],
+        [
+          "forty two",
+          "42"
+        ],
+        [
+          "eight zero three nine",
+          "8039",
+          "8 0 3 9"
+        ]
+      ],
+      "voice": "Rishi",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-support-uk",
+      "path": "generated/tts-support-uk.wav",
+      "sha256": "a71e4036b5e00dee3233f6d55764c12d115c04ce56bf30dea880374fce1347cc",
+      "duration_s": 7.119375,
+      "reference": "Do not delete the backup. The upload has not finished, and the customer cannot sign in until the password reset completes.",
+      "group": "synthetic-dictation",
+      "language": "en",
+      "tags": [
+        "negation",
+        "everyday"
+      ],
+      "terms": [
+        [
+          "do not delete"
+        ],
+        [
+          "not finished"
+        ],
+        [
+          "cannot sign in",
+          "can not sign in"
+        ]
+      ],
+      "voice": "Daniel",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-product-names-us",
+      "path": "generated/tts-product-names-us.wav",
+      "sha256": "e68bf62234c3bc61303e0bcdc90c494053857ba6923ff5512f05ab4348004a2a",
+      "duration_s": 6.6290625,
+      "reference": "Compare OpenFlow with Notion and Obsidian. Send the FastPay reconciliation report to the Acme team before lunch.",
+      "group": "synthetic-dictation",
+      "language": "en",
+      "tags": [
+        "names",
+        "dictionary"
+      ],
+      "terms": [
+        [
+          "OpenFlow",
+          "open flow"
+        ],
+        [
+          "Notion"
+        ],
+        [
+          "Obsidian"
+        ],
+        [
+          "FastPay",
+          "fast pay"
+        ],
+        [
+          "Acme"
+        ]
+      ],
+      "voice": "Samantha",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-short-command-uk",
+      "path": "generated/tts-short-command-uk.wav",
+      "sha256": "0426dc6b826f06c60347048078ee745005ac8af96429d4477645d4bbd5799c2d",
+      "duration_s": 1.9534375,
+      "reference": "Remind me to water the plants.",
+      "group": "synthetic-dictation",
+      "language": "en",
+      "tags": [
+        "short",
+        "everyday"
+      ],
+      "terms": [
+        [
+          "water the plants"
+        ]
+      ],
+      "voice": "Daniel",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-spanish",
+      "path": "generated/tts-spanish.wav",
+      "sha256": "5420fd3199962adf7f93de4536adef4ad6b861f428e07326289961b2150e811c",
+      "duration_s": 6.564,
+      "reference": "La reunión empieza mañana a las nueve. Por favor, envía el informe a Carlos antes del viernes.",
+      "group": "synthetic-dictation",
+      "language": "es",
+      "tags": [
+        "multilingual",
+        "numbers"
+      ],
+      "terms": [
+        [
+          "Carlos"
+        ],
+        [
+          "viernes"
+        ]
+      ],
+      "voice": "Monica",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-french",
+      "path": "generated/tts-french.wav",
+      "sha256": "3946dc1f06c676eb6cfba3a599e2ec2e0eee96dfd6f7559d09655fff7c087d33",
+      "duration_s": 5.7560625,
+      "reference": "Bonjour Camille, le nouveau projet est prêt. Nous pouvons organiser une réunion jeudi après midi.",
+      "group": "synthetic-dictation",
+      "language": "fr",
+      "tags": [
+        "multilingual",
+        "everyday"
+      ],
+      "terms": [
+        [
+          "Camille"
+        ],
+        [
+          "jeudi"
+        ]
+      ],
+      "voice": "Thomas",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    },
+    {
+      "id": "tts-mandarin",
+      "path": "generated/tts-mandarin.wav",
+      "sha256": "02805afa0131ab5cba1a33214cae753549009f5eed81c28696cfe124a081185e",
+      "duration_s": 7.2614375,
+      "reference": "请把明天下午三点的会议改到星期五上午十点，并通知项目组的所有成员。",
+      "group": "synthetic-dictation",
+      "language": "zh",
+      "tags": [
+        "multilingual",
+        "numbers"
+      ],
+      "terms": [
+        [
+          "星期五"
+        ],
+        [
+          "十点"
+        ]
+      ],
+      "voice": "Tingting",
+      "source": "locally generated macOS say; audio not redistributed",
+      "license": "local-evaluation-only",
+      "transforms": [
+        "macOS say at 165 words/minute; afconvert PCM16/16kHz"
+      ]
+    }
+  ]
+}
