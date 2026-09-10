@@ -5,9 +5,11 @@ import Foundation
 ///
 /// PLAN.md section 0 makes a promise -- "the only network request it ever makes
 /// is the one-time model download" -- and section 6 turns it into a check a
-/// reviewer can run: `grep -rn "URLSession" apps/ios --include=*.swift` must
-/// return this file and nothing else. Anything that wants to reach the network
-/// from anywhere else in the app is a bug, not a feature request.
+/// reviewer can run. `apps/ios/README.md` has the exact grep and what it is
+/// allowed to return: this file, its test, and the engine package's manifest,
+/// whose URL is where the dependency comes from rather than a host the app
+/// calls. Anything else in our code that wants to reach the network is a bug,
+/// not a feature request.
 ///
 /// A Moonshine model is three files, not one (`M2-MOONSHINE.md`), so the unit of
 /// download is `ModelPin`: a set of `Pin`s that install together or not at all.

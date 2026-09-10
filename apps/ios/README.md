@@ -129,15 +129,31 @@ host, once, to download the recogniser.
 How to verify it without trusting the claim:
 
 ```bash
-# Only ModelDownloader.swift may appear.
-grep -rn "URLSession\|https://" apps/ios --include='*.swift'
+# Three files may appear, and nothing else: ModelDownloader.swift, its
+# test, and OpenFlowMoonshineEngine/Package.swift, whose https is the
+# pinned source of the dependency rather than a host the app calls.
+grep -rn "URLSession\|https://" apps/ios --include='*.swift' \
+  --exclude-dir=.build
 ```
 
-`ModelDownloader` is the only type allowed to touch the network. Its URL and its
-SHA-256 are compile-time constants -- there is no manifest fetch, no redirect
-chasing, no remote config -- so the host the app can reach is fixed at build
-time and visible in the source. A file whose digest does not match is deleted,
-not used.
+`ModelDownloader` is the only type in our code allowed to touch the network. Its
+URLs and its six SHA-256 digests are compile-time constants -- there is no
+manifest fetch, no redirect chasing, no remote config -- so the host the app can
+reach is fixed at build time and visible in the source. A set of files whose
+digests do not all match is deleted, not used.
+
+The `--exclude-dir=.build` is not a way of hiding something, and here is what it
+hides. `MoonshineVoice` ships an `AssetDownloader` and a `TextToSpeech` that do
+use `URLSession`, and both are checked out under `.build` when SwiftPM resolves
+the dependency. Neither is called from anything here, on purpose: the app keeps
+its own `ModelDownloader` as the only network code in the product, and dead code
+stripping is on for every configuration, so nothing that reaches them is linked
+into the binary. The check that matters is the one below, on the built app:
+
+```bash
+# The hosts a built binary carries. download.moonshine.ai and nothing else.
+strings "$APP/OpenFlow" | grep -Eo 'https?://[a-z0-9.-]+' | sort -u
+```
 
 Two more things a reviewer can check:
 
