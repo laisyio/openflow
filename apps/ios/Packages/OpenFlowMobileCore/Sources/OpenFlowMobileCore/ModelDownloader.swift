@@ -176,6 +176,14 @@ public actor ModelDownloader {
     /// once all three have passed. That is what makes an interrupted download
     /// safe to walk away from: the model directory either does not exist or is
     /// complete, and `isInstalled` never has to decide what a half a model means.
+    ///
+    /// A failure removes the staging directory and **nothing else**. An install
+    /// that is already there is somebody's working recogniser, and a flaky
+    /// network on a re-download is not a reason to take it away: they would be
+    /// left unable to dictate by an operation they only started because they
+    /// were told a newer model existed. The installed set is touched at exactly
+    /// one point, after every file has been verified, when the replacement is
+    /// two directory operations from done.
     public func download(pin: ModelPin) -> AsyncThrowingStream<Progress, Error> {
         let store = self.store
         let session = self.session
@@ -230,6 +238,9 @@ public actor ModelDownloader {
                         continuation.yield(.downloading(received: finishedBytes, expected: total))
                     }
 
+                    // The only moment the installed set is touched: every file
+                    // is downloaded and verified, and the replacement is two
+                    // directory operations away from done.
                     continuation.yield(.installing)
                     try target.removeAll()
                     try FileManager.default.moveItem(at: staging.directory, to: target.directory)
@@ -237,15 +248,12 @@ public actor ModelDownloader {
                     continuation.finish()
                 } catch let error as DownloadError {
                     try? staging.removeAll()
-                    try? target.removeAll()
                     continuation.finish(throwing: error)
                 } catch let error as ModelStore.StoreError {
                     try? staging.removeAll()
-                    try? target.removeAll()
                     continuation.finish(throwing: error)
                 } catch {
                     try? staging.removeAll()
-                    try? target.removeAll()
                     continuation.finish(throwing: DownloadError.transport(error.localizedDescription))
                 }
             }
@@ -259,12 +267,36 @@ public actor ModelDownloader {
         store.subdirectory(pin.subdirectory).directory
     }
 
+    /// Cheap: every file is there and is the size it was pinned at.
+    ///
+    /// What the download screen should ask on appear. It reads three directory
+    /// entries rather than 141 MB, and it is enough to answer "is there anything
+    /// to download", which is the question that screen is actually asking.
+    ///
+    /// It cannot catch a file that was corrupted in place without changing size,
+    /// which is why it is not what gates loading. `isInstalled` is, and `load()`
+    /// fails loudly behind it.
+    public func isPresent(pin: ModelPin) -> Bool {
+        let target = store.subdirectory(pin.subdirectory)
+        for file in pin.files {
+            guard target.exists(file.fileName) else { return false }
+            guard target.sizeOnDisk(file.fileName) == file.expectedBytes else { return false }
+        }
+        return true
+    }
+
     /// True when every file in the set is present and passes its checksum.
-    /// The download screen calls this before offering to download anything.
     ///
     /// All three are hashed, not just counted: a file truncated by a full disk
     /// exists and is the wrong file, and finding that out here costs a second
     /// once, where finding it out in `Transcriber.init` costs the user a take.
+    ///
+    /// **This reads and hashes all 141 MB, every call.** It is not something to
+    /// put in a SwiftUI computed property, a `body`, or anything else that runs
+    /// more than once: a view that asked it on every redraw would hash the model
+    /// repeatedly while the user scrolled. The download screen should call
+    /// `isPresent` for the cheap answer, or call this once and hold the verdict
+    /// in state.
     public func isInstalled(pin: ModelPin) -> Bool {
         let target = store.subdirectory(pin.subdirectory)
         for file in pin.files {

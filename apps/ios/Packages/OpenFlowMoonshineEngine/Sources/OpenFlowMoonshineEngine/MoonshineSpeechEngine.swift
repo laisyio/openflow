@@ -106,22 +106,26 @@ public actor MoonshineSpeechEngine: SpeechEngine {
     /// occupies on disk".
     public var residentBytes: Int { transcriber == nil ? 0 : footprintDelta }
 
-    /// The terms to bias the recogniser towards on the next take, taken from the
-    /// user's dictionary.
+    /// The terms to bias the recogniser towards on the next take.
     ///
-    /// Set from `SettingsStore.dictionary` before a take. The entries are parsed
-    /// by `DictionaryPostPass`, so a `heard -> Correct` rule offers the engine
-    /// the spelling the user wants to see rather than the mishearing, and
-    /// commas cannot reach Moonshine's comma-delimited list because the
-    /// dictionary already splits on them.
+    /// **Nothing in the app calls this, on purpose.** Moonshine applies key
+    /// terms only on its streaming architectures, and this engine loads `.base`
+    /// and `.tiny`, which are not streaming: `Transcriber.setKeyterms` throws
+    /// `invalidArgument` on them and the terms have no effect whatsoever.
+    /// Wiring the dictionary through to a call that cannot work would put a line
+    /// in the capture path that reads like it carries the dictionary and carries
+    /// nothing.
     ///
-    /// This is a hint, not the mechanism. Moonshine applies key terms only on
-    /// its streaming architectures, so on base-en and tiny-en the call is
-    /// refused and the terms have no effect at all. `DictionaryPostPass` runs
-    /// over the finished transcript either way and is what actually guarantees
-    /// the spelling, the same belt-and-braces the desktop uses. The call stays
-    /// because it costs nothing and starts working by itself the day a
-    /// streaming architecture earns its place.
+    /// `DictionaryPostPass` is what carries the dictionary, deterministically,
+    /// over the finished transcript. That is the mechanism, not a fallback.
+    ///
+    /// The hook stays for the day a streaming architecture earns its place here,
+    /// and it does the parsing correctly when that day comes: entries come from
+    /// `DictionaryPostPass`, so a `heard -> Correct` rule offers the spelling
+    /// the user wants to see rather than the mishearing, and commas cannot reach
+    /// Moonshine's comma-delimited list because the dictionary already splits on
+    /// them. If it is ever called, the refusal is swallowed, because a hint that
+    /// cannot be applied is not a reason to fail somebody's take.
     public func setKeyterms(_ terms: [String]) {
         keyterms = terms.filter { !$0.isEmpty && !$0.contains(",") }
     }

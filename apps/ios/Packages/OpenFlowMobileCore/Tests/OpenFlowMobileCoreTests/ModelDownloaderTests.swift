@@ -242,6 +242,131 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: partial.directory.path))
     }
 
+    /// A failed re-download must not cost somebody their working recogniser.
+    ///
+    /// The case: base-en is installed and verified, a newer pin is offered, and
+    /// the second of its three files fails. Every failure path used to remove
+    /// the installed directory along with the staging one, so a flaky network on
+    /// an upgrade left the user unable to dictate at all, by an operation they
+    /// only started because they were told there was something newer. They are
+    /// worse off than if they had ignored it.
+    @Test func testAFailedReDownloadLeavesTheWorkingInstallAlone() async throws {
+        let store = ModelStore(directory: temporaryDirectory().appendingPathComponent("Models"))
+        let downloader = ModelDownloader(store: store)
+
+        let (installed, _) = try makeServedSet(
+            subdirectory: "moonshine/fixture-en",
+            contents: [
+                (name: "encoder_model.ort", body: "v1 encoder"),
+                (name: "decoder_model_merged.ort", body: "v1 decoder"),
+                (name: "tokenizer.bin", body: "v1 tokenizer"),
+            ]
+        )
+        #expect(await run(downloader, installed).error == nil)
+        #expect(await downloader.isInstalled(pin: installed))
+
+        // The upgrade. Its second file will not verify.
+        let (honest, _) = try makeServedSet(
+            subdirectory: "moonshine/fixture-en",
+            contents: [
+                (name: "encoder_model.ort", body: "v2 encoder"),
+                (name: "decoder_model_merged.ort", body: "v2 decoder"),
+                (name: "tokenizer.bin", body: "v2 tokenizer"),
+            ]
+        )
+        var files = honest.files
+        files[1] = ModelDownloader.Pin(
+            fileName: files[1].fileName,
+            remote: files[1].remote,
+            sha256: String(repeating: "b", count: 64),
+            expectedBytes: files[1].expectedBytes
+        )
+        let upgrade = ModelDownloader.ModelPin(subdirectory: honest.subdirectory, files: files)
+
+        let (_, error) = await run(downloader, upgrade)
+        #expect(error != nil, "the upgrade must fail")
+
+        // The recogniser the user had is still the recogniser the user has.
+        let target = store.subdirectory(installed.subdirectory)
+        #expect(await downloader.isInstalled(pin: installed), "the working install must survive")
+        #expect(await downloader.isPresent(pin: installed))
+        #expect(try Data(contentsOf: target.url(for: "encoder_model.ort")) == Data("v1 encoder".utf8))
+        #expect(try Data(contentsOf: target.url(for: "decoder_model_merged.ort")) == Data("v1 decoder".utf8))
+        #expect(try Data(contentsOf: target.url(for: "tokenizer.bin")) == Data("v1 tokenizer".utf8))
+
+        // And no half-written upgrade is left lying about.
+        let partial = store.subdirectory(installed.subdirectory + ".partial")
+        #expect(!FileManager.default.fileExists(atPath: partial.directory.path))
+    }
+
+    /// A successful re-download still replaces the install, so the rule above is
+    /// "do not destroy on failure", not "never replace".
+    @Test func testASucceedingReDownloadStillReplacesTheInstall() async throws {
+        let store = ModelStore(directory: temporaryDirectory().appendingPathComponent("Models"))
+        let downloader = ModelDownloader(store: store)
+        let (first, _) = try makeServedSet(
+            subdirectory: "moonshine/fixture-en",
+            contents: [
+                (name: "encoder_model.ort", body: "v1 encoder"),
+                (name: "decoder_model_merged.ort", body: "v1 decoder"),
+                (name: "tokenizer.bin", body: "v1 tokenizer"),
+            ]
+        )
+        #expect(await run(downloader, first).error == nil)
+
+        let (second, _) = try makeServedSet(
+            subdirectory: "moonshine/fixture-en",
+            contents: [
+                (name: "encoder_model.ort", body: "v2 encoder"),
+                (name: "decoder_model_merged.ort", body: "v2 decoder"),
+                (name: "tokenizer.bin", body: "v2 tokenizer"),
+            ]
+        )
+        #expect(await run(downloader, second).error == nil)
+        let target = store.subdirectory(second.subdirectory)
+        #expect(try Data(contentsOf: target.url(for: "encoder_model.ort")) == Data("v2 encoder".utf8))
+        #expect(await downloader.isInstalled(pin: second))
+        #expect(await downloader.isInstalled(pin: first) == false, "the old digests no longer match")
+    }
+
+    /// `isPresent` is the cheap question the download screen should ask: three
+    /// directory entries rather than 141 MB of hashing.
+    @Test func testIsPresentChecksNamesAndSizesWithoutHashing() async throws {
+        let store = ModelStore(directory: temporaryDirectory().appendingPathComponent("Models"))
+        let downloader = ModelDownloader(store: store)
+        let (pin, _) = try makeServedSet(
+            subdirectory: "moonshine/fixture-en",
+            contents: [
+                (name: "encoder_model.ort", body: "encoder weights"),
+                (name: "decoder_model_merged.ort", body: "decoder weights"),
+                (name: "tokenizer.bin", body: "tokenizer"),
+            ]
+        )
+        #expect(await downloader.isPresent(pin: pin) == false, "nothing is installed yet")
+        #expect(await run(downloader, pin).error == nil)
+        #expect(await downloader.isPresent(pin: pin))
+
+        let installed = store.subdirectory(pin.subdirectory)
+
+        // A truncated file changes size, so the cheap check catches it too.
+        try Data("short".utf8).write(to: installed.url(for: "tokenizer.bin"))
+        #expect(await downloader.isPresent(pin: pin) == false)
+        #expect(await downloader.isInstalled(pin: pin) == false)
+
+        // A file corrupted in place at the same length is exactly what it cannot
+        // catch, which is why it is not what gates loading. Stated here so the
+        // difference between the two is a test rather than a claim in a comment.
+        let original = try Data(contentsOf: installed.url(for: "encoder_model.ort"))
+        try Data(repeating: 0x41, count: original.count).write(to: installed.url(for: "encoder_model.ort"))
+        try Data("tokenizer".utf8).write(to: installed.url(for: "tokenizer.bin"))
+        #expect(await downloader.isPresent(pin: pin), "same names, same sizes")
+        #expect(await downloader.isInstalled(pin: pin) == false, "different bytes")
+
+        // A missing file fails the cheap check.
+        try installed.remove("encoder_model.ort")
+        #expect(await downloader.isPresent(pin: pin) == false)
+    }
+
     /// A file that is not there at all fails the same way a bad digest does, and
     /// takes the set with it.
     @Test func testAMissingFileTakesTheSetWithIt() async throws {

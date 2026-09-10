@@ -82,12 +82,23 @@ occupies on disk".
 On this Mac, base-en measures a 317 MB delta with a 0.64 s load and 0.48 s of
 warm inference on the reference clip. The phone figure replaces it at the M2 gate.
 
-## Key terms
+## Key terms, and why nothing calls them
 
-`setKeyterms` is called from the dictionary before a take when the dictionary is
-not empty, and its failure is swallowed on purpose. Moonshine applies key terms
-only on its streaming architectures, so on base-en and tiny-en the call is
-refused and the terms have no effect. `DictionaryPostPass` runs over the finished
-transcript either way and is what actually guarantees the spelling, the same
-belt-and-braces the desktop uses. The call stays because it costs nothing and
-starts working by itself the day a streaming architecture earns its place.
+The engine has a `setKeyterms` hook, and **nothing in the app target calls it.**
+That is deliberate, and the reason is worth stating rather than leaving as a gap
+somebody later fills in by accident.
+
+Moonshine applies key terms only on its streaming architectures. This app loads
+`.base` and `.tiny`, which are not streaming, so `Transcriber.setKeyterms` throws
+`invalidArgument` on them and the terms have no effect whatsoever. Wiring the
+user's dictionary through to a call that cannot work would put a line in the
+capture path that looks like it carries the dictionary, reads in a diff like it
+carries the dictionary, and carries nothing.
+
+What carries the dictionary is `DictionaryPostPass`, deterministically, over the
+finished transcript. That is the whole mechanism today, not a fallback: it is why
+base-en writing "enterol I" for "entro.ly" is a solved problem.
+
+The hook stays for the day a streaming architecture earns its place here. If it
+is ever called, its failure is swallowed on purpose, because a hint that cannot
+be applied is not a reason to fail somebody's take.
