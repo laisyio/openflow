@@ -46,6 +46,7 @@ Model availability and billing are controlled by the provider. OpenFlow does not
 - Transcript history is stored locally in an unencrypted SQLite database in the operating system's application-data directory. You control it from Settings: delete individual entries, clear everything, turn saving off entirely, or set an auto-delete window (1/7/30/90 days) that is applied at launch and after each transcription.
 - Auto-paste requires operating-system automation/accessibility permission. If permission is denied or a paste helper is unavailable, the transcript should still be available in OpenFlow and on the clipboard.
 - Enabled plugins are local executables and are not sandboxed. They receive transcript data over standard input. Only install and enable plugins you trust.
+- Native MP3 playback uses a bounded memory queue and an immediately unlinked, account-only temporary file for decoder seeking. Generated speech can occupy temporary disk storage during playback; no named playback file remains. Tauri playback keeps one bounded audio session in memory/browser storage.
 
 ## Local transcription (private)
 
@@ -55,8 +56,9 @@ or pick the "On this Mac (private)" card during setup.
 
 It runs [Qwen3-ASR](https://huggingface.co/mlx-community) through
 [`mlx-audio`](https://github.com/Blaizzy/mlx-audio) as a supervised sidecar on
-`127.0.0.1`, and it is faster than the cloud round trip it replaces: 0.40 s for
-an 8.7 s dictation against 1.7 s through Groq, with no network variance.
+`127.0.0.1`. Local latency depends on the model, recording and hardware; see the
+[multi-speaker evaluation](evals/README.md) for a reproducible comparison rather
+than extrapolating from one reference clip.
 
 **It needs a Python 3.10 or newer that you install yourself.** OpenFlow does not
 bundle one -- MLX plus its packages is about 600 MB, and tripling the download
@@ -71,12 +73,20 @@ Two one-time steps, both in that panel, both resumable:
 | **Install** | Creates a virtualenv beside the database and installs `mlx-audio` into it | about 600 MB on disk |
 | **Download** | Fetches the model into the standard Hugging Face cache | 1.0 GB (fast) or 1.7 GB (accurate) |
 
-Two models, measured on an M4 Air with the same 8.7 s clip:
+Two local desktop tiers:
 
-| Model | Wait for a 10 s dictation | Memory while loaded | Notes |
-|-------|---------------------------|---------------------|-------|
-| **Accurate** (Qwen3-ASR 1.7B) | about 1.0 s | about 2.5 GB | The default. Keeps product names. |
-| **Fast** (Qwen3-ASR 0.6B) | about 0.4 s | about 1.0 GB | Weaker on proper nouns. |
+| Model | Notes |
+|-------|-------|
+| **Accurate** (Qwen3-ASR 1.7B) | The default; better synthetic term/stress results in the checked-in eval |
+| **Fast** (Qwen3-ASR 0.6B) | Lower measured latency; same clean-human WER as 1.7B on this small corpus |
+
+The [full results](evals/baselines/2026-09-10-m4/comparison.md) separate RSS,
+Metal allocations, file-cache state and model sizes. They are Mac adapter
+measurements, not iPhone results or a guaranteed memory budget. Runtime installs
+are tied to a hashed lock and model downloads to exact revisions; staged upgrades
+keep the previous runtime generation intact. Older verified inactive generations
+are pruned once no sidecar, setup or probe is using the runtimes. Unknown/legacy
+directories are left untouched, and one rollback generation is retained.
 
 That memory is real, so the model is unloaded after an idle window (10 minutes
 by default, configurable from 1 minute to 4 hours). The reload costs about 3 s,
@@ -182,7 +192,8 @@ The first recording prompts for microphone access. Auto-paste may separately pro
 ## Development commands
 
 ```bash
-# Strict TypeScript check and production frontend build
+# Speech playback regressions, strict TypeScript and production frontend build
+npm test
 npm run check
 
 # Rust formatting, Clippy, and tests
@@ -199,8 +210,7 @@ CI runs these checks from a clean install and compiles the desktop app on macOS,
 
 ## Native build (experimental, macOS only)
 
-`crates/openflow-native` is the same app with AppKit windows instead of a WKWebView: a status item, one main window whose sidebar holds Dictate, History, Plugins and Settings, a setup wizard presented as a sheet on it, and the overlay pill as an `NSPanel`. It drives the same `openflow-core` engine as the Tauri build and reads the same database and keychain items, so the two can be swapped without reconfiguring anything. The plan is `docs/native-port/PLAN.md`; the local transcription runner is what is left of Milestone B.
-`crates/openflow-native` is the same app with AppKit windows instead of a WKWebView: a status item, a setup wizard, Settings, History and Plugins windows, and the overlay pill as an `NSPanel`. It drives the same `openflow-core` engine as the Tauri build and reads the same database and keychain items, so the two can be swapped without reconfiguring anything. It can also transcribe on-device (see [Local transcription](#local-transcription-private)). The plan is `docs/native-port/PLAN.md`; streaming TTS is what is left of Milestone B.
+`crates/openflow-native` uses AppKit instead of a WKWebView: a status item, one sidebar workspace for Dictate, History, Plugins and Settings, an onboarding sheet, and an overlay `NSPanel`. It drives the same `openflow-core` engine and uses the same database/keychain as Tauri. Local transcription and streamed MP3 playback are implemented. See `docs/native-port/PLAN.md` and the [performance sweep](docs/performance-fixes-2026-09-10.md) for status and verification limits.
 
 A launch with no provider saved opens the setup wizard instead of Settings: provider, key, a connection test, then microphone and shortcut. Settings has a "Run setup again" button that reopens it.
 
@@ -299,7 +309,7 @@ Because network and cleanup latency vary, keep the intended destination focused 
 
 ## Plugin hooks
 
-Plugins live under `~/.openflow/plugins/<plugin-id>/`. An enabled plugin may declare `after_transcribe` and/or `after_format` plus a relative executable `entrypoint` in `manifest.json`. OpenFlow passes a JSON payload on standard input and expects the updated payload as JSON on standard output. Hooks run serially with a five-second timeout.
+Plugins live under `~/.openflow/plugins/<plugin-id>/`. An enabled plugin may declare `after_transcribe` and/or `after_format` plus a relative executable `entrypoint` in `manifest.json`. OpenFlow passes a JSON payload on standard input and expects the updated payload as JSON on standard output. Hooks run serially on a blocking worker, with a five-second per-hook limit and a shared ten-second budget across both stages. Cancellation stops work; Unix process groups clean up ordinary descendants, including a parent that exits while children retain its pipes. Windows currently terminates the direct child only.
 
 Plugin entrypoints run with the user's operating-system permissions. There is currently no plugin marketplace, signature verification, or sandbox.
 
