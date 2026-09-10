@@ -48,9 +48,9 @@ settings:
     DEAD_CODE_STRIPPING: YES
   configs:
     # Size, not speed, on the shipping build. The work that has to be fast here
-    # is the model's, and that runs in Metal and the Neural Engine rather than in
-    # anything this flag touches; what the app's own code costs is download size
-    # and pages resident next to a model that wants a gigabyte of them.
+    # is the model's, and that runs inside Moonshine's prebuilt C++ library
+    # rather than in anything this flag touches; what the app's own code costs is
+    # download size and pages resident next to the model's few hundred MB.
     Release:
       SWIFT_OPTIMIZATION_LEVEL: "-Osize"
 
@@ -59,14 +59,21 @@ packages:
   # alone; `swift test` inside it is the gate that runs without Xcode.
   OpenFlowMobileCore:
     path: Packages/OpenFlowMobileCore
-  # The two engine packages are declared but NOT attached to any target yet.
-  # They need MLX Swift / WhisperKit and the Metal toolchain, and Milestone M2
-  # decides which one ships (PLAN.md section 3). To bring one in: uncomment its
-  # entry under the OpenFlow target's `dependencies`.
-  OpenFlowQwenEngine:
-    path: Packages/OpenFlowQwenEngine
-  OpenFlowWhisperEngine:
-    path: Packages/OpenFlowWhisperEngine
+  # The recogniser: SpeechEngine on Moonshine (M2-MOONSHINE.md). Attached to the
+  # OpenFlow target only, below.
+  OpenFlowMoonshineEngine:
+    path: Packages/OpenFlowMoonshineEngine
+  # Moonshine's own package. The engine package already depends on it, so this
+  # entry is not what pulls it in; it is here so the pin is visible in the file
+  # a reviewer reads, next to every other dependency the app has.
+  #
+  # `revision:` and not `from:` or `branch:`. The package carries a binaryTarget
+  # that fetches Moonshine.xcframework.zip from a GitHub release by URL, so a
+  # floating pin would let that artefact change between two builds of the same
+  # commit of this repo. Same rule as the desktop's runner pins.
+  moonshine-swift:
+    url: https://github.com/moonshine-ai/moonshine-swift.git
+    revision: 45a14f9edf1f2a6913d3aff38c1fd4e72d5b7daa   # v0.1.5, 2026-08-24
 
 targets:
 
@@ -89,8 +96,11 @@ targets:
         product: OpenFlowMobileCore
       - target: OpenFlowKeyboard
       - target: OpenFlowWidgets
-      # - package: OpenFlowQwenEngine      # M2
-      # - package: OpenFlowWhisperEngine   # M2
+      # The recogniser, and the 34 MB static library under it. The app target
+      # only: the keyboard extension has a memory cap in the tens of megabytes
+      # and can never run a model, and the widgets have no use for one.
+      - package: OpenFlowMoonshineEngine
+        product: OpenFlowMoonshineEngine
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.laisy.openflow
