@@ -18,14 +18,26 @@
 //!
 //! It answers the keyboard for the same reason the web screen does. A control
 //! whose only gesture is "hold the mouse down on it" cannot be operated from
-//! the keyboard at all, and `AXPress` -- which is what assistive technology and
-//! every scripted click send -- fires an action this button does not have, so
-//! it would do nothing. Space and Return press and release it, `isARepeat`
+//! the keyboard at all. Space and Return press and release it, `isARepeat`
 //! drops the auto-repeat of a held key so the press is not delivered twice, and
 //! the Dictate page takes first responder when it comes forward so the key
 //! reaches the button without a Tab first.
+//!
+//! The keyboard is not enough for VoiceOver, which walks the screen with its
+//! own cursor and never moves the first responder, so the Space key above is
+//! not a way in for it. What VoiceOver sends -- and what every scripted click
+//! sends -- is `AXPress`, and `NSButton` answers that by asking its cell to
+//! `performClick:`, which sends the button's *action*. This button has no
+//! action; its overrides send two selectors of their own to the target. So the
+//! press was accepted, reported as handled, and did nothing at all.
+//!
+//! [`HoldButton::accessibility_perform_press`] closes that. It does not try to
+//! make `AXPress` hold, which one instant cannot express: it hands the two
+//! edges out one press at a time, so the first press starts the capture and the
+//! next one ends it, and `accessibilityHelp` says so out loud because the
+//! visible title still reads "Hold to record".
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use objc2::rc::Retained;
@@ -37,7 +49,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
 
-use openflow_core::engine::{Engine, RecordingState};
+use openflow_core::engine::{Engine, EngineEvent, RecordingState};
+use openflow_core::insert::InsertMethod;
 
 use crate::hotkeys;
 use crate::ui::card::{Card, GAP, MARGIN, PADDING};
@@ -62,13 +75,23 @@ const RESULT_CHARS: usize = 220;
 
 // ── The hold button ───────────────────────────────────────
 
+/// Whether the button is mid-hold. Only the `AXPress` path reads it: the mouse
+/// and the keyboard each bring their own down edge and up edge, but a press is
+/// a single instant with no "still held", so that path has to remember which
+/// half it owes. `Cell<bool>` so the class still implements no Drop.
+#[derive(Default)]
+pub struct HoldButtonIvars {
+    holding: Cell<bool>,
+}
+
 define_class!(
-    // SAFETY: `NSButton` is designed for subclassing, this class adds no ivars
-    // and implements no Drop, and both methods are ones AppKit already defines
-    // with this signature.
+    // SAFETY: `NSButton` is designed for subclassing, this class holds only a
+    // `Cell<bool>` and implements no Drop, and every method here is one AppKit
+    // already defines with this signature.
     #[unsafe(super(NSButton))]
     #[thread_kind = MainThreadOnly]
     #[name = "OpenFlowHoldButton"]
+    #[ivars = HoldButtonIvars]
     pub struct HoldButton;
 
     impl HoldButton {
@@ -81,14 +104,12 @@ define_class!(
             if !self.isEnabled() {
                 return;
             }
-            self.setHighlighted(true);
-            self.send(sel!(holdBegan:));
+            self.begin_hold();
         }
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
-            self.setHighlighted(false);
-            self.send(sel!(holdEnded:));
+            self.end_hold();
         }
 
         /// Focusable, so Space and Return can reach it. A disabled button is
@@ -112,8 +133,7 @@ define_class!(
             if event.isARepeat() || !self.isEnabled() {
                 return;
             }
-            self.setHighlighted(true);
-            self.send(sel!(holdBegan:));
+            self.begin_hold();
         }
 
         #[unsafe(method(keyUp:))]
@@ -122,11 +142,49 @@ define_class!(
                 let _: () = unsafe { msg_send![super(self), keyUp: event] };
                 return;
             }
-            self.setHighlighted(false);
-            self.send(sel!(holdEnded:));
+            self.end_hold();
+        }
+
+        /// The only way in that does not need a mouse or the first responder.
+        /// VoiceOver's VO-Space and every scripted click arrive here, and
+        /// `NSButton`'s own answer -- `performClick:`, which sends the action --
+        /// is a no-op on a button whose action is nil, which this one's is.
+        ///
+        /// A press is one instant and a hold is two edges, so one press cannot
+        /// be both: the press alternates instead, starting the capture and then
+        /// ending it. Returning false while disabled is how the transcribing
+        /// state refuses a second capture, the same as `mouseDown:` does.
+        ///
+        /// Written without an early return: `define_class!` rewrites the body
+        /// to hand AppKit an ObjC `BOOL`, and only the tail expression is
+        /// converted for it.
+        #[unsafe(method(accessibilityPerformPress))]
+        fn accessibility_perform_press(&self) -> bool {
+            if !self.isEnabled() {
+                false
+            } else {
+                if self.ivars().holding.get() {
+                    self.end_hold();
+                } else {
+                    self.begin_hold();
+                }
+                true
+            }
+        }
+
+        /// Said out loud because the visible title cannot be: it reads "Hold to
+        /// record", and holding is exactly what this path does not do.
+        #[unsafe(method_id(accessibilityHelp))]
+        fn accessibility_help(&self) -> Retained<NSString> {
+            NSString::from_str(PRESS_HELP)
         }
     }
 );
+
+/// What VoiceOver reads after the button's title. Spelled as two presses
+/// because that is what `accessibilityPerformPress` above actually does.
+const PRESS_HELP: &str =
+    "Press to start recording, then press again to stop. Holding the button works too.";
 
 /// Space or Return, the two keys the web screen's `record-button` listens for.
 /// Read from the key code rather than the characters so a non-Latin keyboard
@@ -141,6 +199,23 @@ const KEY_SPACE: u16 = 49;
 const KEY_ENTER: u16 = 76;
 
 impl HoldButton {
+    /// The down edge, whichever of the three gestures brought it. Recording the
+    /// hold here rather than in each of them is what keeps the `AXPress` toggle
+    /// in step with a mouse or a key that got there first.
+    fn begin_hold(&self) {
+        self.ivars().holding.set(true);
+        self.setHighlighted(true);
+        self.send(sel!(holdBegan:));
+    }
+
+    /// The up edge. Unconditional, like `mouseUp:` has always been: a release
+    /// with no press behind it is the engine's to ignore, not this button's.
+    fn end_hold(&self) {
+        self.ivars().holding.set(false);
+        self.setHighlighted(false);
+        self.send(sel!(holdEnded:));
+    }
+
     /// Send `selector` to whatever this button's target is. The target is
     /// `NSControl`'s ordinary weak property, so the page owns the button and
     /// the button does not own the page.
@@ -174,6 +249,14 @@ pub struct DictateIvars {
     /// The full text behind the truncated card, so clicking it copies all of
     /// what was said rather than what fits.
     last: RefCell<Option<String>>,
+    /// What the page is currently showing. Kept because the idle copy depends
+    /// on settings as well as on state, so `load` has to redraw the state it is
+    /// already in rather than assume it is idle.
+    state: Cell<RecordingState>,
+    /// Set while the card is reporting a failure instead of a transcript, to
+    /// where in the app that failure is answered. The card is the page's
+    /// "what just happened", and what just happened was the failure.
+    problem: RefCell<Option<String>>,
 }
 
 define_class!(
@@ -209,6 +292,15 @@ define_class!(
         /// than at the app they would want the text typed into.
         #[unsafe(method(copyLast:))]
         fn copy_last(&self, _sender: &NSControl) {
+            // While the card is reporting a failure it is the way to the screen
+            // that answers it, not a copy of a transcript that never arrived.
+            let problem = self.ivars().problem.borrow().clone();
+            if let Some(target) = problem {
+                crate::app::with_app(|app| {
+                    app.handle_event(EngineEvent::Navigate(target));
+                });
+                return;
+            }
             let text = self.ivars().last.borrow().clone();
             let Some(text) = text else {
                 return;
@@ -241,6 +333,8 @@ impl DictatePage {
             view,
             controls,
             last: RefCell::new(None),
+            state: Cell::new(RecordingState::Idle),
+            problem: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -283,9 +377,20 @@ impl DictatePage {
             .controls
             .hint
             .setStringValue(&NSString::from_str(&format!(
-                "{} works from any app  ·  {} pastes again",
-                record, recopy
+                "{} works from any app  ·  {} {} again",
+                record,
+                recopy,
+                insertion_verb(settings.insert_method())
             )));
+
+        // The card is the page's "what just happened", and while a take has
+        // failed that is the failure -- not the take before it. Reloading is
+        // what every navigation into this page does, so without this the
+        // menu-bar item that offers to fix the failure would clear the copy of
+        // it on the way to the screen that answers it.
+        if ivars.problem.borrow().is_some() {
+            return;
+        }
 
         let newest = ivars
             .engine
@@ -309,11 +414,46 @@ impl DictatePage {
                     .setStringValue(&NSString::from_str(""));
             }
         }
+
+        // The panel copy names the insert method too, so redraw whatever state
+        // the page is in rather than leaving yesterday's sentence up.
+        self.set_state(ivars.state.get());
+    }
+
+    /// Report a failure on the result card, and offer the screen that answers
+    /// it. `target` is a [`openflow_core::engine::EngineEvent::Navigate`] name,
+    /// or `None` when there is nowhere useful to go.
+    pub fn set_problem(&self, message: &str, target: Option<&str>) {
+        let ivars = self.ivars();
+        *ivars.problem.borrow_mut() = target.map(str::to_string);
+        ivars
+            .controls
+            .result
+            .setTitle(&NSString::from_str(&preview_of(message)));
+        // Readable either way; clickable only when the click leads somewhere.
+        ivars.controls.result.setEnabled(target.is_some());
+        ivars
+            .controls
+            .result_caption
+            .setStringValue(&NSString::from_str(match target {
+                Some(_) => "That take did not finish \u{2014} click to fix it",
+                None => "That take did not finish",
+            }));
+    }
+
+    /// Put the card back to the last transcript once the failure is answered.
+    pub fn clear_problem(&self) {
+        if self.ivars().problem.borrow().is_none() {
+            return;
+        }
+        *self.ivars().problem.borrow_mut() = None;
+        self.load();
     }
 
     /// Show `text` on the result card, with `caption` above it.
     pub fn set_last(&self, text: &str, caption: &str) {
         let ivars = self.ivars();
+        *ivars.problem.borrow_mut() = None;
         *ivars.last.borrow_mut() = Some(text.to_string());
         ivars
             .controls
@@ -332,6 +472,11 @@ impl DictatePage {
     /// folds it: the pipeline never emits it, and inventing a fourth panel here
     /// would be inventing a state the engine does not have.
     pub fn set_state(&self, state: RecordingState) {
+        self.ivars().state.set(state);
+        let settings = self.ivars().engine.settings();
+        let cleanup = settings.format_enabled();
+        let idle_body = idle_body(cleanup, settings.insert_method());
+        let transcribing_body = transcribing_body(cleanup, settings.is_local_backend());
         let controls = &self.ivars().controls;
         let (eyebrow, title, body, action, enabled, cancel) = match state {
             RecordingState::Recording => (
@@ -345,7 +490,7 @@ impl DictatePage {
             RecordingState::Transcribing | RecordingState::Formatting => (
                 "Turning speech into text",
                 "One moment\u{2026}",
-                "Your provider is transcribing and formatting the result.",
+                transcribing_body,
                 "Transcribing\u{2026}",
                 false,
                 true,
@@ -353,7 +498,7 @@ impl DictatePage {
             RecordingState::Idle => (
                 "Ready when you are",
                 "Hold to speak",
-                "Release when you\u{2019}re done. OpenFlow cleans it up and pastes it for you.",
+                idle_body.as_str(),
                 "Hold to record",
                 true,
                 false,
@@ -384,6 +529,51 @@ fn preview_of(text: &str) -> String {
 /// The binding for `action` as the recorder spells it. Same helper Settings
 /// uses, kept separate rather than shared because the two screens are allowed
 /// to disagree about what to say when nothing is bound.
+/// "pastes" or "types", because they are not the same promise. Paste sends Cmd+V
+/// and takes the clipboard with it; Type sends the characters and never touches
+/// it. The Settings page spells the difference out one screen away, so the main
+/// screen should not tell every user it pastes.
+fn insertion_verb(method: InsertMethod) -> &'static str {
+    match method {
+        InsertMethod::Paste => "pastes",
+        InsertMethod::Type => "types",
+    }
+}
+
+/// What the idle panel promises will happen when the key comes up.
+///
+/// Both halves of it are settings: cleanup can be off, and the text can be
+/// typed rather than pasted. The line was fixed copy that claimed both, so on a
+/// machine with Smart cleanup off and Insert text by set to Type -- a
+/// combination the Settings page offers on purpose -- the first sentence a user
+/// reads on the main screen described someone else's setup.
+fn idle_body(cleanup: bool, method: InsertMethod) -> String {
+    let verb = insertion_verb(method);
+    if cleanup {
+        format!("Release when you\u{2019}re done. OpenFlow cleans it up and {verb} it for you.")
+    } else {
+        format!("Release when you\u{2019}re done. OpenFlow {verb} it for you.")
+    }
+}
+
+/// What the waiting panel says is happening, while it happens.
+///
+/// The same two settings as the idle line, read one panel later. It claimed
+/// "Your provider is transcribing and formatting the result" on every machine,
+/// which is two claims and both can be false: cleanup can be off, and on the
+/// local backend there is no provider in it at all -- the sidecar runs on this
+/// Mac, which is the whole promise of that setting. Cleanup is the exception
+/// worth spelling out, because it does go to the provider even on the local
+/// backend: the sidecar transcribes and nothing else.
+fn transcribing_body(cleanup: bool, local: bool) -> &'static str {
+    match (local, cleanup) {
+        (false, true) => "Your provider is transcribing and formatting the result.",
+        (false, false) => "Your provider is transcribing the recording.",
+        (true, true) => "OpenFlow is transcribing on this Mac, then your provider cleans it up.",
+        (true, false) => "OpenFlow is transcribing on this Mac.",
+    }
+}
+
 fn binding_text(settings: &openflow_core::settings::Settings, action: &str) -> String {
     settings
         .shortcut(action)
@@ -633,16 +823,75 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
 
 impl HoldButton {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
-        let this = Self::alloc(mtm);
+        let this = Self::alloc(mtm).set_ivars(HoldButtonIvars::default());
         // SAFETY: `initWithFrame:` is `NSView`'s designated initialiser, which
         // `NSButton` inherits.
-        unsafe { msg_send![this, initWithFrame: frame] }
+        unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2::ClassType;
+
+    /// Whether `OpenFlowHoldButton` implements `selector` itself rather than
+    /// inheriting it. `class_copyMethodList`, which is what this reads, lists
+    /// only a class's own methods, so it answers exactly that question without
+    /// needing an instance -- and an instance would need the main thread and a
+    /// window, which a test does not have.
+    fn overrides(selector: objc2::runtime::Sel) -> bool {
+        HoldButton::class()
+            .instance_methods()
+            .iter()
+            .any(|method| method.name() == selector)
+    }
+
+    /// The button has to answer `AXPress` itself. Inheriting it is not
+    /// harmless: `NSButton` answers `AXPress` by asking its cell to
+    /// `performClick:`, which sends the button's action, and this button has no
+    /// action -- so the press is accepted, reported as handled, and does
+    /// nothing. VoiceOver sends nothing else, because its cursor never moves
+    /// the first responder and so never reaches the Space key path below, which
+    /// leaves the whole Dictate page unusable with VoiceOver on.
+    #[test]
+    fn the_hold_button_answers_press_itself() {
+        assert!(
+            overrides(sel!(accessibilityPerformPress)),
+            "HoldButton inherits NSButton's accessibilityPerformPress, which \
+             clicks a nil action and does nothing"
+        );
+    }
+
+    /// A press cannot be a hold, so the press has to be spelled out. The
+    /// visible title says "Hold to record" and cannot say anything else.
+    #[test]
+    fn the_press_help_names_both_presses() {
+        assert!(
+            overrides(sel!(accessibilityHelp)),
+            "HoldButton has no accessibilityHelp, so VoiceOver reads only the \
+             title, which describes a gesture the press path does not use"
+        );
+        let help = PRESS_HELP.to_lowercase();
+        assert!(help.contains("press to start"), "{PRESS_HELP}");
+        assert!(help.contains("press again"), "{PRESS_HELP}");
+    }
+
+    /// The press is an addition, not a replacement: the mouse and the keyboard
+    /// are still the two gestures that carry a real hold, and a control that
+    /// stopped taking first responder would lose the keyboard entirely.
+    #[test]
+    fn the_hold_button_keeps_the_mouse_and_the_keyboard() {
+        for selector in [
+            sel!(mouseDown:),
+            sel!(mouseUp:),
+            sel!(keyDown:),
+            sel!(keyUp:),
+            sel!(acceptsFirstResponder),
+        ] {
+            assert!(overrides(selector), "{selector:?} is no longer overridden");
+        }
+    }
 
     /// The card shows one line, so newlines and runs of spaces collapse.
     #[test]
@@ -658,6 +907,68 @@ mod tests {
         let preview = preview_of(&long);
         assert_eq!(preview.chars().count(), RESULT_CHARS + 1);
         assert!(preview.ends_with('\u{2026}'));
+    }
+
+    /// Neither half of the idle promise is fixed, so neither is claimed when
+    /// it is off. The combination that matters is the last one: Smart cleanup
+    /// off and Insert text by set to Type is a setup the Settings page offers
+    /// on purpose, and the sentence used to describe someone else's.
+    #[test]
+    fn the_idle_panel_promises_only_what_the_settings_do() {
+        assert_eq!(
+            idle_body(true, InsertMethod::Paste),
+            "Release when you\u{2019}re done. OpenFlow cleans it up and pastes it for you."
+        );
+        assert_eq!(
+            idle_body(false, InsertMethod::Paste),
+            "Release when you\u{2019}re done. OpenFlow pastes it for you."
+        );
+        assert_eq!(
+            idle_body(false, InsertMethod::Type),
+            "Release when you\u{2019}re done. OpenFlow types it for you."
+        );
+    }
+
+    /// Paste and Type are different promises about the user's clipboard, which
+    /// is why the Settings page spells the difference out. The main screen must
+    /// not tell every user it pastes.
+    #[test]
+    fn the_insertion_verb_follows_the_insert_method() {
+        assert_eq!(insertion_verb(InsertMethod::Paste), "pastes");
+        assert_eq!(insertion_verb(InsertMethod::Type), "types");
+    }
+
+    /// The waiting panel makes the same two claims one panel later, and both
+    /// can be false. "Your provider" is the one to watch: on the local backend
+    /// the transcription happens on this Mac, and saying otherwise contradicts
+    /// the setting the user turned on to stop it leaving.
+    #[test]
+    fn the_waiting_panel_does_not_name_a_provider_that_is_not_involved() {
+        assert!(transcribing_body(true, false).contains("provider"));
+        assert!(transcribing_body(false, false).contains("provider"));
+
+        assert!(
+            !transcribing_body(false, true).contains("provider"),
+            "on-device with cleanup off, no provider sees the take at all"
+        );
+        // Cleanup is the exception: it goes to the provider even on the local
+        // backend, so this one names both.
+        let both = transcribing_body(true, true);
+        assert!(both.contains("this Mac"), "{both}");
+        assert!(both.contains("provider"), "{both}");
+    }
+
+    /// Formatting is claimed only when it will happen.
+    #[test]
+    fn the_waiting_panel_claims_formatting_only_when_cleanup_is_on() {
+        for local in [false, true] {
+            assert!(
+                !transcribing_body(false, local).contains("formatting")
+                    && !transcribing_body(false, local).contains("cleans it up"),
+                "cleanup is off: {}",
+                transcribing_body(false, local)
+            );
+        }
     }
 
     /// The centring constant has to be the sum of the steps `build_content`

@@ -40,14 +40,15 @@ use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 
+use openflow_core::audio::AudioDevice;
 use openflow_core::engine::Engine;
 use openflow_core::transcribe::ModelInfo;
 
 use crate::ui::recorder::ChordRecorder;
 use crate::ui::settings::{join_provider, split_provider};
 use crate::ui::{
-    button, combo, label, note, popup, radio, secure_field, switch_control, text_field, wire, wrap,
-    Form, ROW,
+    allow_wrapping, button, combo, label, note, popup, radio, secure_field, switch_control,
+    text_field, wire, wrap, Form, ROW,
 };
 
 const WINDOW_WIDTH: f64 = 520.0;
@@ -69,6 +70,20 @@ const WINDOW_WIDTH: f64 = 520.0;
 const WINDOW_HEIGHT: f64 = STEP_HEIGHT + 140.0;
 const STEP_WIDTH: f64 = 488.0;
 const STEP_HEIGHT: f64 = 461.0;
+
+/// The box the line under the microphone picker gets.
+///
+/// Filled in by `reload_microphones`, so the frame is reserved rather than
+/// fitted: two lines of [`note`] text, because the longest thing this line says
+/// is an enumeration error with the audio thread's own words inside it, and a
+/// label sized to the empty placeholder it is built with would have nowhere to
+/// put one. Nothing clips it -- `allow_wrapping` turns wrapping on and stops
+/// there -- so a third line does not truncate, it draws over the Record
+/// shortcut row underneath. It is a named constant because the arithmetic that
+/// makes two lines enough is a claim about the sentences in
+/// [`microphone_note`], and that claim is asserted rather than remembered; see
+/// `every_microphone_note_fits_the_line_reserved_for_it`.
+const MICROPHONE_NOTE_HEIGHT: f64 = 28.0;
 
 // ── The step machine ──────────────────────────────────────
 
@@ -314,10 +329,82 @@ pub fn summary_line(kind: &str, model: &str, microphone: &str, shortcut: &str) -
     } else {
         model.trim()
     };
+    if microphone == NO_MICROPHONE {
+        return format!(
+            "{} · {} · {} · connect an input device, then hold {} to dictate",
+            provider, model, microphone, shortcut
+        );
+    }
     format!(
         "{} · {} · {} · hold {} to dictate, active now",
         provider, model, microphone, shortcut
     )
+}
+
+/// What the microphone popup shows when the wizard could not name a device.
+///
+/// It is a device name, not a message, because it is also what the closing
+/// panel reads back out of the popup: whatever stands here is what setup
+/// claims OpenFlow will record with.
+pub const NO_MICROPHONE: &str = "No microphone detected";
+
+/// The popup's items for `devices`, in the order the id list is built in.
+///
+/// "System default" used to be added unconditionally, before the devices and
+/// whatever the enumeration had said. That named a device that need not exist:
+/// `list_audio_devices` fails one way and comes back empty another -- a wedged
+/// CoreAudio HAL times out after two seconds (audio.rs:275), while an
+/// enumeration error or a machine with no input at all just yields nothing
+/// (audio.rs:336) -- and `unwrap_or_default` flattened both into the same empty
+/// list. The fallback the item promises does not exist either: `Start` resolves
+/// an empty selection through `default_input_device`, and when that is `None`
+/// the first real dictation fails with "No microphone found. Connect or enable
+/// an input device." (audio.rs:126-131). So an empty list says so here, in the
+/// words the web wizard uses for the same state (src/App.tsx:1026).
+pub fn microphone_items(devices: &[AudioDevice]) -> Vec<String> {
+    if devices.is_empty() {
+        return vec![NO_MICROPHONE.to_string()];
+    }
+    let mut items = vec!["System default".to_string()];
+    items.extend(devices.iter().map(|device| {
+        if device.is_default {
+            format!("{} (default)", device.name)
+        } else {
+            device.name.clone()
+        }
+    }));
+    items
+}
+
+/// The line under the picker: how many devices were found, or why none were.
+///
+/// The two failures are kept apart on purpose, because the user's next move
+/// differs. Nothing enumerated is usually the microphone grant, which Refresh
+/// picks up once it is given; an `Err` is the audio thread not answering, which
+/// Refresh retries. The web wizard shows the first of these and nothing for the
+/// second, since `invoke` rejections land in its error banner instead.
+pub fn microphone_note(listed: Result<usize, &str>) -> String {
+    match listed {
+        Err(error) => format!("Could not read microphones: {error}. Press Refresh to try again."),
+        Ok(0) => {
+            "No microphone detected yet. Check system permission, then press Refresh.".to_string()
+        }
+        Ok(1) => "1 microphone ready.".to_string(),
+        Ok(count) => format!("{count} microphones ready."),
+    }
+}
+
+/// The closing panel's heading, which [`Step::title`] cannot answer alone.
+///
+/// "OpenFlow is ready" is a promise about the whole pipeline, and setup is only
+/// four fifths of it: everything else the wizard collected can be correct while
+/// the one thing it cannot supply -- a microphone -- is missing. Saying it here
+/// costs a panel the user reads anyway, rather than at the first hotkey press.
+pub fn done_heading(microphone: &str) -> &'static str {
+    if microphone == NO_MICROPHONE {
+        return "Setup is saved, but there is no microphone";
+    }
+    Step::Done.title()
 }
 
 // ── Control tags ──────────────────────────────────────────
@@ -352,6 +439,7 @@ struct Controls {
     stt_model: Retained<NSComboBox>,
     chat_model: Retained<NSComboBox>,
     microphone: Retained<NSPopUpButton>,
+    microphone_note: Retained<NSTextField>,
     microphone_ids: RefCell<Vec<String>>,
     refresh: Retained<NSButton>,
     hotkey: Retained<NSButton>,
@@ -607,23 +695,24 @@ impl OnboardingWindow {
     fn reload_microphones(&self) {
         let ivars = self.ivars();
         let controls = &ivars.controls;
-        let devices = ivars.engine.list_audio_devices().unwrap_or_default();
+        let listed = ivars.engine.list_audio_devices();
+        self.set_text(
+            &controls.microphone_note,
+            &microphone_note(listed.as_ref().map(Vec::len).map_err(String::as_str)),
+        );
+        let devices = listed.unwrap_or_default();
+        // The id list stays keyed to the popup by position, and its first entry
+        // is the empty string either way: an empty `microphone` row means "let
+        // the recorder pick", which is still the right thing to save when there
+        // was nothing to enumerate.
         let mut ids = vec![String::new()];
         controls.microphone.removeAllItems();
-        controls
-            .microphone
-            .addItemWithTitle(&NSString::from_str("System default"));
-        for device in &devices {
-            let title = if device.is_default {
-                format!("{} (default)", device.name)
-            } else {
-                device.name.clone()
-            };
+        for title in microphone_items(&devices) {
             controls
                 .microphone
                 .addItemWithTitle(&NSString::from_str(&title));
-            ids.push(device.id.clone());
         }
+        ids.extend(devices.iter().map(|device| device.id.clone()));
         let saved = ivars.engine.settings().microphone().unwrap_or_default();
         let index = ids.iter().position(|id| *id == saved).unwrap_or(0);
         controls.microphone.selectItemAtIndex(index as isize);
@@ -650,7 +739,12 @@ impl OnboardingWindow {
         let controls = &ivars.controls;
         let step = ivars.step.get();
         self.set_text(&controls.kicker, &step.kicker());
-        self.set_text(&controls.heading, step.title());
+        let heading = if step == Step::Done {
+            done_heading(&self.selected_microphone())
+        } else {
+            step.title()
+        };
+        self.set_text(&controls.heading, heading);
         controls
             .primary
             .setTitle(&NSString::from_str(step.primary_title()));
@@ -785,14 +879,20 @@ impl OnboardingWindow {
         }
     }
 
-    fn fill_summary(&self) {
-        let ivars = self.ivars();
-        let controls = &ivars.controls;
-        let microphone = controls
+    /// Whatever the picker is currently claiming OpenFlow will record with.
+    fn selected_microphone(&self) -> String {
+        self.ivars()
+            .controls
             .microphone
             .titleOfSelectedItem()
             .map(|title| title.to_string())
-            .unwrap_or_else(|| "System default".to_string());
+            .unwrap_or_else(|| "System default".to_string())
+    }
+
+    fn fill_summary(&self) {
+        let ivars = self.ivars();
+        let controls = &ivars.controls;
+        let microphone = self.selected_microphone();
         let shortcut = controls.hotkey.title().to_string();
         let line = summary_line(
             &self.selected_provider(),
@@ -1089,7 +1189,7 @@ fn build_panels(mtm: MainThreadMarker) -> (Retained<NSTabView>, Controls) {
     let (provider_view, providers, local_card, same_provider, formatting_provider) =
         build_provider(mtm);
     let (credentials_view, provider_url, api_key, connection_status, test) = build_credentials(mtm);
-    let (preferences_view, stt_model, chat_model, microphone, refresh, hotkey) =
+    let (preferences_view, stt_model, chat_model, microphone, microphone_note, refresh, hotkey) =
         build_preferences(mtm);
     let (done_view, summary) = build_done(mtm);
 
@@ -1180,6 +1280,7 @@ fn build_panels(mtm: MainThreadMarker) -> (Retained<NSTabView>, Controls) {
         stt_model,
         chat_model,
         microphone,
+        microphone_note,
         microphone_ids: RefCell::new(vec![String::new()]),
         refresh,
         hotkey,
@@ -1376,6 +1477,7 @@ fn build_preferences(
     Retained<NSComboBox>,
     Retained<NSComboBox>,
     Retained<NSPopUpButton>,
+    Retained<NSTextField>,
     Retained<NSButton>,
     Retained<NSButton>,
 ) {
@@ -1416,6 +1518,10 @@ fn build_preferences(
         0,
     );
     form.add(&refresh);
+    let n = form.control_only(MICROPHONE_NOTE_HEIGHT);
+    let microphone_note = note(mtm, "", n);
+    allow_wrapping(&microphone_note, n.size.width);
+    form.add(&microphone_note);
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Record shortcut", l));
@@ -1431,6 +1537,7 @@ fn build_preferences(
         stt_model,
         chat_model,
         microphone,
+        microphone_note,
         refresh,
         hotkey,
     )
@@ -1459,6 +1566,46 @@ fn build_done(mtm: MainThreadMarker) -> (Retained<NSView>, Retained<NSTextField>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wizard's captions are one line each, and have to stay one line.
+    ///
+    /// `build_provider` gives each one a fixed 14pt row and never turns
+    /// wrapping on, so a caption too wide for its column is not wrapped -- it is
+    /// cut at the edge. That is how the on-this-Mac card came to read
+    /// "...No key, no network, and no audio leaves the machine. Needs Pyth".
+    ///
+    /// That one wraps now and is measured. These five deliberately do not: the
+    /// panel they sit in is `STEP_HEIGHT`, which is the measured height of the
+    /// tallest panel, and a caption that grew to two lines would push the panel
+    /// past it and back on top of the Back and Continue buttons. So the
+    /// constraint here is real, and this is where it is written down.
+    #[test]
+    fn every_provider_caption_stays_on_one_line() {
+        let column = STEP_WIDTH - 20.0;
+        for option in PROVIDER_OPTIONS {
+            let width = crate::ui::metrics::note_width(option.description);
+            assert!(
+                width <= column,
+                "{:?}'s caption renders {width:.1}pt wide in a {column}pt row that does not wrap; \
+                 shorten it, or give it the wrapping treatment the on-this-Mac card got and check \
+                 STEP_HEIGHT still holds the panel",
+                option.label
+            );
+        }
+    }
+
+    /// The on-this-Mac card's own two strings, which sit in different boxes: the
+    /// radio's title shares its row with the badge column, and the caption wraps
+    /// into the same column as the ones above.
+    #[test]
+    fn the_on_this_mac_card_fits_its_row() {
+        let title = crate::ui::metrics::label_width(LOCAL_CARD_LABEL);
+        let room = STEP_WIDTH - 110.0;
+        assert!(
+            title <= room,
+            "the card title {LOCAL_CARD_LABEL:?} renders {title:.1}pt wide in {room}pt"
+        );
+    }
 
     /// The wizard must not be able to walk off either end, and every panel has
     /// to be reachable from the front by pressing the primary button.
@@ -1653,5 +1800,259 @@ mod tests {
             summary_line("groq", "  ", "System default", "Option+V"),
             "Groq · whisper-large-v3-turbo · System default · hold Option+V to dictate, active now"
         );
+    }
+
+    fn device(name: &str, is_default: bool) -> AudioDevice {
+        AudioDevice {
+            id: format!("{name}::1"),
+            name: name.to_string(),
+            is_default,
+        }
+    }
+
+    /// The wizard used to add "System default" whether or not anything had been
+    /// enumerated, so a machine with no usable input looked exactly like a
+    /// machine with one. Both ways of finding nothing -- `Err` from a wedged
+    /// audio thread, `Ok(vec![])` from a failed enumeration or a denied grant --
+    /// arrive here as an empty slice, and neither may produce an item naming a
+    /// device that does not exist.
+    #[test]
+    fn an_empty_device_list_does_not_invent_a_microphone() {
+        assert_eq!(microphone_items(&[]), vec![NO_MICROPHONE.to_string()]);
+        assert!(
+            !microphone_items(&[]).contains(&"System default".to_string()),
+            "nothing enumerated means there is no default to fall back on either"
+        );
+
+        // With devices the list is unchanged: the fallback first, then every
+        // device, so the popup stays aligned with the saved id list.
+        assert_eq!(
+            microphone_items(&[
+                device("MacBook Pro Microphone", true),
+                device("Yeti", false)
+            ]),
+            vec![
+                "System default".to_string(),
+                "MacBook Pro Microphone (default)".to_string(),
+                "Yeti".to_string(),
+            ]
+        );
+    }
+
+    /// The readiness line under the picker keeps the two failures apart, since
+    /// the user's next move differs, and never reports a count it did not get.
+    #[test]
+    fn the_microphone_note_says_which_kind_of_nothing_it_found() {
+        assert_eq!(
+            microphone_note(Ok(0)),
+            "No microphone detected yet. Check system permission, then press Refresh."
+        );
+        assert_eq!(microphone_note(Ok(1)), "1 microphone ready.");
+        assert_eq!(microphone_note(Ok(3)), "3 microphones ready.");
+        // The audio thread's own words, as `list_audio_devices` hands them over.
+        assert_eq!(
+            microphone_note(Err("Device list timeout")),
+            "Could not read microphones: Device list timeout. Press Refresh to try again."
+        );
+    }
+
+    /// The closing panel is the last thing setup says, and it may not say the
+    /// app is ready to dictate when nothing can hear the user. Everything it
+    /// promises about a machine that does have a microphone is unchanged.
+    #[test]
+    fn the_closing_panel_does_not_claim_a_microphone_it_never_found() {
+        let missing = &microphone_items(&[])[0];
+
+        assert_eq!(
+            done_heading(missing),
+            "Setup is saved, but there is no microphone"
+        );
+        assert_eq!(
+            summary_line("groq", "whisper-large-v3", missing, "Option+V"),
+            "Groq · whisper-large-v3 · No microphone detected · connect an input \
+device, then hold Option+V to dictate"
+        );
+
+        // A real device, or the fallback that only exists when one was found,
+        // still gets the ready wording.
+        for microphone in microphone_items(&[device("MacBook Pro Microphone", true)]) {
+            assert_eq!(done_heading(&microphone), "OpenFlow is ready");
+            assert!(
+                summary_line("groq", "whisper-large-v3", &microphone, "Option+V")
+                    .ends_with("hold Option+V to dictate, active now"),
+                "{microphone} must keep the ready wording"
+            );
+        }
+    }
+    /// The id list both popups keep is positional: index 0 is the empty
+    /// string, then one id per device, and `write` turns the selected index
+    /// straight back into an id. So `microphone_items` is not free to change
+    /// how many rows it returns -- one extra or one fewer and the selection
+    /// silently saves a different microphone than the one on screen, or the
+    /// empty string.
+    ///
+    /// This became worth holding when Settings' `reload_microphones` became
+    /// the second caller: it builds the same id list, so a change made for one
+    /// popup now moves the other.
+    #[test]
+    fn the_item_list_stays_the_same_length_as_the_id_list() {
+        for count in 0..4 {
+            let devices: Vec<AudioDevice> = (0..count)
+                .map(|n| device(&format!("Microphone {n}"), n == 0))
+                .collect();
+
+            // Exactly what both callers build alongside the items.
+            let mut ids = vec![String::new()];
+            ids.extend(devices.iter().map(|d| d.id.clone()));
+
+            let items = microphone_items(&devices);
+            assert_eq!(
+                items.len(),
+                ids.len(),
+                "{count} device(s): the popup shows {items:?} against ids {ids:?}, \
+so a selection maps to the wrong device"
+            );
+            for (index, id) in ids.iter().enumerate().skip(1) {
+                assert!(
+                    items[index].starts_with(&devices[index - 1].name),
+                    "row {index} shows {:?} but would save {id:?}",
+                    items[index]
+                );
+            }
+        }
+    }
+
+    /// The height of one line of [`note`] text at the size `note` sets, which
+    /// is what [`MICROPHONE_NOTE_HEIGHT`] is a multiple of. Pinned by
+    /// `one_line_of_note_text_is_one_note_line` rather than assumed.
+    const NOTE_LINE: f64 = 13.0;
+
+    /// The column the microphone line is laid out in.
+    ///
+    /// `Form::control_only` hands back the form's width less the label column,
+    /// and `build_preferences` builds its form at [`STEP_WIDTH`], so this is
+    /// the same arithmetic the panel does rather than a number copied off it.
+    /// The wizard is a fixed-size sheet, so there is only the one width.
+    fn microphone_note_width() -> f64 {
+        STEP_WIDTH - crate::ui::CONTROL_X
+    }
+
+    /// How many lines `text` takes when wrapped into a column `width` wide, at
+    /// the font [`note`] uses.
+    ///
+    /// AppKit measures text without a main thread and without an
+    /// `NSApplication`, so the one layout question the wizard cannot be asked
+    /// -- step 3 is behind a connection test no test run can pass, and nothing
+    /// short of a real provider key gets a person to this panel -- is
+    /// arithmetic instead. Measured through `NSAttributedString`, which agrees
+    /// to the point with what `wrap` gets from a real `NSTextField`.
+    fn wrapped_lines(text: &str, width: f64) -> usize {
+        use objc2::runtime::AnyObject;
+        use objc2_app_kit::{
+            NSAttributedStringNSExtendedStringDrawing, NSFont, NSFontAttributeName,
+            NSStringDrawingOptions,
+        };
+        use objc2_foundation::{NSAttributedString, NSDictionary};
+
+        let font = NSFont::systemFontOfSize(10.0);
+        let font: &AnyObject = &font;
+        let attributes = NSDictionary::from_slices(&[unsafe { NSFontAttributeName }], &[font]);
+        let string = NSString::from_str(text);
+        let attributed = unsafe { NSAttributedString::new_with_attributes(&string, &attributes) };
+        let height = attributed
+            .boundingRectWithSize_options_context(
+                NSSize::new(width, f64::MAX),
+                NSStringDrawingOptions::UsesLineFragmentOrigin,
+                None,
+            )
+            .size
+            .height;
+        (height / NOTE_LINE).round() as usize
+    }
+
+    /// The words the audio thread puts inside the error wording, read out of
+    /// `openflow-core` rather than copied here.
+    ///
+    /// [`microphone_note`] quotes them verbatim -- `list_audio_devices` is
+    /// `Recorder::list_devices` and nothing in between rewrites them -- so a
+    /// longer one written over there is exactly how this box overflows, and a
+    /// copy kept here would go on passing while it did.
+    fn audio_thread_errors() -> Vec<&'static str> {
+        const SOURCE: &str = include_str!("../../../openflow-core/src/audio.rs");
+        let at = SOURCE
+            .find("pub fn list_devices")
+            .expect("openflow-core still enumerates devices through Recorder::list_devices");
+        let body = &SOURCE[at..];
+        let body = &body[..body.find("\n    pub fn ").unwrap_or(body.len())];
+
+        let mut errors = Vec::new();
+        let mut rest = body;
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else { break };
+            let (literal, tail) = after.split_at(close);
+            let tail = &tail[1..];
+            if tail.starts_with(".to_string()") {
+                errors.push(literal);
+            }
+            rest = tail;
+        }
+        assert_eq!(
+            errors.len(),
+            2,
+            "the scan found {errors:?}, so it has stopped matching how \
+Recorder::list_devices words its failures"
+        );
+        errors
+    }
+
+    /// [`NOTE_LINE`] has to be what a line of note text actually measures, or
+    /// every line count below is off by whatever it is wrong by.
+    #[test]
+    fn one_line_of_note_text_is_one_note_line() {
+        assert_eq!(
+            wrapped_lines("Ag", microphone_note_width()),
+            1,
+            "a short note is one line, or NOTE_LINE disagrees with the font"
+        );
+    }
+
+    /// The line under the microphone picker has to fit the box reserved for
+    /// it, and this is the only way anyone finds out.
+    ///
+    /// Step 3 of the wizard is behind `can_advance`, which will not open the
+    /// Credentials panel without a connection a test run cannot make, so this
+    /// panel has never been on screen outside a hand-driven session with a
+    /// real key. The reservation was arithmetic done by hand; here it is done
+    /// by AppKit, against the strings [`microphone_note`] actually returns and
+    /// the height [`build_preferences`] actually reserves. Nothing clips this
+    /// label, so a third line is not an ellipsis -- it draws over the Record
+    /// shortcut row below it.
+    #[test]
+    fn every_microphone_note_fits_the_line_reserved_for_it() {
+        let width = microphone_note_width();
+        let reserved = (MICROPHONE_NOTE_HEIGHT / NOTE_LINE).floor() as usize;
+        assert!(
+            reserved >= 1,
+            "{MICROPHONE_NOTE_HEIGHT}pt does not hold a single {NOTE_LINE}pt line"
+        );
+
+        // Every arm of the match, and enough counts to cover the singular, the
+        // plural, and a machine with an unlikely number of inputs.
+        let mut messages: Vec<String> = (0..=16).map(|count| microphone_note(Ok(count))).collect();
+        messages.extend(
+            audio_thread_errors()
+                .into_iter()
+                .map(|error| microphone_note(Err(error))),
+        );
+
+        for message in messages {
+            let lines = wrapped_lines(&message, width);
+            assert!(
+                lines <= reserved,
+                "{lines} lines in {width}pt, but the picker's note reserves \
+{MICROPHONE_NOTE_HEIGHT}pt, which is {reserved}: {message:?}"
+            );
+        }
     }
 }

@@ -28,6 +28,23 @@ jobs:
       - run: npm run check
       - run: npm run audit:dependencies
 
+  macos-tests:
+    name: macOS tests
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      # `rust` runs the same command on Linux, where `openflow-native` is
+      # `cfg(target_os = "macos")` down to an empty main -- so its tests have
+      # never run anywhere but a contributor's own Mac. This is the job that
+      # runs them. It is not a duplicate of `rust`: on this runner the same
+      # command has 77 more tests to find.
+      - run: cargo test --workspace
+
   rust:
     name: Rust quality checks
     runs-on: ubuntu-22.04
@@ -53,6 +70,32 @@ jobs:
         with:
           workspaces: . -> target
       - run: npm run check:rust
+
+  runner:
+    name: Runner sidecar tests (python ${{ matrix.python }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # The ends of the range crates/openflow-core/src/runner.rs searches for:
+        # MINIMUM_PYTHON is (3, 10), and 3.14 is the newest it will pick up.
+        python: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # The sidecar is plain stdlib, so this needs no install step. It is the
+      # only test suite in the repository that the other jobs never reach.
+      # `unittest discover` prints OK and exits 0 when it finds nothing, so a
+      # wrong working directory would be a permanently green job that tests
+      # nothing. The guard turns that into a failure.
+      - name: Test the local runner sidecar
+        working-directory: crates/openflow-native/runner
+        run: |
+          test -f test_runner.py
+          python3 -m unittest discover --verbose
 
   desktop-build:
     name: Desktop build (${{ matrix.os }})

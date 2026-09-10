@@ -31,10 +31,16 @@ impl EngineEvents for TauriEvents {
             EngineEvent::TranscriptionPartial(partial) => {
                 self.app.emit("transcription-partial", &partial)
             }
+            // Both payloads carry a remedy the native host uses to offer the
+            // user somewhere to go. The webview has its own routing and its own
+            // wire format for these two events, so it keeps receiving the plain
+            // message it has always received.
             EngineEvent::TranscriptionWarning(warning) => {
-                self.app.emit("transcription-warning", warning)
+                self.app.emit("transcription-warning", warning.message)
             }
-            EngineEvent::TranscriptionError(error) => self.app.emit("transcription-error", error),
+            EngineEvent::TranscriptionError(error) => {
+                self.app.emit("transcription-error", error.message)
+            }
             EngineEvent::RecopySuccess(message) => self.app.emit("recopy-success", message),
             // Not a webview event: the tray's recents list is what went stale.
             EngineEvent::HistoryChanged => {
@@ -49,6 +55,7 @@ impl EngineEvents for TauriEvents {
             // host), but the event is forwarded rather than dropped so a
             // console or a future screen can see it without a new plumbing pass.
             EngineEvent::RunnerState(payload) => self.app.emit("runner-state", &payload),
+            EngineEvent::PreviewAgreement(payload) => self.app.emit("preview-agreement", &payload),
             EngineEvent::Navigate(target) => self.app.emit("navigate", target),
         };
         sent.map_err(|error| error.to_string())

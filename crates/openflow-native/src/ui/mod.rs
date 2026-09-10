@@ -30,12 +30,46 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 /// Height of one form row.
 pub const ROW: f64 = 24.0;
+/// Height of one line of [`note`] text, measured rather than guessed: a note
+/// laid out at any width reports a multiple of this, and the test beside
+/// [`Form::status_row`] fails if the font ever stops agreeing.
+pub const NOTE_LINE: f64 = 13.0;
+
 /// Vertical gap between rows.
 pub const GAP: f64 = 10.0;
 /// Width of the label column.
 pub const LABEL_WIDTH: f64 = 132.0;
 /// Where the control column starts.
 pub const CONTROL_X: f64 = LABEL_WIDTH + 10.0;
+
+/// How many lines `text` takes when wrapped into a column `width` wide, at the
+/// font [`note`] uses.
+///
+/// AppKit measures text without a main thread and without an `NSApplication`,
+/// so a layout question that used to need the running app -- does this sentence
+/// fit the box reserved for it -- is arithmetic a test can do. Measured through
+/// `NSAttributedString`, which agrees to the point with what `wrap` gets from a
+/// real `NSTextField`.
+#[cfg(test)]
+pub(crate) fn wrapped_lines(text: &str, width: f64) -> usize {
+    use objc2_app_kit::{NSAttributedStringNSExtendedStringDrawing, NSFontAttributeName};
+    use objc2_foundation::{NSAttributedString, NSDictionary};
+
+    let font = NSFont::systemFontOfSize(10.0);
+    let font: &AnyObject = &font;
+    let attributes = NSDictionary::from_slices(&[unsafe { NSFontAttributeName }], &[font]);
+    let string = NSString::from_str(text);
+    let attributed = unsafe { NSAttributedString::new_with_attributes(&string, &attributes) };
+    let height = attributed
+        .boundingRectWithSize_options_context(
+            NSSize::new(width, f64::MAX),
+            objc2_app_kit::NSStringDrawingOptions::UsesLineFragmentOrigin,
+            None,
+        )
+        .size
+        .height;
+    (height / NOTE_LINE).round() as usize
+}
 
 /// Bring `window` forward from a menu bar click, the way the Tauri host does.
 ///
@@ -215,6 +249,40 @@ impl Form {
         frame
     }
 
+    /// A status line in the control column, `lines` tall and capped there.
+    ///
+    /// Unlike [`Form::note_row`], which measures the sentence it is given, this
+    /// row is built empty and filled later -- with a message chosen at run time,
+    /// sometimes by macOS or by a server rather than by us. The card's height is
+    /// already fixed by then, so the space has to be reserved up front, and the
+    /// only honest thing to do with a message that outgrows it is to say so:
+    /// `ByTruncatingTail` ends an over-long line in an ellipsis instead of
+    /// letting it run past the bottom edge and vanish without a mark.
+    pub fn status_row(&mut self, mtm: MainThreadMarker, lines: usize) -> Retained<NSTextField> {
+        let frame = self.control_only(NOTE_LINE * lines as f64);
+        self.status_field(mtm, frame, lines)
+    }
+
+    /// The same, spanning both columns.
+    pub fn status_full(&mut self, mtm: MainThreadMarker, lines: usize) -> Retained<NSTextField> {
+        let frame = self.full(NOTE_LINE * lines as f64);
+        self.status_field(mtm, frame, lines)
+    }
+
+    fn status_field(
+        &self,
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        lines: usize,
+    ) -> Retained<NSTextField> {
+        let field = note(mtm, "", frame);
+        allow_wrapping(&field, frame.size.width);
+        field.setMaximumNumberOfLines(lines as isize);
+        field.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
+        self.add(&field);
+        field
+    }
+
     /// A wrapped hint under the row above it, as tall as its text needs.
     ///
     /// The fixed-height variant truncated: these sentences are longer than the
@@ -232,6 +300,27 @@ impl Form {
         let height = field.frame().size.height;
         self.y -= height;
         field.setFrameOrigin(NSPoint::new(CONTROL_X, self.y));
+        self.y -= GAP;
+        self.add(&field);
+        field
+    }
+
+    /// A wrapping note across the whole width, for a caption under a control
+    /// that spans the form rather than sitting in the control column.
+    ///
+    /// The same shape as `note_row`: laid out at the real width, wrapped, and
+    /// then asked how tall it turned out. A fixed height here is what cut
+    /// "...Sent to Whisper as a hint, and ap" off mid-word.
+    pub fn note_full(&mut self, mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+        let field = note(
+            mtm,
+            text,
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(self.width, 14.0)),
+        );
+        wrap(&field, self.width);
+        let height = field.frame().size.height;
+        self.y -= height;
+        field.setFrameOrigin(NSPoint::new(0.0, self.y));
         self.y -= GAP;
         self.add(&field);
         field
@@ -536,5 +625,43 @@ pub fn wire(control: &NSControl, target: &AnyObject, action: objc2::runtime::Sel
     unsafe {
         control.setTarget(Some(target));
         control.setAction(Some(action));
+    }
+}
+
+/// Text measurement, so a string that does not fit its box fails a test instead
+/// of waiting to be noticed in a screenshot.
+///
+/// Two of those shipped: a 148.8pt label in a 132pt column, and a 607pt sentence
+/// drawn on one line in a 468pt row. Neither is visible in the code, neither
+/// breaks a build, and both were found by driving the built app. They are
+/// arithmetic, though -- and AppKit does this arithmetic off the main thread,
+/// with no `NSApplication`, which is what lets the checks be `cargo test`.
+///
+/// The fonts are read from the same constructors [`label`] and [`note`] use, so
+/// a change there cannot leave the measurements behind.
+#[cfg(test)]
+pub(crate) mod metrics {
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::{NSFont, NSFontAttributeName, NSStringDrawing};
+    use objc2_foundation::{NSDictionary, NSString};
+
+    fn width(text: &str, font: &NSFont) -> f64 {
+        let font: &AnyObject = font;
+        let attributes = NSDictionary::from_slices(&[unsafe { NSFontAttributeName }], &[font]);
+        let string = NSString::from_str(text);
+        unsafe { string.sizeWithAttributes(Some(&attributes)) }.width
+    }
+
+    /// How wide `text` draws at the font [`super::label`] gives a row label.
+    pub(crate) fn label_width(text: &str) -> f64 {
+        width(
+            text,
+            &NSFont::systemFontOfSize(NSFont::smallSystemFontSize()),
+        )
+    }
+
+    /// How wide `text` draws at the font [`super::note`] gives a caption.
+    pub(crate) fn note_width(text: &str) -> f64 {
+        width(text, &NSFont::systemFontOfSize(10.0))
     }
 }

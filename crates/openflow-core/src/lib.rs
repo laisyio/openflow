@@ -4,6 +4,7 @@
 //! they own windows, trays and menus, and delegate capture, transcription,
 //! insertion, storage and secrets to the modules below.
 
+pub mod agreement;
 pub mod audio;
 pub mod db;
 pub mod engine;

@@ -2,7 +2,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -33,6 +33,11 @@ pub struct AudioRecorder {
     /// alongside it, and a reader that sees the previous buffer's peak is off
     /// by a frame on a bar that decays anyway.
     level: Arc<AtomicU32>,
+    /// Set by the capture callback the first time a buffer does not fit.
+    ///
+    /// An atomic for the same reason `level` is, and read the same way: the
+    /// thread that wants to know is the one drawing, not the audio thread.
+    truncated: Arc<AtomicBool>,
 }
 
 /// Where the meter bottoms out, in dBFS: the silence gate's own line.
@@ -92,6 +97,8 @@ impl AudioRecorder {
         let (cmd_tx, cmd_rx) = mpsc::channel::<RecordCommand>();
         let level = Arc::new(AtomicU32::new(0));
         let stream_level = Arc::clone(&level);
+        let truncated = Arc::new(AtomicBool::new(false));
+        let stream_truncated = Arc::clone(&truncated);
 
         thread::spawn(move || {
             let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -158,26 +165,32 @@ impl AudioRecorder {
                         }
                         // A stale peak outlives the stream that wrote it, so
                         // clear it with the buffer rather than leaving the
-                        // meter showing the end of the previous take.
+                        // meter showing the end of the previous take. Same
+                        // for the ceiling flag: this take has overrun nothing
+                        // yet.
                         stream_level.store(0, Ordering::Relaxed);
+                        stream_truncated.store(false, Ordering::Relaxed);
                         let stream = match default_config.sample_format() {
                             SampleFormat::F32 => build_input_stream::<f32>(
                                 &device,
                                 &config,
                                 samples.clone(),
                                 Arc::clone(&stream_level),
+                                Arc::clone(&stream_truncated),
                             ),
                             SampleFormat::I16 => build_input_stream::<i16>(
                                 &device,
                                 &config,
                                 samples.clone(),
                                 Arc::clone(&stream_level),
+                                Arc::clone(&stream_truncated),
                             ),
                             SampleFormat::U16 => build_input_stream::<u16>(
                                 &device,
                                 &config,
                                 samples.clone(),
                                 Arc::clone(&stream_level),
+                                Arc::clone(&stream_truncated),
                             ),
                             format => Err(format!(
                                 "Unsupported microphone sample format: {:?}",
@@ -263,7 +276,11 @@ impl AudioRecorder {
             }
         });
 
-        Self { cmd_tx, level }
+        Self {
+            cmd_tx,
+            level,
+            truncated,
+        }
     }
 
     pub fn list_devices(&self) -> Result<Vec<AudioDevice>, String> {
@@ -318,6 +335,25 @@ impl AudioRecorder {
         f32::from_bits(self.level.load(Ordering::Relaxed))
     }
 
+    /// True once the capture hit [`MAX_CAPTURE_SAMPLES`] and began throwing
+    /// audio away. Cleared by the next `start`.
+    ///
+    /// It needs its own signal because the meter cannot carry it, and does not
+    /// even try: [`AudioRecorder::input_level`] is written before the ceiling
+    /// is consulted, deliberately, so that a full or contended buffer still
+    /// leaves a live bar rather than one frozen at zero -- which reads as a
+    /// dead microphone. The result is that the interface is at its most
+    /// reassuring at the one moment it has the least to report.
+    ///
+    /// What is lost is the *end* of the take. Frames are dropped as they
+    /// arrive, not rotated out, so `stop` returns the opening 20 minutes (at
+    /// 48 kHz) of however long the user actually spoke. That is why this is a
+    /// flag and not an error: the audio that fit is good, and refusing the
+    /// take would throw away 20 minutes to report the loss of the 21st.
+    pub fn capture_truncated(&self) -> bool {
+        self.truncated.load(Ordering::Relaxed)
+    }
+
     pub fn stop(&self) -> Result<Vec<u8>, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.cmd_tx
@@ -364,14 +400,39 @@ fn audio_device_id(name: &str, occurrence: usize) -> String {
     format!("{}::{}", name, occurrence)
 }
 
-// Bounds memory even when a hotkey release is missed (~20 minutes at 48 kHz).
+/// Bounds memory even when a hotkey release is missed: 57.6 M mono samples,
+/// 230 MB of `f32`.
+///
+/// A count of frames, not a length of time, so the wall-clock ceiling moves
+/// with the device: 20 minutes at 48 kHz, but 21:46 at 44.1 kHz, 60 minutes at
+/// 16 kHz, and only 10 minutes on a 96 kHz interface. Sizing it in samples is
+/// what makes the memory bound a bound; keying it to a duration would let a
+/// 96 kHz device ask for 460 MB.
+///
+/// Unrelated to [`crate::engine::MAX_RECORDING`] (300 s), which frees the
+/// recording *slot* after a lost key-up and does not stop this buffer filling.
 const MAX_CAPTURE_SAMPLES: usize = 48_000 * 60 * 20;
+
+/// What the user is told when a take ended at [`MAX_CAPTURE_SAMPLES`].
+///
+/// It names no duration, because the ceiling has none: the same constant is 20
+/// minutes on the built-in microphone and 10 on a 96 kHz interface, so a figure
+/// here would be wrong on half the machines that see this line.
+///
+/// It says *end* rather than "part", because which part is lost is the one
+/// thing the user cannot guess. Frames are dropped as they arrive rather than
+/// rotated out, so what survives is the opening of the take -- the reverse of
+/// what a person who has watched a full disk fill would assume.
+pub const CAPTURE_CEILING_WARNING: &str =
+    "This recording reached its length limit, so the end of it was not captured. \
+Everything spoken before that point is still here.";
 
 fn build_input_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     samples: Arc<Mutex<Vec<f32>>>,
     level: Arc<AtomicU32>,
+    truncated: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + Copy,
@@ -382,30 +443,80 @@ where
         .build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
-                // Before the lock, and before the early return the lock can
-                // take: the meter is the one thing that should still move when
-                // the buffer is full or contended, and this is one pass over
-                // the samples with nothing allocated.
-                let peak = data
-                    .iter()
-                    .map(|sample| (*sample).to_sample::<f32>().abs())
-                    .fold(0.0f32, f32::max);
-                level.store(peak.to_bits(), Ordering::Relaxed);
-
-                let Ok(mut output) = samples.lock() else {
-                    return;
-                };
-                let remaining = MAX_CAPTURE_SAMPLES.saturating_sub(output.len());
-                for frame in data.chunks(channels).take(remaining) {
-                    if let Some(mono) = mix_frame_to_mono(frame) {
-                        output.push(mono);
-                    }
-                }
+                handle_capture_buffer(
+                    data,
+                    channels,
+                    &samples,
+                    &level,
+                    &truncated,
+                    MAX_CAPTURE_SAMPLES,
+                );
             },
             |error| eprintln!("Audio stream error: {}", error),
             None,
         )
         .map_err(|error| format!("Could not open microphone: {}", error))
+}
+
+/// One buffer from the device: publish the meter, then keep what fits.
+///
+/// The order is the whole point of having this as a function. The peak goes
+/// out before the lock, and before the ceiling is consulted, because the meter
+/// is the one thing that should still move when the buffer is full or
+/// contended -- this is one pass over the samples with nothing allocated. The
+/// cost of that choice is that a full capture looks exactly like a healthy
+/// one, which is what `truncated` is for; see
+/// [`AudioRecorder::capture_truncated`].
+///
+/// Lifted out of the stream closure so both halves can be measured against a
+/// stand-in `limit`, without a microphone and without allocating the 230 MB
+/// the real ceiling asks for.
+fn handle_capture_buffer<T>(
+    data: &[T],
+    channels: usize,
+    samples: &Mutex<Vec<f32>>,
+    level: &AtomicU32,
+    truncated: &AtomicBool,
+    limit: usize,
+) where
+    T: SizedSample + Copy,
+    f32: FromSample<T>,
+{
+    let peak = data
+        .iter()
+        .map(|sample| (*sample).to_sample::<f32>().abs())
+        .fold(0.0f32, f32::max);
+    level.store(peak.to_bits(), Ordering::Relaxed);
+
+    let Ok(mut output) = samples.lock() else {
+        return;
+    };
+    if append_mono_frames(&mut output, data, channels, limit) > 0 {
+        truncated.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Append `data` to the capture, downmixed to mono, until `limit` is reached.
+///
+/// Returns the number of frames that did not fit. Split out of the callback so
+/// what happens at the ceiling can be measured without a microphone and without
+/// allocating the 230 MB the real limit asks for.
+fn append_mono_frames<T>(output: &mut Vec<f32>, data: &[T], channels: usize, limit: usize) -> usize
+where
+    T: SizedSample + Copy,
+    f32: FromSample<T>,
+{
+    if channels == 0 {
+        return 0;
+    }
+    let frames = data.len().div_ceil(channels);
+    let room = limit.saturating_sub(output.len());
+    for frame in data.chunks(channels).take(room) {
+        if let Some(mono) = mix_frame_to_mono(frame) {
+            output.push(mono);
+        }
+    }
+    frames.saturating_sub(room.min(frames))
 }
 
 fn mix_frame_to_mono<T>(frame: &[T]) -> Option<f32>
@@ -649,6 +760,140 @@ pub fn wav_duration_ms(bytes: &[u8]) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ceiling is a count of mono frames, so the length it buys depends on
+    /// what the device hands back. 48 kHz is the only rate it was sized for.
+    #[test]
+    fn the_capture_ceiling_is_a_sample_count_not_a_duration() {
+        let seconds = |rate: u32| MAX_CAPTURE_SAMPLES as f64 / f64::from(rate);
+        assert_eq!(MAX_CAPTURE_SAMPLES, 57_600_000);
+        assert!(
+            (seconds(48_000) - 1_200.0).abs() < 0.05,
+            "{}",
+            seconds(48_000)
+        );
+        assert!(
+            (seconds(44_100) - 1_306.12).abs() < 0.05,
+            "{}",
+            seconds(44_100)
+        );
+        assert!(
+            (seconds(96_000) - 600.0).abs() < 0.05,
+            "{}",
+            seconds(96_000)
+        );
+        assert!(
+            (seconds(16_000) - 3_600.0).abs() < 0.05,
+            "{}",
+            seconds(16_000)
+        );
+    }
+
+    /// Which end of a too-long take survives. Not a ring buffer: the frames
+    /// that arrive after the ceiling are the ones thrown away, so what comes
+    /// back is the *opening* of the dictation and the user loses the close.
+    #[test]
+    fn a_full_capture_keeps_the_head_and_drops_the_tail() {
+        let mut captured: Vec<f32> = Vec::new();
+        let limit = 8;
+        // Two mono callbacks of six frames each against a ceiling of eight.
+        let first: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        let second: Vec<f32> = (6..12).map(|i| i as f32).collect();
+        append_mono_frames(&mut captured, &first, 1, limit);
+        append_mono_frames(&mut captured, &second, 1, limit);
+        assert_eq!(captured, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    }
+
+    /// The same thing measured through the real pipeline, with a stand-in
+    /// ceiling one second wide so the test costs 192 kB instead of 230 MB.
+    ///
+    /// Three seconds are spoken: a 200 Hz opening and a 2 kHz close. What the
+    /// WAV carries is one second of the opening. The 2 kHz close is not
+    /// quieter, or clipped, or at the end -- it is not there at all.
+    #[test]
+    fn a_capture_that_hits_the_ceiling_comes_back_a_third_as_long() {
+        let rate = 48_000usize;
+        let limit = rate; // one second, standing in for MAX_CAPTURE_SAMPLES
+        let tone =
+            |i: usize, hz: f32| (std::f32::consts::TAU * hz * i as f32 / rate as f32).sin() * 0.3;
+        let spoken: Vec<f32> = (0..rate * 3)
+            .map(|i| {
+                if i < rate * 3 / 2 {
+                    tone(i, 200.0)
+                } else {
+                    tone(i, 2_000.0)
+                }
+            })
+            .collect();
+
+        let mut captured: Vec<f32> = Vec::new();
+        let mut dropped = 0usize;
+        for callback in spoken.chunks(512) {
+            dropped += append_mono_frames(&mut captured, callback, 1, limit);
+        }
+        assert_eq!(captured.len(), rate);
+        assert_eq!(dropped, rate * 2);
+
+        let take = prepare_take(&captured, 48_000).expect("a second is plenty");
+        let wav = encode_wav(&auto_gain(&take), 16_000).expect("encodes");
+        assert_eq!(wav_duration_ms(&wav), Some(1_000));
+
+        // And the survivor is the opening: correlate the 16 kHz take against
+        // both tones. Only the one that was spoken first shows up.
+        let energy_at = |hz: f32| {
+            let (mut re, mut im) = (0.0f32, 0.0f32);
+            for (i, sample) in take.iter().enumerate() {
+                let phase = std::f32::consts::TAU * hz * i as f32 / 16_000.0;
+                re += sample * phase.cos();
+                im += sample * phase.sin();
+            }
+            (re * re + im * im).sqrt() / take.len() as f32
+        };
+        assert!(
+            energy_at(200.0) > 0.05,
+            "opening tone: {}",
+            energy_at(200.0)
+        );
+        assert!(
+            energy_at(2_000.0) < 0.01,
+            "closing tone: {}",
+            energy_at(2_000.0)
+        );
+    }
+
+    /// The interface keeps saying "recording" after the recording has stopped
+    /// growing, and the take that comes back says nothing about it.
+    ///
+    /// Both halves are the assertion. The meter must go on moving -- freezing
+    /// it would read as a dead microphone -- so the only honest way out is a
+    /// second signal, which is what `truncated` is.
+    #[test]
+    fn a_full_capture_still_drives_the_meter_but_now_says_so() {
+        let samples = Mutex::new(Vec::new());
+        let level = AtomicU32::new(0);
+        let truncated = AtomicBool::new(false);
+        let limit = 4;
+
+        let quiet = [0.1f32; 4];
+        handle_capture_buffer(&quiet, 1, &samples, &level, &truncated, limit);
+        assert_eq!(samples.lock().unwrap().len(), 4, "the ceiling is now full");
+        assert!(!truncated.load(Ordering::Relaxed), "nothing dropped yet");
+
+        // Every buffer from here on is thrown away, and the meter never knows.
+        let loud = [0.9f32; 4];
+        handle_capture_buffer(&loud, 1, &samples, &level, &truncated, limit);
+        assert_eq!(samples.lock().unwrap().len(), 4, "not one frame more");
+        assert_eq!(
+            f32::from_bits(level.load(Ordering::Relaxed)),
+            0.9,
+            "the meter still reports the buffer it just threw away"
+        );
+        assert!(meter_fraction(f32::from_bits(level.load(Ordering::Relaxed))) > 0.5);
+        assert!(
+            truncated.load(Ordering::Relaxed),
+            "a capture that dropped audio has to be able to say so"
+        );
+    }
 
     #[test]
     fn downsample_interpolates_and_preserves_duration() {
@@ -988,5 +1233,60 @@ mod tests {
         assert_eq!(mix_frame_to_mono(&[0.0_f32, 1.0_f32]), Some(0.5));
         assert_eq!(mix_frame_to_mono(&[1.0_f32, 0.0_f32]), Some(0.5));
         assert_eq!(mix_frame_to_mono::<f32>(&[]), None);
+    }
+    /// The ceiling is a frame count, so the wall-clock length it allows is a
+    /// property of the device: 20 minutes at 48 kHz, 21:46 at 44.1, 10:00 on a
+    /// 96 kHz interface. A figure in the message would therefore be wrong on
+    /// whichever machines are not the one it was written on -- which is why
+    /// `CAPTURE_CEILING_WARNING` names none, and why that is worth holding.
+    ///
+    /// Faked this before trusting it: the first draft asserted the string did
+    /// not contain "minutes", which "20 min" and "1200 seconds" both walk
+    /// straight past. Digits are the thing that cannot be smuggled.
+    #[test]
+    fn the_ceiling_message_names_no_duration() {
+        assert!(
+            !CAPTURE_CEILING_WARNING.chars().any(|c| c.is_ascii_digit()),
+            "the ceiling moves with the sample rate, so a number here is \
+wrong on some machine: {:?}",
+            CAPTURE_CEILING_WARNING
+        );
+    }
+
+    /// What survives is the *opening* of the take: frames are dropped as they
+    /// arrive rather than rotated out, so the message has to name the end. A
+    /// line that said the start was lost would send the user looking for the
+    /// wrong half of what they said, so the two claims are pinned together
+    /// here -- the behaviour is re-measured rather than assumed, because the
+    /// wording is only correct while the dropping stays this way round.
+    #[test]
+    fn the_ceiling_message_says_which_end_was_lost() {
+        let samples = Mutex::new(Vec::new());
+        let level = AtomicU32::new(0);
+        let truncated = AtomicBool::new(false);
+        let limit = 4;
+
+        handle_capture_buffer(
+            &[1.0f32, 2.0, 3.0, 4.0],
+            1,
+            &samples,
+            &level,
+            &truncated,
+            limit,
+        );
+        handle_capture_buffer(&[5.0f32, 6.0], 1, &samples, &level, &truncated, limit);
+
+        assert!(truncated.load(Ordering::Relaxed), "the ceiling was reached");
+        assert_eq!(
+            *samples.lock().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0],
+            "the opening is what survives, so the end is what is missing"
+        );
+        assert!(
+            CAPTURE_CEILING_WARNING.contains("the end of it was not captured"),
+            "the message has to name the end, because that is the half the \
+user cannot infer: {:?}",
+            CAPTURE_CEILING_WARNING
+        );
     }
 }

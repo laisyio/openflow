@@ -58,6 +58,61 @@ pub fn is_known_position(name: &str) -> bool {
     POSITIONS.iter().any(|(known, _, _)| *known == name)
 }
 
+/// Where the screen the pill was left on is recorded.
+///
+/// Its own setting rather than a second field inside `overlay_position`,
+/// because that value is what the Settings popup matches its menu items
+/// against: anything but one of the eight anchor names selects nothing there,
+/// and `is_known_position` would reject every stored value.
+pub const OVERLAY_SCREEN: &str = "overlay_screen";
+
+/// A name for one screen, stable for as long as the arrangement is.
+///
+/// The full frame, not the visible one: the visible frame moves when the Dock
+/// is hidden or the menu bar changes height, and a name that changed for those
+/// would send the pill home for no reason. Rounded, because a screen's frame
+/// is whole points in practice and an exact float comparison would be a name
+/// that sometimes does not match itself.
+///
+/// Not the display ID. `NSScreenNumber` is assigned by the window server and
+/// is not promised to be the same after a display is unplugged and replugged,
+/// which is precisely when this has to still work.
+///
+/// Through `i64` rather than formatting the rounded float, because `f64` has a
+/// negative zero and `-0.0` prints as `-0`. A screen sitting on the origin with
+/// a hair of negative jitter would then be named `-0` once and `0` the next
+/// time, and a name that does not match itself reads as "that display is gone".
+/// The test below is what found that.
+pub fn screen_name(frame: Rect) -> String {
+    format!(
+        "{},{},{},{}",
+        frame.x.round() as i64,
+        frame.y.round() as i64,
+        frame.width.round() as i64,
+        frame.height.round() as i64
+    )
+}
+
+/// Which of this machine's screens the pill should open on.
+///
+/// `None` means "no opinion", and every caller reads that as the screen macOS
+/// would have chosen anyway. There are two ways to get it and they are both
+/// deliberate:
+///
+/// - nothing stored -- an install from before the pill remembered anything,
+///   which must behave exactly as it did before;
+/// - stored, but no screen on this machine answers to that name -- the display
+///   was unplugged, or the arrangement changed under it. Putting the pill back
+///   where it was is not possible then, and the one outcome that must never
+///   happen is placing it on a screen that is not there, where it would be a
+///   recording indicator the user cannot see.
+pub fn screen_for_name(stored: Option<&str>, screens: &[Rect]) -> Option<usize> {
+    let stored = stored?;
+    screens
+        .iter()
+        .position(|frame| screen_name(*frame) == stored)
+}
+
 /// A rectangle in AppKit screen coordinates: origin bottom-left, y upwards.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -400,6 +455,22 @@ impl PillView {
 
         if let Some(engine) = self.ivars().engine.borrow().as_ref() {
             let _ = engine.settings().set("overlay_position", nearest);
+            // The anchor alone says where on a screen, never which screen. A
+            // drag onto a second display used to be forgotten the moment the
+            // app was quit, because this is the only place the pill's position
+            // is written down and it wrote eight names and nothing else.
+            if let Some(screen) = window.screen() {
+                let frame = screen.frame();
+                let _ = engine.settings().set(
+                    OVERLAY_SCREEN,
+                    &screen_name(Rect {
+                        x: frame.origin.x,
+                        y: frame.origin.y,
+                        width: frame.size.width,
+                        height: frame.size.height,
+                    }),
+                );
+            }
         }
     }
 
@@ -782,6 +853,39 @@ fn rounded_path(rect: NSRect, radii: [f64; 4]) -> Retained<NSBezierPath> {
     path
 }
 
+/// Every screen attached right now, in AppKit's order.
+///
+/// The only enumeration of screens in this crate. `visible_frame` below asks
+/// one window which screen it is on; this asks what the choices are, which is
+/// the question that has to be answered before the panel is placed at all.
+fn screen_frames(mtm: MainThreadMarker) -> Vec<Rect> {
+    NSScreen::screens(mtm)
+        .iter()
+        .map(|screen| {
+            let frame = screen.frame();
+            Rect {
+                x: frame.origin.x,
+                y: frame.origin.y,
+                width: frame.size.width,
+                height: frame.size.height,
+            }
+        })
+        .collect()
+}
+
+/// The visible area of the screen at `index`, for placing the panel onto it.
+fn visible_frame_of(mtm: MainThreadMarker, index: usize) -> Option<Rect> {
+    let screens = NSScreen::screens(mtm);
+    let screen = screens.iter().nth(index)?;
+    let frame = screen.visibleFrame();
+    Some(Rect {
+        x: frame.origin.x,
+        y: frame.origin.y,
+        width: frame.size.width,
+        height: frame.size.height,
+    })
+}
+
 fn visible_frame(window: &NSWindow) -> Option<Rect> {
     let screen = window
         .screen()
@@ -813,6 +917,9 @@ impl Overlay {
         if !is_known_position(&position) {
             position = "left-center".to_string();
         }
+        // A database that cannot be read is not a screen: `Err` and "no such
+        // row" both mean the pill opens where it always did.
+        let remembered_screen = engine.settings().get(OVERLAY_SCREEN).ok().flatten();
 
         let content = NSRect::new(
             NSPoint::new(0.0, 0.0),
@@ -856,6 +963,18 @@ impl Overlay {
             state: Cell::new(RecordingState::Idle),
             engine: Arc::clone(engine),
         };
+        // Onto the remembered screen *before* the first snap, because `snap`
+        // anchors within whichever screen the panel is already on -- and a
+        // panel built at the content origin is on the main one. Nothing to
+        // restore, or a screen that is no longer here, leaves it exactly where
+        // it would have been.
+        if let Some(index) = screen_for_name(remembered_screen.as_deref(), &screen_frames(mtm)) {
+            if let Some(visible) = visible_frame_of(mtm, index) {
+                overlay
+                    .panel
+                    .setFrameOrigin(NSPoint::new(visible.x, visible.y));
+            }
+        }
         overlay.snap(WIDTH_IDLE, false);
         overlay.panel.orderFrontRegardless();
         overlay
@@ -1073,6 +1192,187 @@ mod tests {
         width: 1440.0,
         height: 875.0,
     };
+
+    /// This Mac's built-in display and an external one beside it, in the
+    /// arrangement `NSScreen::screens` reports: the main screen is always at
+    /// the origin, and the others sit around it.
+    const BUILT_IN: Rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 1728.0,
+        height: 1117.0,
+    };
+    const EXTERNAL: Rect = Rect {
+        x: 1728.0,
+        y: 0.0,
+        width: 2048.0,
+        height: 858.0,
+    };
+
+    /// A screen answers to its own name.
+    ///
+    /// Trivial on its own, and here because everything below is a comparison
+    /// of two names: if naming were not reflexive, the pill would go home
+    /// every launch and every one of these tests would still pass.
+    #[test]
+    fn a_screen_answers_to_its_own_name() {
+        let screens = [BUILT_IN, EXTERNAL];
+        for (index, screen) in screens.iter().enumerate() {
+            assert_eq!(
+                screen_for_name(Some(&screen_name(*screen)), &screens),
+                Some(index)
+            );
+        }
+    }
+
+    /// The pill opens on the screen it was left on.
+    ///
+    /// The regression: the only thing ever written down about the pill's
+    /// position was one of eight anchor names, which says where on a screen
+    /// and never which screen. A user who dragged it to their second display
+    /// found it back on the built-in one after every restart.
+    #[test]
+    fn the_pill_opens_on_the_screen_it_was_left_on() {
+        assert_eq!(
+            screen_for_name(Some(&screen_name(EXTERNAL)), &[BUILT_IN, EXTERNAL]),
+            Some(1),
+            "left on the external display, opened on the built-in one"
+        );
+    }
+
+    /// A screen that is not there any more sends the pill home.
+    ///
+    /// The one outcome that must never happen: the pill is the only indication
+    /// that a recording is running, and placed on a display that was unplugged
+    /// it is an indicator the user cannot see. "Somewhere visible" beats
+    /// "where it was".
+    #[test]
+    fn a_screen_that_is_gone_sends_the_pill_home() {
+        assert_eq!(
+            screen_for_name(Some(&screen_name(EXTERNAL)), &[BUILT_IN]),
+            None,
+            "the external display was unplugged and the pill went with it"
+        );
+        assert_eq!(
+            screen_for_name(Some("nonsense"), &[BUILT_IN, EXTERNAL]),
+            None,
+            "a value this cannot read is not a screen"
+        );
+    }
+
+    /// An install that never recorded a screen behaves exactly as it did.
+    #[test]
+    fn nothing_remembered_is_no_opinion() {
+        assert_eq!(screen_for_name(None, &[BUILT_IN, EXTERNAL]), None);
+        assert_eq!(screen_for_name(Some(""), &[BUILT_IN, EXTERNAL]), None);
+    }
+
+    /// Two identical displays are told apart.
+    ///
+    /// A name built from the size alone would match the wrong one, and the
+    /// pair of matching monitors is the arrangement where a person is most
+    /// likely to care which of them it is on.
+    #[test]
+    fn two_identical_displays_are_told_apart() {
+        let left = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 2560.0,
+            height: 1440.0,
+        };
+        let right = Rect { x: 2560.0, ..left };
+        assert_ne!(screen_name(left), screen_name(right));
+        assert_eq!(
+            screen_for_name(Some(&screen_name(right)), &[left, right]),
+            Some(1)
+        );
+    }
+
+    /// The name survives the sub-point jitter a float frame can carry.
+    ///
+    /// An exact float comparison would be a name that does not always match
+    /// itself, which reads as "the display is gone" and puts the pill back on
+    /// the built-in screen for no reason the user can see.
+    #[test]
+    fn the_name_does_not_move_with_sub_point_jitter() {
+        let jittered = Rect {
+            x: EXTERNAL.x + 0.0001,
+            y: EXTERNAL.y - 0.0001,
+            ..EXTERNAL
+        };
+        assert_eq!(screen_name(jittered), screen_name(EXTERNAL));
+    }
+
+    /// The screen is recorded under its own key, not inside the anchor.
+    ///
+    /// `overlay_position` is what the Settings popup matches its menu items
+    /// against. A value carrying a screen in it would select nothing there and
+    /// fail `is_known_position`, so the pill would also lose its anchor -- a
+    /// second bug, in a window the user is looking at.
+    #[test]
+    fn the_screen_is_not_stored_in_the_anchor() {
+        assert_ne!(OVERLAY_SCREEN, "overlay_position");
+        for screen in [BUILT_IN, EXTERNAL] {
+            assert!(
+                !is_known_position(&screen_name(screen)),
+                "a screen name is not an anchor, so the two cannot share a key"
+            );
+        }
+    }
+
+    /// Both ends of the wire, checked in this file.
+    ///
+    /// Everything above is about a *decision*. None of it is about the
+    /// decision being made: every test here still passes with the write
+    /// removed from `settle`, or the lookup removed from `Overlay::new`, and
+    /// either of those is the whole bug back. Neither end can be reached from
+    /// a test -- one needs a dragged window, the other an `NSApplication` --
+    /// so what is checked is that the calls are there, the way the status-row
+    /// test reads its own call sites.
+    #[test]
+    fn both_ends_of_the_wire_are_connected() {
+        let source = include_str!("overlay.rs");
+        let code = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the code above the tests");
+
+        // Declared, read when the pill opens, written when it is dropped.
+        let mentions = code.matches("OVERLAY_SCREEN").count();
+        assert!(
+            mentions >= 3,
+            "OVERLAY_SCREEN appears {mentions} times outside the tests: it has \
+             to be declared, read when the panel is placed, and written when a \
+             drag settles. Fewer means one end of the wire is loose and the \
+             pill forgets its screen again"
+        );
+        // Counted, not `contains`. Every one of these names its own
+        // definition, so `contains` is satisfied by the function existing and
+        // says nothing about it being called -- which is exactly the forgery
+        // this test has to catch. The first version used `contains` and stayed
+        // green with the call removed from `Overlay::new`.
+        let asked = code.matches("screen_for_name(").count();
+        assert!(
+            asked >= 2,
+            "screen_for_name appears {asked} times outside the tests -- its \
+             definition and nothing else. Nothing asks which screen to open \
+             on, so the panel is placed wherever a window at the content \
+             origin lands"
+        );
+        let named = code.matches("screen_name(").count();
+        assert!(
+            named >= 3,
+            "screen_name appears {named} times outside the tests: it has to be \
+             defined, used to match a stored name, and used to write one down \
+             when a drag settles"
+        );
+        let enumerated = code.matches("screen_frames(").count();
+        assert!(
+            enumerated >= 2,
+            "screen_frames appears {enumerated} times outside the tests, so \
+             nothing ever asks what the choices are"
+        );
+    }
 
     /// The badge keeps the resting footprint on purpose: an outcome that
     /// resized the pill would move it at the moment the user is reading it.

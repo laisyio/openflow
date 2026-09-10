@@ -16,6 +16,66 @@ pub struct PluginManifest {
     pub entrypoint: Option<String>,
 }
 
+/// Start a plugin in a process group of its own.
+///
+/// A plugin is an arbitrary executable, and the ones worth writing shell out:
+/// a `run.sh` that starts a helper leaves that helper a *grandchild* of this
+/// app. `Child::kill` signals the one process it spawned and nothing below it,
+/// so the timeout below could report "timed out" while the work it timed out on
+/// kept running. Its own group is what makes the whole tree addressable.
+///
+/// The cost, stated because it is a real change: a plugin no longer receives
+/// signals sent to this app's process group, so an app interrupted from a
+/// terminal no longer takes a running plugin down with it. The timeout is what
+/// bounds that, and it is bounded either way -- whereas the grandchild was not
+/// bounded by anything.
+#[cfg(unix)]
+fn own_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // Between fork and exec, where only async-signal-safe calls are allowed.
+    // `setpgid` is one of them.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+/// No process groups here: `Child::kill` remains one process deep on Windows,
+/// which needs a job object rather than a signal and is not what this changes.
+#[cfg(not(unix))]
+fn own_process_group(_command: &mut Command) {}
+
+/// Stop the plugin and anything it started.
+///
+/// Checked rather than assumed: `killpg` is only sent when the child really is
+/// the leader of its own group. If `setpgid` failed in the fork the child is
+/// still in *this app's* group, and signalling that group would kill the app.
+/// Reading the group back is one syscall and turns the worst possible outcome
+/// into the old behaviour.
+///
+/// The group is signalled before the child is reaped, because reaping releases
+/// the pid and there is nothing to ask about a pid that has been reused.
+#[cfg(unix)]
+fn stop_everything_it_started(child: &mut std::process::Child) {
+    let pid = child.id() as i32;
+    if pid > 0 && unsafe { libc::getpgid(pid) } == pid {
+        unsafe { libc::killpg(pid, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn stop_everything_it_started(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PluginInfo {
     pub manifest: PluginManifest,
@@ -134,6 +194,20 @@ impl PluginManager {
         std::fs::create_dir_all(&plugin_dir)
             .map_err(|e| format!("Failed to create plugin dir: {}", e))?;
 
+        // Before the new code, not after. Installing over a plugin the user had
+        // enabled would otherwise leave the old `.enabled` marker standing over
+        // it, and the next hook would run it -- a subprocess with the user's
+        // privileges -- without anyone having enabled it. Enabling is the
+        // user's decision to take again, about the thing they just installed.
+        //
+        // Order matters for the failure as much as for the success. Writing
+        // first and then failing to remove the marker returns an error while
+        // leaving new code enabled on disk, and leaves a window in which a hook
+        // starting on another thread reads the new manifest as still permitted.
+        // This way a failure leaves a plugin disabled, which is the side that
+        // costs the user a click rather than a decision they never made.
+        self.disable_plugin(&manifest.id)?;
+
         std::fs::write(plugin_dir.join("manifest.json"), manifest_json)
             .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
@@ -159,12 +233,15 @@ impl PluginManager {
                 )
             })?;
             let executable = resolve_entrypoint(&plugin_dir, entrypoint)?;
-            let mut child = Command::new(&executable)
+            let mut command = Command::new(&executable);
+            command
                 .arg(hook_name)
                 .current_dir(&plugin_dir)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::piped());
+            own_process_group(&mut command);
+            let mut child = command
                 .spawn()
                 .map_err(|e| format!("Plugin '{}' could not start: {}", plugin.manifest.id, e))?;
             let input = serde_json::to_vec(&payload)
@@ -201,13 +278,11 @@ impl PluginManager {
                         std::thread::sleep(Duration::from_millis(20))
                     }
                     Ok(None) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        stop_everything_it_started(&mut child);
                         return Err(format!("Plugin '{}' timed out", plugin.manifest.id));
                     }
                     Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        stop_everything_it_started(&mut child);
                         return Err(format!("Plugin '{}' failed: {}", plugin.manifest.id, e));
                     }
                 }
@@ -364,12 +439,252 @@ mod tests {
         assert!(validate_plugin_id("clean-plugin_2").is_ok());
     }
 
+    /// Reinstalling over a plugin the user had enabled must not hand the new
+    /// code the old permission. The marker is what the hook runner reads, so
+    /// leaving it in place would run a freshly installed executable at the next
+    /// dictation with nobody having said yes to it.
+    #[test]
+    fn installing_over_an_enabled_plugin_lands_disabled() {
+        let root =
+            std::env::temp_dir().join(format!("openflow-plugin-test-{}", uuid::Uuid::new_v4()));
+        let manager = PluginManager {
+            plugins_dir: root.clone(),
+        };
+        let manifest_json = r#"{
+            "id": "reinstalled",
+            "name": "Reinstalled",
+            "version": "2.0.0",
+            "description": "Replaces a version the user had enabled",
+            "hooks": ["after_transcribe"],
+            "entrypoint": "run.sh"
+        }"#;
+
+        let first = manager
+            .install_plugin(manifest_json)
+            .expect("first install");
+        assert!(!first.enabled);
+        manager
+            .enable_plugin("reinstalled")
+            .expect("the user enables it");
+        assert!(manager.list_plugins()[0].enabled);
+
+        let reinstalled = manager
+            .install_plugin(manifest_json)
+            .expect("install over the enabled copy");
+
+        assert!(
+            !reinstalled.enabled,
+            "the returned value has to be true of what is on disk"
+        );
+        assert!(
+            !root.join("reinstalled").join(".enabled").exists(),
+            "the old permission cannot survive the code it was granted to"
+        );
+        assert!(!manager.list_plugins()[0].enabled);
+        assert!(
+            manager.get_enabled_hooks("after_transcribe").is_empty(),
+            "the newly written plugin must not run at the next hook"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove plugin fixture");
+    }
+
+    /// Installing is two steps, and the order decides what a failure leaves
+    /// behind. If the marker cannot be removed, the new executable's manifest
+    /// must not already be on disk under the old permission -- otherwise the
+    /// call reports failure while the thing it was refusing to enable is
+    /// enabled.
+    #[test]
+    #[cfg(unix)]
+    fn an_install_that_cannot_disable_does_not_land_the_new_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("openflow-plugin-order-{}", uuid::Uuid::new_v4()));
+        let manager = PluginManager {
+            plugins_dir: root.clone(),
+        };
+        let manifest_of = |version: &str| {
+            format!(
+                r#"{{"id":"pinned","name":"Pinned","version":"{}","description":"d","hooks":["after_transcribe"],"entrypoint":"run.sh"}}"#,
+                version
+            )
+        };
+        manager
+            .install_plugin(&manifest_of("2.0.0"))
+            .expect("first install");
+        manager
+            .enable_plugin("pinned")
+            .expect("the user enables it");
+
+        let plugin_dir = root.join("pinned");
+        let original = std::fs::metadata(&plugin_dir).expect("stat").permissions();
+        std::fs::set_permissions(&plugin_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("lock the folder");
+        // A process that ignores directory permissions -- root -- would make
+        // this test assert nothing, so check the premise rather than assume it.
+        let unremovable = std::fs::remove_file(plugin_dir.join(".enabled")).is_err();
+
+        let outcome = manager.install_plugin(&manifest_of("3.0.0"));
+        let on_disk = std::fs::read_to_string(plugin_dir.join("manifest.json")).expect("manifest");
+
+        std::fs::set_permissions(&plugin_dir, original).expect("unlock the folder");
+        std::fs::remove_dir_all(&root).expect("remove plugin fixture");
+
+        if !unremovable {
+            return;
+        }
+        assert!(outcome.is_err(), "the install could not be made safe");
+        assert!(
+            on_disk.contains("2.0.0"),
+            "new code must not land while the old permission still stands: {}",
+            on_disk
+        );
+    }
+
     #[test]
     fn bounded_reader_drains_but_caps_retained_output() {
         let mut input = std::io::Cursor::new(vec![7_u8; 32]);
         let (kept, truncated) = read_bounded(&mut input, 8).expect("bounded read");
         assert_eq!(kept, vec![7_u8; 8]);
         assert!(truncated);
+    }
+
+    /// A plugin that times out leaves nothing of its own running.
+    ///
+    /// The fixture is the point: `run.sh` starts a helper in the background and
+    /// then hangs. The helper is a *grandchild*, and `Child::kill` never
+    /// reached it -- measured before this change, the direct child was gone the
+    /// instant the hook returned and the helper was still writing its heartbeat
+    /// file two seconds later.
+    ///
+    /// The helper is detached from all three pipes on purpose. If it held one,
+    /// the drain loop above would be what kept it referenced and this would be
+    /// testing that instead: a helper that survives here survives on its own.
+    ///
+    /// Both halves are asserted. "The helper is dead" alone would pass on a
+    /// fixture that never started one, so the heartbeat file has to exist --
+    /// the helper has to have been alive for this to be about killing it.
+    #[cfg(unix)]
+    #[test]
+    fn a_plugin_that_times_out_leaves_nothing_of_its_own_running() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("openflow-plugin-test-{}", uuid::Uuid::new_v4()));
+        let plugin_dir = root.join("slow");
+        std::fs::create_dir_all(&plugin_dir).expect("create plugin fixture");
+        let manifest = PluginManifest {
+            id: "slow".to_string(),
+            name: "Slow".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Timeout fixture".to_string(),
+            author: None,
+            hooks: vec!["after_transcribe".to_string()],
+            entrypoint: Some("run.sh".to_string()),
+        };
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        std::fs::write(plugin_dir.join(".enabled"), []).expect("enable fixture");
+        let script = "#!/bin/sh\n\
+( while true; do date +%s > heartbeat; sleep 0.2; done ) >/dev/null 2>&1 </dev/null &\n\
+echo $! > helper.pid\n\
+echo $$ > child.pid\n\
+ps -o pgid= -p $$ | tr -d ' ' > child.pgid\n\
+cat >/dev/null\n\
+sleep 60\n";
+        let script_path = plugin_dir.join("run.sh");
+        std::fs::write(&script_path, script).expect("write fixture executable");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("fixture metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script_path, permissions).expect("make fixture executable");
+
+        let manager = PluginManager {
+            plugins_dir: root.clone(),
+        };
+        let outcome = manager.run_hook(
+            "after_transcribe",
+            HookPayload {
+                raw_text: Some("input".to_string()),
+                formatted_text: None,
+                provider: None,
+                language: None,
+            },
+        );
+
+        let helper: i32 = std::fs::read_to_string(plugin_dir.join("helper.pid"))
+            .expect("the fixture never recorded a helper pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let alive = |pid: i32| pid > 0 && unsafe { libc::kill(pid, 0) } == 0;
+        let heartbeat = plugin_dir.join("heartbeat");
+        let beat = std::fs::read_to_string(&heartbeat).ok();
+
+        // Whether it is still *working* is the question, and it is asked with
+        // the heartbeat rather than with the pid, because a pid answers
+        // `kill(pid, 0)` for as long as it is a zombie. The helper's parent is
+        // the plugin, which this just killed, so between the signal and the
+        // reparenting there is a window where the pid is still there and the
+        // process is not. That window made the first version of this test fail
+        // on the Linux runner and pass here, which is the worst kind of test.
+        // A zombie writes no files.
+        std::thread::sleep(Duration::from_millis(700));
+        let beat_again = std::fs::read_to_string(&heartbeat).ok();
+
+        // And then the pid, polled rather than sampled, for the same reason.
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while alive(helper) && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let still_running = alive(helper);
+        if still_running {
+            unsafe { libc::kill(helper, libc::SIGKILL) };
+        }
+        let read = |name: &str| {
+            std::fs::read_to_string(plugin_dir.join(name))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        let (child_pid, child_pgid) = (read("child.pid"), read("child.pgid"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            matches!(outcome, Err(ref message) if message.contains("timed out")),
+            "the fixture did not reach the timeout, so nothing here is about \
+             what the timeout kills: {outcome:?}"
+        );
+        assert!(
+            beat.is_some(),
+            "the helper never ran, so \"the helper is dead\" would pass on a \
+             fixture that started nothing"
+        );
+        assert_eq!(
+            beat, beat_again,
+            "the hook reported a timeout and the process the plugin started \
+             carried on working through it"
+        );
+        assert!(
+            !still_running,
+            "the hook reported a timeout and left the process the plugin \
+             started running"
+        );
+        // The premise the group kill checks before it fires. Asserted rather
+        // than demonstrated by forgery for an obvious reason: the forgery for
+        // "signal the group without checking" is this test killing everything
+        // in its own process group, which includes the test runner.
+        assert!(
+            !child_pid.is_empty() && child_pid == child_pgid,
+            "the plugin did not lead a process group of its own (pid \
+             {child_pid:?}, group {child_pgid:?}), so the group kill correctly \
+             refused to fire -- and every helper a plugin starts outlives it"
+        );
     }
 
     #[cfg(unix)]

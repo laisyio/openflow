@@ -21,7 +21,11 @@ The project is currently an early source build. There are no official pre-built 
 
 ### Streaming scope
 
-Speech-to-text is not live streaming: OpenFlow records locally, then uploads the finished WAV and waits for a transcript. The Gemini TTS preview progressively appends ordered MP3 chunks and starts playback while the response is still downloading when the system webview supports Media Source Extensions; otherwise it falls back to playback after download. Groq's Orpheus returns WAV only, which cannot be streamed through Media Source Extensions, so it always plays after the download completes.
+Speech-to-text is not live streaming: every request carries a complete WAV and waits for a transcript back, and the transcript you keep is always the one returned for the finished recording.
+
+Live preview is the exception to "nothing is uploaded until you let go". With it on, OpenFlow also re-uploads the whole recording so far every 0.8 seconds while you are still speaking, so the pill can show words as they arrive. That previewing stops 20 seconds into a take, or at the first reading that takes longer than 0.8 seconds, whichever comes first: a 60-second dictation sends up to 24 preview requests carrying about 4 minutes of audio in total, and then the final upload of the 60-second WAV. It is off by default for the hosted providers and **on by default for custom (self-hosted) endpoints**, where the requests cost nothing but your own hardware. Settings > General > "Live preview while recording" turns it off or on for any provider; turn it off before pointing a custom endpoint at a paid, per-minute API. On-device transcription previews the same way, against the local model, and nothing leaves the machine.
+
+The Gemini TTS preview progressively appends ordered MP3 chunks and starts playback while the response is still downloading when the system webview supports Media Source Extensions; otherwise it falls back to playback after download. Groq's Orpheus returns WAV only, which cannot be streamed through Media Source Extensions, so it always plays after the download completes.
 
 ## Providers
 
@@ -38,7 +42,7 @@ Model availability and billing are controlled by the provider. OpenFlow does not
 ## Privacy and permissions
 
 - API credentials are stored using macOS Keychain, Windows DPAPI, or Linux Secret Service. Linux requires an unlocked keyring and the `secret-tool` command.
-- Recordings are held in memory for transcription and sent to the provider selected in Settings. Cleanup sends transcript text to the selected cleanup provider. Voice previews send their text to the selected speech endpoint. Your transcription key is only ever reused by that same service; a different hosted provider or a self-hosted server never receives it.
+- Recordings are held in memory for transcription and sent to the provider selected in Settings. On-device transcription is the exception: the local runner is handed a file to decode, so the recording is written to a scratch file in your temporary directory that only your account can read, and deleted as soon as the decode ends -- including when the app quits or the runner is signalled mid-transcription. A power cut or a force-kill can still leave one behind; the next start of the local runner deletes it. Cleanup sends transcript text to the selected cleanup provider. Voice previews send their text to the selected speech endpoint. Your transcription key is only ever reused by that same service; a different hosted provider or a self-hosted server never receives it.
 - Transcript history is stored locally in an unencrypted SQLite database in the operating system's application-data directory. You control it from Settings: delete individual entries, clear everything, turn saving off entirely, or set an auto-delete window (1/7/30/90 days) that is applied at launch and after each transcription.
 - Auto-paste requires operating-system automation/accessibility permission. If permission is denied or a paste helper is unavailable, the transcript should still be available in OpenFlow and on the clipboard.
 - Enabled plugins are local executables and are not sandboxed. They receive transcript data over standard input. Only install and enable plugins you trust.

@@ -41,6 +41,7 @@ import argparse
 import gc
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -213,6 +214,147 @@ def active_memory_bytes() -> int | None:
         return None
 
 
+# ── the scratch recording ─────────────────────────────────
+#
+# `model.generate()` takes a path, so a recording of the user speaking has to
+# sit on disk for the length of one decode. It must not outlive that, and the
+# `finally` around the decode is not enough on its own:
+#
+# * SIGTERM is not a corner case here. It is what the supervisor sends when the
+#   app quits and when the model or the idle window changes
+#   (`terminate` in `crates/openflow-core/src/runner.rs`), and Python's default
+#   disposition for it ends the process without unwinding -- so a dictation in
+#   flight at that moment left its wav behind.
+# * SIGINT is no better. The request runs on one of `ThreadingHTTPServer`'s
+#   daemon threads, and those are stopped at interpreter shutdown without their
+#   `finally` blocks running.
+# * `watch_parent` leaves through `os._exit`, which skips `finally` as well.
+#
+# So the paths in flight are tracked and every exit this process can see
+# unlinks them first. Nothing in a process sees SIGKILL or a power cut, which
+# is why the names carry the pid that wrote them: a starting runner can delete
+# the leftovers of runners that are gone, and leave alone the ones that are not.
+
+SCRATCH_PREFIX = "openflow-scratch-"
+# Held only around a set operation, never across I/O, so the signal handler on
+# the main thread waits for a worker at most momentarily. The main thread never
+# takes it itself, which is what would turn that wait into a deadlock.
+_scratch_lock = threading.Lock()
+_scratch_paths: set[str] = set()
+
+
+def new_scratch(audio: bytes) -> str:
+    """Write `audio` to a private file and remember it until it is dropped.
+
+    `mkstemp` opens 0600, and the file goes in this user's temp directory --
+    on macOS a per-user one the operating system creates 0700.
+    """
+    handle, path = tempfile.mkstemp(
+        prefix="%s%d-" % (SCRATCH_PREFIX, os.getpid()), suffix=".wav"
+    )
+    with _scratch_lock:
+        _scratch_paths.add(path)
+    try:
+        with os.fdopen(handle, "wb") as scratch:
+            scratch.write(audio)
+    except BaseException:
+        drop_scratch(path)
+        raise
+    return path
+
+
+def drop_scratch(path: str) -> None:
+    """Unlink one recording. Safe to call twice."""
+    with _scratch_lock:
+        _scratch_paths.discard(path)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def drop_all_scratch() -> None:
+    """Unlink every recording still in flight. Safe from a signal handler and
+    safe to call twice."""
+    with _scratch_lock:
+        paths = list(_scratch_paths)
+        _scratch_paths.clear()
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _pid_is_running(pid: int) -> bool:
+    """Conservative: anything other than "that pid is definitely gone" counts
+    as running, because the only use of this is deciding whether a file is
+    safe to delete."""
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # EPERM says something is there; it is just not ours.
+        return True
+    return True
+
+
+def sweep_orphan_scratch() -> None:
+    """Delete recordings left behind by runners that are no longer running.
+
+    A SIGKILL or a power cut leaves the file and nothing in that process can
+    help; the next start can. Every name carries the pid that wrote it, so a
+    leftover whose writer is gone is unambiguously finished with, and one whose
+    writer is alive is left alone -- two sidecars can briefly overlap, and
+    deleting a live one's audio would fail a dictation.
+    """
+    if os.name != "posix":
+        # `os.kill(pid, 0)` is not a liveness test off POSIX, and without one
+        # this cannot tell a leftover from a recording being decoded right now.
+        return
+    directory = tempfile.gettempdir()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(SCRATCH_PREFIX) or not name.endswith(".wav"):
+            continue
+        owner = name[len(SCRATCH_PREFIX) :].split("-", 1)[0]
+        if not owner.isdigit() or _pid_is_running(int(owner)):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            if os.stat(path).st_uid != os.getuid():
+                continue
+            os.unlink(path)
+        except OSError:
+            continue
+
+
+def install_exit_handlers() -> None:
+    """Unlink the recording in flight before this process goes away.
+
+    The handler re-raises with the default disposition rather than exiting
+    itself, so the status the supervisor waits on is exactly the one it saw
+    before: killed by that signal. Only the unlink in front of it is new.
+    """
+
+    def handler(number, _frame) -> None:
+        drop_all_scratch()
+        signal.signal(number, signal.SIG_DFL)
+        os.kill(os.getpid(), number)
+
+    for number in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(number, handler)
+        except (ValueError, OSError):  # not the main thread, or no such signal
+            pass
+
+
 # ── multipart ─────────────────────────────────────────────
 
 
@@ -353,9 +495,7 @@ class Handler(BaseHTTPRequestHandler):
 
         path = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as scratch:
-                scratch.write(audio)
-                path = scratch.name
+            path = new_scratch(audio)
             started = time.monotonic()
             text = self.holder.transcribe(path, language)
             elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -365,10 +505,7 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(500, {"error": f"{type(failure).__name__}: {failure}"})
         finally:
             if path:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                drop_scratch(path)
 
 
 def watch_parent(parent_pid: int) -> None:
@@ -382,6 +519,10 @@ def watch_parent(parent_pid: int) -> None:
     while True:
         time.sleep(5)
         if os.getppid() != parent_pid:
+            # `os._exit` skips every `finally`, so the recording a decode is
+            # holding has to go first: the app being SIGKILLed is exactly the
+            # case that leaves one behind otherwise.
+            drop_all_scratch()
             os._exit(0)
 
 
@@ -391,6 +532,11 @@ def main() -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--idle-minutes", type=float, default=10.0)
     arguments = parser.parse_args()
+
+    # Before anything can be recorded: clear out what a SIGKILLed or
+    # power-cut predecessor could not clear out itself.
+    sweep_orphan_scratch()
+    install_exit_handlers()
 
     holder = ModelHolder(arguments.model, max(0.5, arguments.idle_minutes) * 60.0)
     Handler.holder = holder
@@ -418,6 +564,7 @@ def main() -> int:
         pass
     finally:
         server.server_close()
+        drop_all_scratch()
     return 0
 
 

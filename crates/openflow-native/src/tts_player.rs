@@ -10,10 +10,12 @@
 //!   played when the stream finishes. A WAV header describes a length, and a
 //!   half-written one is not a clip.
 //!
-//! Cancellation is a flag the reader checks: it reports end-of-file, the
-//! decoder finishes, and the player thread exits. The same flag closes the
-//! [`PreviewGate`], which is what makes the *engine* stop downloading, since
-//! `speech::stream` gives up when a chunk cannot be delivered.
+//! Cancellation is a flag the source checks: it reports end-of-file, the
+//! decoder finishes, and the player thread exits. Both shapes are wrapped in
+//! [`StopsWhenCancelled`] on the way to the decoder, because neither one stops
+//! on its own -- see that type. The same flag closes the [`PreviewGate`], which
+//! is what makes the *engine* stop downloading, since `speech::stream` gives up
+//! when a chunk cannot be delivered.
 
 use std::cell::RefCell;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -111,6 +113,57 @@ impl Seek for StreamBuffer {
     }
 }
 
+/// Reports end-of-file the moment playback is cancelled, whatever it wraps.
+///
+/// [`StreamBuffer`] already consults the same flag, but only where it would
+/// otherwise block waiting for a chunk that will never come; bytes it has
+/// already pulled are still served, and the buffered WAV path is a plain
+/// `Cursor` that has never heard of the flag at all. So Stop closed the gate,
+/// dropped the sender and left the speaker playing. Measured on a silent
+/// 8-second WAV, decoding without a device: after the flag was set the decoder
+/// still handed out 351_800 of 352_800 samples through the `Cursor`, and 31_746
+/// through `StreamBuffer` -- one symphonia read-ahead buffer, which for a
+/// 128 kbps mp3 is about four seconds of audio.
+///
+/// Wrapping the source is where the fix belongs: it is the one place both
+/// shapes pass through, and it also releases the retained clip as soon as the
+/// player thread unwinds rather than at the end of a preview nobody wanted.
+struct StopsWhenCancelled<R> {
+    inner: R,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<R> StopsWhenCancelled<R> {
+    fn new(inner: R, cancelled: Arc<AtomicBool>) -> Self {
+        Self { inner, cancelled }
+    }
+}
+
+impl<R: Read> Read for StopsWhenCancelled<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Ok(0);
+        }
+        self.inner.read(out)
+    }
+}
+
+impl<R: Seek> Seek for StopsWhenCancelled<R> {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(from)
+    }
+}
+
+/// Exactly what [`spawn_player`] hands the decoder, named so the tests can
+/// decode the same thing the speaker would. Both shapes of preview go through
+/// here: the channel-backed reader and the finished WAV in a `Cursor`.
+fn player_source<R>(source: R, cancelled: Arc<AtomicBool>) -> impl Read + Seek + Send + Sync
+where
+    R: Read + Seek + Send + Sync + 'static,
+{
+    StopsWhenCancelled::new(source, cancelled)
+}
+
 /// One preview in flight.
 struct Playback {
     request_id: String,
@@ -123,6 +176,15 @@ struct Playback {
     /// the download outran the speaker. `StreamBuffer` keeps every byte it is
     /// sent anyway, so a queue depth bought no memory either; the ceiling is
     /// `MAX_SPEECH_BYTES` in core, which is what actually bounds a clip.
+    ///
+    /// Measured, because "the download outran the speaker" sounds like a risk
+    /// rather than the everyday case it is: the longest preview the settings
+    /// screen can ask for (`PREVIEW_LIMIT`, 500 characters) came back from the
+    /// LAN endpoint as 567_980 bytes of mp3, delivered in 9 chunks in 34 ms
+    /// against 35.5 s of playback. So the whole clip is always queued before a
+    /// note is played. Peak live heap for that: 2.05 MiB, about 3.8x the clip,
+    /// the multiple being the channel's copy plus a `Vec` that doubles. At the
+    /// `MAX_SPEECH_BYTES` ceiling the same shape peaks at 146 MiB.
     chunks: Option<Sender<Vec<u8>>>,
     /// Set for a WAV preview, which plays only when the download completes.
     buffered: Option<Vec<u8>>,
@@ -303,6 +365,7 @@ where
             Ok(device) => device,
             Err(error) => return report(format!("No audio output is available: {}", error)),
         };
+        let source = player_source(source, Arc::clone(&cancelled));
         let decoder = match rodio::Decoder::new(source) {
             Ok(decoder) => decoder,
             Err(error) => {
@@ -390,6 +453,121 @@ mod tests {
             "a cancelled stream must report end-of-file, not wait"
         );
         drop(sender);
+    }
+
+    /// A silent 16-bit mono WAV, so that nothing here can make a sound even if
+    /// something later hands one of these to a real device. Nothing does: these
+    /// tests decode, they never open an output.
+    fn silent_wav(samples: u32, rate: u32) -> Vec<u8> {
+        let data_len = samples * 2;
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 2).to_le_bytes()); // bytes per second
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.resize(44 + data_len as usize, 0);
+        wav
+    }
+
+    /// Stop has to stop the sound, and the flag alone did not: `StreamBuffer`
+    /// only consults it where it would otherwise block, and the buffered WAV
+    /// path is a `Cursor` that never consulted it at all. Decoded here with no
+    /// audio device, on silence, so the check costs nothing and plays nothing.
+    ///
+    /// This crate's tests only ever run on a developer's Mac -- CI is Linux and
+    /// compiles the whole thing away -- so this is the only place the promise in
+    /// the module header gets checked at all.
+    #[test]
+    fn cancelling_stops_the_decoder_for_both_shapes_of_preview() {
+        let rate = 44_100;
+        let total = rate * 8;
+        let wav = silent_wav(total, rate);
+
+        // A tenth of a second. The floor is the packet symphonia has already
+        // decoded, measured at 514 samples (11.7 ms) for both shapes; the
+        // ceiling has to stay under the smaller of the two unfixed numbers,
+        // 31_746, or this assertion would wave the bug through.
+        let allowed = rate as usize / 10;
+
+        // The buffered shape: Groq's Orpheus answers in WAV, which plays from a
+        // `Cursor` over the finished download. Unwrapped it delivered 351_800
+        // of 352_800 samples after the flag was set -- every remaining second.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let source = player_source(Cursor::new(wav.clone()), Arc::clone(&cancelled));
+        let mut decoder = rodio::Decoder::new(source).expect("the silent wav decodes");
+        assert_eq!(
+            decoder.by_ref().take(1_000).count(),
+            1_000,
+            "the preview has to play before there is anything to stop"
+        );
+        cancelled.store(true, Ordering::SeqCst);
+        let after = decoder.count();
+        assert!(
+            after < allowed,
+            "a cancelled WAV preview kept playing: {after} samples after Stop, \
+             out of {total}"
+        );
+
+        // The streaming shape: the same clip arriving in chunks. Unwrapped this
+        // one ran on for 31_746 samples -- one read-ahead buffer, which for a
+        // 128 kbps mp3 is about four seconds.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = channel::<Vec<u8>>();
+        for piece in wav.chunks(65_536) {
+            sender.send(piece.to_vec()).expect("the queue takes it");
+        }
+        drop(sender);
+        let source = player_source(
+            StreamBuffer::new(receiver, Arc::clone(&cancelled)),
+            Arc::clone(&cancelled),
+        );
+        let mut decoder = rodio::Decoder::new(source).expect("the silent wav decodes");
+        assert_eq!(decoder.by_ref().take(1_000).count(), 1_000);
+        cancelled.store(true, Ordering::SeqCst);
+        let after = decoder.count();
+        assert!(
+            after < allowed,
+            "a cancelled streaming preview kept playing: {after} samples after \
+             Stop, out of {total}"
+        );
+    }
+
+    /// The narrow version of the same rule, at the byte level: bytes that have
+    /// already been pulled are not a licence to keep playing. This is the case
+    /// `cancelling_ends_the_stream_for_the_reader` does not cover -- there the
+    /// reader was out of bytes and would have blocked, which is the only place
+    /// `StreamBuffer` looks at the flag.
+    #[test]
+    fn cancelling_stops_a_source_that_still_holds_buffered_bytes() {
+        let (sender, receiver) = channel::<Vec<u8>>();
+        sender.send(b"0123456789".to_vec()).expect("the whole clip");
+        drop(sender);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut source = player_source(
+            StreamBuffer::new(receiver, Arc::clone(&cancelled)),
+            Arc::clone(&cancelled),
+        );
+
+        let mut head = [0u8; 4];
+        source.read_exact(&mut head).expect("playback starts");
+        assert_eq!(&head, b"0123");
+
+        cancelled.store(true, Ordering::SeqCst);
+        let mut rest = [0u8; 6];
+        assert_eq!(
+            source.read(&mut rest).expect("cancelled reads as eof"),
+            0,
+            "a cancelled preview must stop even with the rest of the clip in hand"
+        );
     }
 
     /// Arming before the stream starts is what keeps a chunk that overtakes the

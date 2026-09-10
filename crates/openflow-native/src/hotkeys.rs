@@ -4,7 +4,8 @@
 //! `Pressed` starts the capture and `Released` ends it, and the engine's
 //! watchdog covers the case where a release is swallowed by another app.
 
-use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, OnceLock};
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -136,33 +137,146 @@ impl Hotkeys {
     }
 
     /// Route one hotkey event. Runs on the main thread, after the hop.
+    ///
+    /// Only the part that has to be here stays here; every engine call goes to
+    /// the worker. See [`route`] for why, and for what it costs.
     pub fn dispatch(&self, engine: &Arc<Engine>, event: GlobalHotKeyEvent) {
-        if self.record.map(|key| key.id()) == Some(event.id) {
-            match event.state {
-                HotKeyState::Pressed => {
-                    // "Paste the key, then hold the hotkey to try it" is the
-                    // first thing anyone does in Settings, and the overlay pill
-                    // is a non-activating panel, so nothing takes focus off the
-                    // field. Without this the capture would run against the key
-                    // the user typed but never committed, because credentials
-                    // and endpoint URLs only write when editing ends.
-                    crate::app::with_app(|app| {
-                        app.with_settings(|window| window.commit_pending_edits())
-                    });
-                    engine.hotkey_pressed();
-                }
-                HotKeyState::Released => engine.hotkey_released(),
-            }
-        } else if self.recopy.map(|key| key.id()) == Some(event.id)
+        if self.record.map(|key| key.id()) == Some(event.id)
             && matches!(event.state, HotKeyState::Pressed)
         {
-            engine.recopy();
+            // "Paste the key, then hold the hotkey to try it" is the first
+            // thing anyone does in Settings, and the overlay pill is a
+            // non-activating panel, so nothing takes focus off the field.
+            // Without this the capture would run against the key the user typed
+            // but never committed, because credentials and endpoint URLs only
+            // write when editing ends.
+            //
+            // This is the one part of a hotkey that is AppKit, so it is the one
+            // part that stays on the main thread. It is synchronous and it runs
+            // before the press is handed on, so the capture still sees the
+            // committed value.
+            crate::app::with_app(|app| app.with_settings(|window| window.commit_pending_edits()));
         }
+        route(
+            self.record.map(|key| key.id()),
+            self.recopy.map(|key| key.id()),
+            engine,
+            event,
+        );
     }
 }
 
-/// `global-hotkey` calls this from its own thread. Nothing here touches AppKit
-/// or the engine; both happen after the hop.
+/// What a hotkey asks of the engine.
+///
+/// A trait rather than a direct call so the routing can be tested against a
+/// stand-in: building a real [`Engine`] opens the database and the keychain,
+/// and driving one would need a microphone.
+pub trait HotkeyTarget: Clone + Send + 'static {
+    fn pressed(&self);
+    fn released(&self);
+    fn recopy(&self);
+}
+
+impl HotkeyTarget for Arc<Engine> {
+    fn pressed(&self) {
+        Engine::hotkey_pressed(self);
+    }
+
+    fn released(&self) {
+        Engine::hotkey_released(self);
+    }
+
+    fn recopy(&self) {
+        Engine::recopy(self);
+    }
+}
+
+/// Hand one hotkey event to `target`, off the calling thread.
+///
+/// **Why off it.** `dispatch` runs on the main thread -- `install_handler` hops
+/// there through [`crate::events::on_main`] -- and all three engine calls block
+/// it. The release is the one that costs the most: `Engine::hotkey_released`
+/// waits on `AudioRecorder::stop`, a channel round trip to the audio thread,
+/// which resamples, gains and WAV-encodes the whole take before it answers.
+/// Measured on this machine in a release build that is 34 ms for a five second
+/// take and 87 ms for a minute, and the 300 s ceiling `MAX_RECORDING` allows
+/// costs about a quarter of a second. Nothing like the 5 s `recv_timeout` --
+/// that is the give-up line, not the work -- but it is a quarter of a second in
+/// which the app draws nothing, and it lands exactly when the user has stopped
+/// talking and is watching the overlay for an answer. The press pays for
+/// opening a `cpal` stream on the same thread, and the recopy for a 200 ms
+/// settle plus an `osascript`.
+///
+/// **Why one worker and not a thread per event.** Press and release have to
+/// reach the engine in the order the user made them. A thread each would let a
+/// press that lands while the previous release is still encoding overtake it,
+/// and the states the overlay shows would arrive out of order. One serial
+/// worker keeps the ordering the main thread used to give for free.
+///
+/// Nothing here touches AppKit. Every UI update the engine makes leaves as an
+/// event and `NativeEvents::emit` hops to the main queue itself, and the
+/// clipboard and keystroke paths already run from the pipeline's tokio worker.
+pub(crate) fn route<T: HotkeyTarget>(
+    record_id: Option<u32>,
+    recopy_id: Option<u32>,
+    target: &T,
+    event: GlobalHotKeyEvent,
+) {
+    if record_id == Some(event.id) {
+        let target = target.clone();
+        match event.state {
+            HotKeyState::Pressed => run_off_main(Box::new(move || target.pressed())),
+            HotKeyState::Released => run_off_main(Box::new(move || target.released())),
+        }
+    } else if recopy_id == Some(event.id) && matches!(event.state, HotKeyState::Pressed) {
+        let target = target.clone();
+        run_off_main(Box::new(move || target.recopy()));
+    }
+}
+
+type HotkeyWork = Box<dyn FnOnce() + Send + 'static>;
+
+/// The one thread every hotkey's engine call runs on, or `None` when the
+/// process would not give us one.
+fn worker() -> Option<&'static Sender<HotkeyWork>> {
+    static WORKER: OnceLock<Option<Sender<HotkeyWork>>> = OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<HotkeyWork>();
+            std::thread::Builder::new()
+                .name("openflow-hotkeys".to_string())
+                .spawn(move || {
+                    for work in receiver {
+                        work();
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+/// Run `work` on the hotkey worker, or here when there is no worker to run it
+/// on.
+///
+/// A machine that will not hand the process a thread is not a reason to drop
+/// the take the user just spoke. The fallback is exactly what this did before:
+/// a blocked caller, which is worse than a free one and far better than
+/// silence.
+fn run_off_main(work: HotkeyWork) {
+    match worker() {
+        Some(sender) => {
+            if let Err(returned) = sender.send(work) {
+                (returned.0)();
+            }
+        }
+        None => work(),
+    }
+}
+
+/// `global-hotkey` calls this from a Carbon application event handler, which
+/// macOS runs on the main run loop. Nothing here touches AppKit or the engine;
+/// both happen after the hop.
 pub fn install_handler() {
     GlobalHotKeyEvent::set_event_handler(Some(|event: GlobalHotKeyEvent| {
         crate::events::on_main(move || {
@@ -328,6 +442,210 @@ fn code_name(code: Code) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// How long a stand-in engine call is allowed to hold the worker before it
+    /// gives up. Long enough that a caller which ran it inline could not be
+    /// mistaken for one that handed it off, short enough that the test still
+    /// ends if the release channel is never signalled.
+    const STANDIN_BLOCK: Duration = Duration::from_secs(5);
+
+    #[derive(Clone)]
+    struct Recorder {
+        calls: Arc<Mutex<Vec<(&'static str, std::thread::ThreadId)>>>,
+        /// Held by `released`, so the test decides when the release finishes.
+        release: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
+        done: mpsc::Sender<&'static str>,
+    }
+
+    impl Recorder {
+        fn new() -> (Self, mpsc::Receiver<&'static str>) {
+            let (done, seen) = mpsc::channel();
+            (
+                Self {
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    release: Arc::new(Mutex::new(None)),
+                    done,
+                },
+                seen,
+            )
+        }
+
+        fn note(&self, what: &'static str) {
+            self.calls
+                .lock()
+                .expect("call log")
+                .push((what, std::thread::current().id()));
+            let _ = self.done.send(what);
+        }
+
+        fn names(&self) -> Vec<&'static str> {
+            self.calls
+                .lock()
+                .expect("call log")
+                .iter()
+                .map(|(name, _)| *name)
+                .collect()
+        }
+
+        fn threads(&self) -> Vec<std::thread::ThreadId> {
+            self.calls
+                .lock()
+                .expect("call log")
+                .iter()
+                .map(|(_, thread)| *thread)
+                .collect()
+        }
+    }
+
+    impl HotkeyTarget for Recorder {
+        fn pressed(&self) {
+            self.note("pressed");
+        }
+
+        fn released(&self) {
+            if let Some(gate) = self.release.lock().expect("release gate").take() {
+                match gate.recv_timeout(STANDIN_BLOCK) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+            self.note("released");
+        }
+
+        fn recopy(&self) {
+            self.note("recopy");
+        }
+    }
+
+    const RECORD: u32 = 11;
+    const RECOPY: u32 = 22;
+
+    fn event(id: u32, state: HotKeyState) -> GlobalHotKeyEvent {
+        GlobalHotKeyEvent { id, state }
+    }
+
+    /// The release is the expensive one: `Engine::hotkey_released` waits on the
+    /// audio thread while it resamples, gains and encodes the whole take, which
+    /// is a quarter of a second for a take at the recording ceiling. `dispatch`
+    /// runs on the main thread, so routing it there is the app not drawing for
+    /// that long, at the exact moment the user has stopped talking and is
+    /// looking at the overlay.
+    #[test]
+    fn releasing_the_key_does_not_hold_up_the_thread_that_delivered_it() {
+        let (target, seen) = Recorder::new();
+        let (unblock, gate) = mpsc::channel();
+        *target.release.lock().expect("release gate") = Some(gate);
+
+        let started = Instant::now();
+        route(
+            Some(RECORD),
+            Some(RECOPY),
+            &target,
+            event(RECORD, HotKeyState::Released),
+        );
+        let handed_off = started.elapsed();
+
+        assert!(
+            handed_off < Duration::from_secs(1),
+            "the release held the caller for {handed_off:?}; it must be handed off, \
+             not run on the thread that delivered it"
+        );
+        // And it really did run: handing off is not dropping.
+        unblock.send(()).expect("the release is still waiting");
+        assert_eq!(
+            seen.recv_timeout(STANDIN_BLOCK * 2),
+            Ok("released"),
+            "the release never reached the engine"
+        );
+        assert_eq!(target.names(), vec!["released"]);
+        assert_ne!(
+            target.threads()[0],
+            std::thread::current().id(),
+            "the release ran on the calling thread"
+        );
+    }
+
+    /// Off the main thread, but not out of order. A press that lands while the
+    /// previous release is still encoding must still reach the engine second,
+    /// or the engine sees a capture starting before the one it replaces has
+    /// ended and the overlay publishes the two states backwards.
+    #[test]
+    fn hotkeys_reach_the_engine_in_the_order_they_arrived() {
+        let (target, seen) = Recorder::new();
+        let (unblock, gate) = mpsc::channel();
+        *target.release.lock().expect("release gate") = Some(gate);
+
+        route(
+            Some(RECORD),
+            Some(RECOPY),
+            &target,
+            event(RECORD, HotKeyState::Released),
+        );
+        route(
+            Some(RECORD),
+            Some(RECOPY),
+            &target,
+            event(RECORD, HotKeyState::Pressed),
+        );
+        route(
+            Some(RECORD),
+            Some(RECOPY),
+            &target,
+            event(RECOPY, HotKeyState::Pressed),
+        );
+        // Everything above queued behind a release that has not finished yet.
+        // A caller that ran the release inline has already given up waiting by
+        // now; let that be the thread assertion's failure to report, not this
+        // line's.
+        let _ = unblock.send(());
+
+        for expected in ["released", "pressed", "recopy"] {
+            assert_eq!(
+                seen.recv_timeout(STANDIN_BLOCK * 2),
+                Ok(expected),
+                "expected {expected} next"
+            );
+        }
+        assert_eq!(target.names(), vec!["released", "pressed", "recopy"]);
+        let threads = target.threads();
+        assert_ne!(
+            threads[0],
+            std::thread::current().id(),
+            "the hotkey calls ran on the thread that delivered them"
+        );
+        assert!(
+            threads.windows(2).all(|pair| pair[0] == pair[1]),
+            "the hotkey calls were spread over several threads, so nothing keeps them in order"
+        );
+    }
+
+    /// A key press that is neither binding is not the engine's business.
+    #[test]
+    fn an_unbound_chord_and_a_recopy_release_reach_nothing() {
+        let (target, seen) = Recorder::new();
+        route(
+            Some(RECORD),
+            Some(RECOPY),
+            &target,
+            event(99, HotKeyState::Pressed),
+        );
+        route(
+            Some(RECORD),
+            Some(RECOPY),
+            &target,
+            event(RECOPY, HotKeyState::Released),
+        );
+        route(None, None, &target, event(RECORD, HotKeyState::Released));
+        assert_eq!(
+            seen.recv_timeout(Duration::from_millis(500)),
+            Err(RecvTimeoutError::Timeout),
+            "an event for no binding of ours reached the engine"
+        );
+        assert!(target.names().is_empty());
+    }
 
     /// The recorder writes settings strings, so everything it can produce has
     /// to survive `parse_shortcut` unchanged. A format the parser rejects would

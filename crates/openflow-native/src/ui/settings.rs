@@ -32,6 +32,7 @@ use objc2_foundation::{
 };
 
 use openflow_core::engine::Engine;
+use openflow_core::settings::Settings;
 use openflow_core::speech::SpeechRequest;
 use openflow_core::transcribe::ModelInfo;
 
@@ -39,6 +40,7 @@ use crate::hotkeys;
 use crate::login_item;
 use crate::overlay;
 use crate::ui::card::{Card, Flipped, GAP, MARGIN, PADDING};
+use crate::ui::onboarding::microphone_items;
 use crate::ui::recorder::ChordRecorder;
 use crate::ui::{
     allow_wrapping, button, combo, label, note, popup, secure_field, switch_control, text_field,
@@ -52,6 +54,16 @@ use crate::ui::{
 /// the cleanup rows below either into a scroll view or off the tab. Sized for
 /// the taller of the two so nothing reflows when the choice changes.
 const BOX_HEIGHT: f64 = 300.0;
+
+/// How many lines every status line in this page reserves.
+///
+/// Three, because the longest message the app itself writes into one needs
+/// three: `speech::resolve_speech_key`'s answer when the voice provider has no
+/// key of its own is 638 pt of text in a 288 pt column. Two lines held the
+/// first two thirds of that sentence and dropped the third, which is the half
+/// that says what to do about it. Messages from further away -- a `reqwest`
+/// connection error is four lines -- are truncated with an ellipsis instead.
+const STATUS_LINES: usize = 3;
 /// The dictionary is sent to the transcriber as a spelling hint and the web
 /// settings screen caps it here.
 pub const DICTIONARY_LIMIT: usize = 800;
@@ -185,6 +197,70 @@ const TAG_TTS_FORMAT: isize = 46;
 
 const TAG_SAVE_HISTORY: isize = 60;
 const TAG_RETENTION: isize = 61;
+/// The dictionary is an `NSTextView` and is not dispatched by tag, but it does
+/// save, so it needs a name in [`TAG_SECTIONS`] like every other control that
+/// can fail.
+const TAG_DICTIONARY: isize = 62;
+
+/// Which card each control sits on, as an index into [`SECTIONS`].
+///
+/// This is what decides where a save failure is written. It used to be one
+/// answer for every control -- `models_status`, the line beside Fetch models --
+/// so turning off Save history on the Privacy card and having the write fail
+/// put the reason 1133pt further up the column, close to two screenfuls out of
+/// sight in a 580pt window. Worse, `models_status` lives inside `remote_box`,
+/// which is hidden whenever the backend is "On this Mac": with that selected
+/// the failure went into a hidden view and the user saw nothing at all.
+///
+/// A tag missing from here falls back to the Providers card, which is the old
+/// behaviour and the only wrong-card case left; the tests below keep the table
+/// complete so that fallback stays unreachable.
+const TAG_SECTIONS: [&[isize]; SECTIONS.len()] = [
+    &[
+        TAG_MICROPHONE,
+        TAG_HOTKEY_RECORD,
+        TAG_HOTKEY_RECOPY,
+        TAG_INSERT_METHOD,
+        TAG_PRESERVE_CLIPBOARD,
+        TAG_OVERLAY_ONLY,
+        TAG_OVERLAY_POSITION,
+        TAG_THEME,
+        TAG_LANGUAGE,
+        TAG_LIVE_PREVIEW,
+    ],
+    &[
+        TAG_BACKEND,
+        TAG_LOCAL_MODEL,
+        TAG_LOCAL_IDLE,
+        TAG_LOCAL_ONLY,
+        TAG_PROVIDER,
+        TAG_PROVIDER_URL,
+        TAG_API_KEY,
+        TAG_STT_MODEL,
+        TAG_SAME_PROVIDER,
+        TAG_FORMATTING_PROVIDER,
+        TAG_FORMATTING_URL,
+        TAG_FORMATTING_KEY,
+        TAG_FORMAT_ENABLED,
+        TAG_CHAT_MODEL,
+        TAG_FETCH_MODELS,
+    ],
+    &[
+        TAG_TTS_ENABLED,
+        TAG_TTS_PROVIDER,
+        TAG_TTS_URL,
+        TAG_TTS_KEY,
+        TAG_TTS_MODEL,
+        TAG_TTS_VOICE,
+        TAG_TTS_FORMAT,
+    ],
+    &[TAG_DICTIONARY, TAG_SAVE_HISTORY, TAG_RETENTION],
+];
+
+/// The card `tag`'s control is on, or `None` for a tag no form claims.
+fn section_of_tag(tag: isize) -> Option<usize> {
+    TAG_SECTIONS.iter().position(|tags| tags.contains(&tag))
+}
 
 /// Everything the window has to read back or write into.
 struct Controls {
@@ -203,6 +279,9 @@ struct Controls {
     /// Whatever the login item needs said about itself: the approval hint, or
     /// the reason a register call was refused. Empty the rest of the time.
     login_status: Retained<NSTextField>,
+    /// Where a General save failure is written. The other three cards already
+    /// had a line of their own; this card reported into the Providers card.
+    general_status: Retained<NSTextField>,
 
     backend: Retained<NSPopUpButton>,
     /// The online-provider rows and the on-this-Mac rows share one frame; the
@@ -229,6 +308,12 @@ struct Controls {
     stt_model: Retained<NSComboBox>,
     chat_model: Retained<NSComboBox>,
     models_status: Retained<NSTextField>,
+    /// Where a Providers save failure is written. Deliberately not
+    /// `models_status` or `local_status`: those two live inside `remote_box`
+    /// and `local_box`, and each is hidden exactly when the other is showing,
+    /// so half the card's failures would land in a hidden view. This one is on
+    /// the card itself and is always on screen with the rows it reports for.
+    provider_status: Retained<NSTextField>,
 
     tts_enabled: Retained<NSSwitch>,
     tts_provider: Retained<NSPopUpButton>,
@@ -577,6 +662,26 @@ impl SettingsPage {
         field.setStringValue(&NSString::from_str(text));
     }
 
+    /// The status line a failed write for `tag` belongs in: the one on the card
+    /// the control itself is on.
+    ///
+    /// A save failure is only useful beside the control that caused it. Every
+    /// one of them used to be written into `models_status` instead -- see
+    /// [`TAG_SECTIONS`] for what that cost -- and this is the whole of the
+    /// mapping back.
+    fn status_field(&self, tag: isize) -> &NSTextField {
+        let controls = &self.ivars().controls;
+        match section_of_tag(tag) {
+            Some(0) => &controls.general_status,
+            Some(2) => &controls.voice_status,
+            Some(3) => &controls.history_status,
+            // Providers, and the fallback for a tag no form claims: a new row
+            // is far more likely to be a Providers one than anything else, and
+            // this line is the only one on that card that is never hidden.
+            _ => &controls.provider_status,
+        }
+    }
+
     // ── Reading settings into the controls ────────────────
 
     /// Fill every control from the database. Called when the window is built
@@ -687,6 +792,9 @@ impl SettingsPage {
                 .unwrap_or_default(),
         );
         set_switch(&controls.format_enabled, settings.format_enabled());
+        if let Err(error) = self.apply_cleanup_capability() {
+            self.set_text(&controls.models_status, &error);
+        }
         self.set_combo(
             &controls.stt_model,
             &settings.stt_model().unwrap_or_default(),
@@ -755,24 +863,24 @@ impl SettingsPage {
     fn reload_microphones(&self) {
         let ivars = self.ivars();
         let controls = &ivars.controls;
+        // Same conflation the wizard had: `list_audio_devices` fails one way
+        // and comes back empty another, and `unwrap_or_default` flattens both
+        // into the same empty list. It is left flattened *here* on purpose --
+        // unlike the wizard's step, this row has no second line to tell the
+        // two apart on, and the popup itself can only say that there is
+        // nothing to pick. What it must not do is name something anyway.
         let devices = ivars.engine.list_audio_devices().unwrap_or_default();
+        // Keyed to the popup by position, first entry empty either way: an
+        // empty `microphone` row means "let the recorder pick".
         let mut ids = vec![String::new()];
         {
             controls.microphone.removeAllItems();
-            controls
-                .microphone
-                .addItemWithTitle(&NSString::from_str("System default"));
-            for device in &devices {
-                let title = if device.is_default {
-                    format!("{} (default)", device.name)
-                } else {
-                    device.name.clone()
-                };
+            for title in microphone_items(&devices) {
                 controls
                     .microphone
                     .addItemWithTitle(&NSString::from_str(&title));
-                ids.push(device.id.clone());
             }
+            ids.extend(devices.iter().map(|device| device.id.clone()));
         }
         let saved = ivars.engine.settings().microphone().unwrap_or_default();
         let index = ids.iter().position(|id| *id == saved).unwrap_or(0);
@@ -885,13 +993,16 @@ impl SettingsPage {
                 self.apply_local_only_gating();
                 written
             }
-            TAG_PROVIDER | TAG_PROVIDER_URL => settings.set(
-                "provider",
-                &join_provider(
-                    selected_value(&controls.provider, PROVIDERS),
-                    &string_value(&controls.provider_url),
-                ),
-            ),
+            TAG_PROVIDER | TAG_PROVIDER_URL => {
+                let written = settings.set(
+                    "provider",
+                    &join_provider(
+                        selected_value(&controls.provider, PROVIDERS),
+                        &string_value(&controls.provider_url),
+                    ),
+                );
+                written.and(self.apply_cleanup_capability())
+            }
             TAG_API_KEY => settings.set("api_key", string_value(&controls.api_key).trim()),
             TAG_SAME_PROVIDER => settings.set(
                 "same_provider",
@@ -941,7 +1052,7 @@ impl SettingsPage {
             _ => Ok(()),
         };
         if let Err(error) = result {
-            self.set_text(&controls.models_status, &error);
+            self.set_text(self.status_field(tag), &error);
         }
         // Cheap, and it depends on three different rows (the toggle and the two
         // provider endpoints), so it is re-evaluated after any of them.
@@ -962,6 +1073,54 @@ impl SettingsPage {
             .get(index)
             .unwrap_or(&openflow_core::runner::LOCAL_MODELS[0]);
         self.set_text(&controls.local_cost, model.cost);
+    }
+
+    /// Keep "Same for cleanup" away from a transcription provider that cannot
+    /// run the cleanup pass, and show why rather than failing later.
+    ///
+    /// Called from `reload` as well as on a change, so that a database written
+    /// before this existed is brought into the same shape as one written after
+    /// it. Without that, the cleanup row would go on displaying a provider the
+    /// engine does not use, because an unset `formatting_provider` reads back
+    /// as the transcription one.
+    ///
+    /// What this does not do is make a keyless install able to dictate. It
+    /// stops Deepgram being handed a pass it refuses; the pass then goes to the
+    /// row's own provider, and if that one has no key `format_text` fails there
+    /// instead. That is the same shape the wizard already lands in
+    /// (`onboarding.rs::save` writes `formatting_provider` from a list Deepgram
+    /// is filtered out of, and its first entry is Groq), and the reason it
+    /// costs the whole take rather than just the cleanup is one `?` in
+    /// `engine.rs`. That is a product decision and it is filed separately.
+    fn apply_cleanup_capability(&self) -> Result<(), String> {
+        let ivars = self.ivars();
+        let controls = &ivars.controls;
+        let settings = ivars.engine.settings();
+        let stored = settings.provider_name();
+        let serves = serves_cleanup(&split_provider(&stored).0);
+        controls.same_provider.setEnabled(serves);
+        if serves {
+            return Ok(());
+        }
+        store_transcription_provider(
+            settings,
+            &stored,
+            selected_value(&controls.formatting_provider, FORMATTING_PROVIDERS),
+            &string_value(&controls.formatting_url),
+        )?;
+        set_switch(&controls.same_provider, false);
+        let (cleanup, cleanup_url) = split_provider(
+            &settings
+                .formatting_provider_name()
+                .unwrap_or_else(|| settings.provider_name()),
+        );
+        select_value(
+            &controls.formatting_provider,
+            FORMATTING_PROVIDERS,
+            &cleanup,
+        );
+        self.set_text(&controls.formatting_url, &cleanup_url);
+        Ok(())
     }
 
     /// What "Local only" turns off.
@@ -1059,7 +1218,13 @@ impl SettingsPage {
             view.setString(&NSString::from_str(&text));
         }
         self.update_dictionary_count(text.chars().count());
-        let _ = ivars.engine.settings().set("dictionary", text.trim());
+        // Not `let _ =`: this is the one control on the page whose save was
+        // discarded outright, so a full disk or a locked database silently ate
+        // every term the user typed. The dictionary is on the Privacy card, and
+        // so is the line this reports into.
+        if let Err(error) = ivars.engine.settings().set("dictionary", text.trim()) {
+            self.set_text(self.status_field(TAG_DICTIONARY), &error);
+        }
     }
 
     fn update_dictionary_count(&self, used: usize) {
@@ -1108,7 +1273,14 @@ impl SettingsPage {
                 self.field_for(&action)
                     .setTitle(&NSString::from_str(&chord));
             }
-            Some(Err(error)) => self.set_text(&ivars.controls.models_status, &error),
+            Some(Err(error)) => {
+                let tag = if action == "record" {
+                    TAG_HOTKEY_RECORD
+                } else {
+                    TAG_HOTKEY_RECOPY
+                };
+                self.set_text(self.status_field(tag), &error);
+            }
             None => {}
         }
     }
@@ -1378,6 +1550,55 @@ pub fn join_provider(kind: &str, url: &str) -> String {
     }
 }
 
+/// Whether a provider offered for transcription can also run the cleanup pass.
+///
+/// The cleanup menu is the list that knows: Deepgram transcribes and has no
+/// chat endpoint, which is why it is missing from `FORMATTING_PROVIDERS`. Both
+/// of the ways the window can hand cleanup a provider go around that menu, so
+/// they have to ask the same question themselves.
+pub fn serves_cleanup(kind: &str) -> bool {
+    FORMATTING_PROVIDERS.iter().any(|(value, _)| *value == kind)
+}
+
+/// Store a transcription provider without leaving the cleanup pass pointed at
+/// one that refuses to run.
+///
+/// The wizard already handles this (`onboarding.rs`, following the web
+/// wizard's `src/App.tsx:934`): choosing Deepgram there switches "Same for
+/// cleanup" off. Settings wrote the provider string and nothing else, and both
+/// routes back to the cleanup provider then led to Deepgram -- `same_provider`
+/// because it hands the transcription provider straight over, and an unset
+/// `formatting_provider` because [`openflow_core::settings::Settings`] falls
+/// back to the transcription one. `transcribe::format_text` refuses Deepgram
+/// outright and the pipeline propagates that refusal, so the take was
+/// abandoned: not a cleanup that was skipped, but the transcribed text thrown
+/// away after the work of producing it.
+///
+/// `shown_cleanup` is what the cleanup row is displaying, so that repairing
+/// the stored value leaves the screen and the engine saying the same thing.
+pub fn store_transcription_provider(
+    settings: &Settings,
+    provider: &str,
+    shown_cleanup: &str,
+    shown_cleanup_url: &str,
+) -> Result<(), String> {
+    settings.set("provider", provider)?;
+    if serves_cleanup(&split_provider(provider).0) {
+        return Ok(());
+    }
+    settings.set("same_provider", bool_setting(false))?;
+    let cleanup_stands = settings
+        .formatting_provider_name()
+        .is_some_and(|stored| serves_cleanup(&split_provider(&stored).0));
+    if !cleanup_stands {
+        settings.set(
+            "formatting_provider",
+            &join_provider(shown_cleanup, shown_cleanup_url),
+        )?;
+    }
+    Ok(())
+}
+
 // ── Tab construction ──────────────────────────────────────
 
 #[allow(clippy::type_complexity)]
@@ -1449,7 +1670,7 @@ fn build_sections(
     form.add(&language);
 
     let (l, c) = form.row(ROW);
-    form.add(&label(mtm, "Live preview while recording", l));
+    form.add(&label(mtm, "Live preview", l));
     let live_preview = switch_control(mtm, switch_rect(c), TAG_LIVE_PREVIEW);
     form.add(&live_preview);
     form.note_row(
@@ -1479,6 +1700,10 @@ fn build_sections(
     login_status.setMaximumNumberOfLines(2);
     login_status.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
     form.add(&login_status);
+    let n = form.control_only(28.0);
+    let general_status = note(mtm, "", n);
+    allow_wrapping(&general_status, n.size.width);
+    form.add(&general_status);
     let general = form.fit();
 
     // Providers
@@ -1553,6 +1778,10 @@ fn build_sections(
         0,
     );
     form.add(&setup);
+    let n = form.control_only(28.0);
+    let provider_status = note(mtm, "", n);
+    allow_wrapping(&provider_status, n.size.width);
+    form.add(&provider_status);
     let providers = form.fit();
 
     // Voice
@@ -1616,10 +1845,7 @@ fn build_sections(
     );
     let stop = button(mtm, stop_frame, "Stop", 0);
     form.add(&stop);
-    let n = form.control_only(28.0);
-    let voice_status = note(mtm, "", n);
-    allow_wrapping(&voice_status, n.size.width);
-    form.add(&voice_status);
+    let voice_status = form.status_row(mtm, STATUS_LINES);
     let voice = form.fit();
 
     // Privacy
@@ -1632,12 +1858,10 @@ fn build_sections(
     let n = form.full(14.0);
     let dictionary_count = note(mtm, "0/800", n);
     form.add(&dictionary_count);
-    let n = form.full(28.0);
-    form.add(&note(
+    form.note_full(
         mtm,
         "Names and terms to spell correctly, comma separated. Sent to Whisper as a hint, and applied to every transcript afterwards. Write `heard -> Correct` to fix a mishearing.",
-        n,
-    ));
+    );
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Save history", l));
@@ -1657,10 +1881,7 @@ fn build_sections(
         0,
     );
     form.add(&clear);
-    let n = form.control_only(28.0);
-    let history_status = note(mtm, "", n);
-    allow_wrapping(&history_status, n.size.width);
-    form.add(&history_status);
+    let history_status = form.status_row(mtm, STATUS_LINES);
     let privacy = form.fit();
 
     let controls = Controls {
@@ -1677,6 +1898,7 @@ fn build_sections(
         live_preview,
         open_at_login,
         login_status,
+        general_status,
         backend,
         remote_box,
         local_box,
@@ -1699,6 +1921,7 @@ fn build_sections(
         stt_model,
         chat_model,
         models_status,
+        provider_status,
         tts_enabled,
         tts_provider,
         tts_url,
@@ -1766,6 +1989,28 @@ const FORM_SPACE: f64 = 2400.0;
 /// Settings keeps as its own window grows.
 const MAX_FORM_WIDTH: f64 = 430.0;
 
+/// The width the two-column form is built at inside a pane `pane` wide.
+///
+/// Extracted from the layout so the tests can ask the same question the window
+/// asks, rather than restating the arithmetic and drifting from it.
+fn form_width(pane: f64) -> f64 {
+    let available = (pane - MARGIN * 2.0).max(320.0);
+    (available - PADDING * 2.0).clamp(280.0, MAX_FORM_WIDTH)
+}
+
+/// The width a [`Form::status_row`] gets on this page at its narrowest.
+///
+/// The pane is the window minus the sidebar, and the window has a minimum, so
+/// this is a real floor rather than a hypothetical one: the status lines are
+/// never laid out in less room than this.
+#[cfg(test)]
+fn narrowest_status_width() -> f64 {
+    use crate::ui::main_window::{MIN_WIDTH, SIDEBAR_WIDTH};
+    use crate::ui::CONTROL_X;
+
+    form_width(MIN_WIDTH - SIDEBAR_WIDTH) - CONTROL_X
+}
+
 /// The column keeps its width and stays centred as the window grows, rather
 /// than stretching with it.
 const CENTRED_COLUMN: NSAutoresizingMaskOptions = NSAutoresizingMaskOptions(
@@ -1786,8 +2031,7 @@ fn build_page(
     Vec<NSRect>,
     Controls,
 ) {
-    let available = (size.width - MARGIN * 2.0).max(320.0);
-    let form_width = (available - PADDING * 2.0).clamp(280.0, MAX_FORM_WIDTH);
+    let form_width = form_width(size.width);
     let card_width = form_width + PADDING * 2.0;
     let card_x = ((size.width - card_width) / 2.0).max(MARGIN);
     let (forms, controls) = build_sections(mtm, form_width, FORM_SPACE);
@@ -1925,9 +2169,7 @@ fn build_remote_panel(
         TAG_FETCH_MODELS,
     );
     form.add(&fetch);
-    let n = form.control_only(28.0);
-    let models_status = note(mtm, "", n);
-    form.add(&models_status);
+    let models_status = form.status_row(mtm, STATUS_LINES);
 
     (
         form.view.clone(),
@@ -1959,9 +2201,11 @@ fn build_local_panel(
     Retained<objc2_app_kit::NSButton>,
 ) {
     let mut form = Form::new(mtm, width, BOX_HEIGHT);
-    let n = form.full(28.0);
-    let local_status = note(mtm, "", n);
-    form.add(&local_status);
+    // Two lines, not three: this panel already fills `BOX_HEIGHT` exactly, so
+    // there is nowhere to grow. What it was missing was not room but the cap --
+    // without one a runner message four times this wide drew as a single line
+    // and lost most of itself off the right edge.
+    let local_status = form.status_full(mtm, 2);
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Model", l));
@@ -2069,6 +2313,129 @@ fn titles(table: &'static [(&'static str, &'static str)]) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::wrapped_lines;
+
+    /// `NOTE_LINE` has to be what a line of note text actually measures, since
+    /// every status line's height is a multiple of it.
+    #[test]
+    fn note_line_is_the_height_of_one_line_of_note_text() {
+        assert_eq!(
+            wrapped_lines("Ag", narrowest_status_width()),
+            1,
+            "a short note is one line, or NOTE_LINE disagrees with the font"
+        );
+    }
+
+    /// The message that tells the user how to fix a missing voice key is
+    /// written in `openflow-core`, and drawn here in a column `openflow-core`
+    /// knows nothing about. Ask the real function for it rather than keeping a
+    /// copy: a sentence lengthened over there is the way this regresses.
+    ///
+    /// It was three lines in a box that had two. The line that fell off the
+    /// bottom was the one naming the way out ("or point the speech endpoint at
+    /// a self-hosted server"), and nothing marked it as missing.
+    #[test]
+    fn the_speech_key_messages_fit_the_status_line() {
+        let width = narrowest_status_width();
+        for same_endpoint in [true, false] {
+            let message = openflow_core::speech::resolve_speech_key(
+                &openflow_core::transcribe::Provider::Groq,
+                None,
+                None,
+                same_endpoint,
+            )
+            .expect_err("no key anywhere is an error, and the error is the message");
+            let lines = wrapped_lines(&message, width);
+            assert!(
+                lines <= STATUS_LINES,
+                "{lines} lines in {width}pt, but the status line reserves {STATUS_LINES}: {message:?}"
+            );
+        }
+    }
+
+    /// Every message this page writes into the voice status line, read out of
+    /// this file rather than listed again here, so one added tomorrow is
+    /// measured tomorrow.
+    #[test]
+    fn every_voice_status_message_this_page_writes_fits() {
+        let width = narrowest_status_width();
+        let messages = status_literals(include_str!("settings.rs"));
+        assert!(
+            messages.len() >= 3,
+            "the scan found {} messages, so it has stopped matching the call sites",
+            messages.len()
+        );
+        for message in messages {
+            let lines = wrapped_lines(message, width);
+            assert!(
+                lines <= STATUS_LINES,
+                "{lines} lines in {width}pt, but the status line reserves {STATUS_LINES}: {message:?}"
+            );
+        }
+    }
+
+    /// Pull the string literals handed to `set_voice_status` out of the source.
+    ///
+    /// A call whose argument is not a literal (the one that forwards an error
+    /// from the speech stream) has nothing to measure and is skipped; that one
+    /// is covered by the cap instead.
+    fn status_literals(source: &str) -> Vec<&str> {
+        // Written split so this needle does not match itself in the scan.
+        let needle: &str = concat!("set_voice_status", "(");
+        source
+            .match_indices(needle)
+            .filter_map(|(at, _)| {
+                let rest = source[at + needle.len()..].trim_start();
+                let rest = rest.strip_prefix('"')?;
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect()
+    }
+
+    /// Pull every row label out of this file's own source.
+    ///
+    /// Reading the source rather than a table is deliberate. A table would be a
+    /// second place to remember, and the labels are written inline beside the
+    /// control they name, which is where they read best. This way a label added
+    /// tomorrow is measured tomorrow without anyone opting it in.
+    fn row_labels(source: &str) -> Vec<&str> {
+        // Written split so this needle does not match itself in the scan.
+        let needle: &str = concat!("label(mtm,", " \"");
+        source
+            .match_indices(needle)
+            .filter_map(|(at, _)| {
+                let rest = &source[at + needle.len()..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect()
+    }
+
+    /// Every label has to fit the column it is drawn in.
+    ///
+    /// `LABEL_WIDTH` is a hard edge, not a hint: the control column starts at
+    /// `CONTROL_X` and the controls fill it, so a label wider than the column is
+    /// drawn underneath the control beside it. "Live preview while recording"
+    /// was 148.8pt in a 132pt column and shipped that way, because nothing in
+    /// the code says how wide a string is -- it took a screenshot of the built
+    /// app to see it.
+    #[test]
+    fn every_row_label_fits_its_column() {
+        let labels = row_labels(include_str!("settings.rs"));
+        assert!(
+            labels.len() > 25,
+            "found only {} labels, so the scan is what broke, not the layout",
+            labels.len()
+        );
+        let column = crate::ui::LABEL_WIDTH;
+        for text in labels {
+            let width = crate::ui::metrics::label_width(text);
+            assert!(
+                width <= column,
+                "the label {text:?} renders {width:.1}pt wide in a {column}pt column; \
+                 shorten it, or widen LABEL_WIDTH and narrow all the other rows to match"
+            );
+        }
+    }
 
     /// The provider setting packs a kind and a URL into one string. Both halves
     /// have to survive a round trip, or a custom endpoint silently becomes Groq
@@ -2223,6 +2590,211 @@ mod tests {
         assert_eq!(human_bytes(2_792_422_202), "2.6 GB");
         assert_eq!(human_bytes(142_442_496), "136 MB");
         assert_eq!(human_bytes(0), "0 MB");
+    }
+
+    /// A `Settings` over a database of its own, so a test can write the rows
+    /// the window writes and read back the value the engine would read.
+    fn temp_settings() -> (Settings, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("openflow-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = openflow_core::db::Database::new(dir.clone()).expect("database");
+        let settings = Settings::new(db, openflow_core::secrets::SecretStore::new(dir.clone()));
+        (settings, dir)
+    }
+
+    /// Which provider `Engine::run_pipeline_inner` will hand `format_text`,
+    /// spelled the same way it spells it: the transcription provider while
+    /// "Same for cleanup" is on, and otherwise the cleanup row, which falls
+    /// back to the transcription provider when it has never been set.
+    fn cleanup_provider(settings: &Settings) -> String {
+        if settings.same_provider() {
+            settings.provider_name()
+        } else {
+            settings
+                .formatting_provider_name()
+                .unwrap_or_else(|| settings.provider_name())
+        }
+    }
+
+    /// Every provider this tab offers for transcription, stored the way the tab
+    /// stores it, has to leave the cleanup pass pointed at a provider that will
+    /// actually run it.
+    ///
+    /// Deepgram did not. `transcribe::format_text` refuses it outright and the
+    /// pipeline propagates that refusal, so the cost was not a cleanup that got
+    /// skipped -- it was the whole take abandoned and the transcribed text
+    /// dropped, on every dictation, until the user found the setting again.
+    /// The wizard has refused this since `src/App.tsx:934`; this tab did not.
+    #[test]
+    fn no_transcription_provider_leaves_cleanup_pointed_at_one_that_refuses_it() {
+        for (kind, _) in PROVIDERS {
+            let (settings, dir) = temp_settings();
+            let stored = join_provider(kind, "http://192.168.100.203:8881/v1");
+            store_transcription_provider(&settings, &stored, FORMATTING_PROVIDERS[0].0, "")
+                .expect("store");
+            let cleanup = cleanup_provider(&settings);
+            let survived = serves_cleanup(&split_provider(&cleanup).0);
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                survived,
+                "choosing {kind} for transcription left the cleanup pass on {cleanup}"
+            );
+        }
+    }
+
+    /// A save failure has to be shown on the card the control is on.
+    ///
+    /// The regression this pins: every failure went into `models_status`, the
+    /// line beside Fetch models on the Providers card. Turning off Save history
+    /// on the Privacy card and having the write fail put the reason 1133pt
+    /// further up the column -- close to two screenfuls in the 580pt window --
+    /// and with "On this Mac" selected it went into `remote_box`, which is
+    /// hidden then, so nothing appeared anywhere.
+    #[test]
+    fn a_failed_save_is_reported_on_the_card_its_control_is_on() {
+        let general = section_index("General").unwrap();
+        let providers = section_index("Providers").unwrap();
+        let voice = section_index("Voice").unwrap();
+        let privacy = section_index("Privacy").unwrap();
+
+        for tag in [
+            TAG_MICROPHONE,
+            TAG_HOTKEY_RECORD,
+            TAG_HOTKEY_RECOPY,
+            TAG_INSERT_METHOD,
+            TAG_PRESERVE_CLIPBOARD,
+            TAG_OVERLAY_ONLY,
+            TAG_OVERLAY_POSITION,
+            TAG_THEME,
+            TAG_LANGUAGE,
+            TAG_LIVE_PREVIEW,
+        ] {
+            assert_eq!(
+                section_of_tag(tag),
+                Some(general),
+                "tag {tag} is on General"
+            );
+        }
+        for tag in [
+            TAG_BACKEND,
+            TAG_LOCAL_MODEL,
+            TAG_LOCAL_IDLE,
+            TAG_LOCAL_ONLY,
+            TAG_PROVIDER,
+            TAG_PROVIDER_URL,
+            TAG_API_KEY,
+            TAG_STT_MODEL,
+            TAG_SAME_PROVIDER,
+            TAG_FORMATTING_PROVIDER,
+            TAG_FORMATTING_URL,
+            TAG_FORMATTING_KEY,
+            TAG_FORMAT_ENABLED,
+            TAG_CHAT_MODEL,
+            TAG_FETCH_MODELS,
+        ] {
+            assert_eq!(
+                section_of_tag(tag),
+                Some(providers),
+                "tag {tag} is on Providers"
+            );
+        }
+        for tag in [
+            TAG_TTS_ENABLED,
+            TAG_TTS_PROVIDER,
+            TAG_TTS_URL,
+            TAG_TTS_KEY,
+            TAG_TTS_MODEL,
+            TAG_TTS_VOICE,
+            TAG_TTS_FORMAT,
+        ] {
+            assert_eq!(section_of_tag(tag), Some(voice), "tag {tag} is on Voice");
+        }
+        for tag in [TAG_DICTIONARY, TAG_SAVE_HISTORY, TAG_RETENTION] {
+            assert_eq!(
+                section_of_tag(tag),
+                Some(privacy),
+                "tag {tag} is on Privacy"
+            );
+        }
+    }
+
+    /// The repair points the cleanup pass somewhere it can run; it does not get
+    /// to overrule a provider the user picked for it.
+    #[test]
+    fn repairing_the_cleanup_provider_leaves_a_working_choice_alone() {
+        let (settings, dir) = temp_settings();
+        settings.set("formatting_provider", "openai").expect("set");
+        store_transcription_provider(&settings, "deepgram", "groq", "").expect("store");
+        let chosen = settings.formatting_provider_name();
+        let same = settings.same_provider();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(chosen.as_deref(), Some("openai"));
+        assert!(
+            !same,
+            "the toggle that hands Deepgram the cleanup pass is off"
+        );
+    }
+
+    /// Every control the window can fail to save has to be in the table, and in
+    /// exactly one group. A tag left out falls back to the Providers card,
+    /// which is the bug this file just stopped having -- so the omission has to
+    /// be caught here rather than on screen.
+    #[test]
+    fn every_control_that_saves_has_a_card() {
+        // The tags `write` matches on, plus the two that save outside it: the
+        // shortcut buttons go through `finish_recording_hotkey` and the
+        // dictionary through `write_dictionary`.
+        let writes = [
+            TAG_MICROPHONE,
+            TAG_HOTKEY_RECORD,
+            TAG_HOTKEY_RECOPY,
+            TAG_INSERT_METHOD,
+            TAG_PRESERVE_CLIPBOARD,
+            TAG_OVERLAY_ONLY,
+            TAG_OVERLAY_POSITION,
+            TAG_THEME,
+            TAG_LANGUAGE,
+            TAG_LIVE_PREVIEW,
+            TAG_BACKEND,
+            TAG_LOCAL_MODEL,
+            TAG_LOCAL_IDLE,
+            TAG_LOCAL_ONLY,
+            TAG_PROVIDER,
+            TAG_PROVIDER_URL,
+            TAG_API_KEY,
+            TAG_STT_MODEL,
+            TAG_SAME_PROVIDER,
+            TAG_FORMATTING_PROVIDER,
+            TAG_FORMATTING_URL,
+            TAG_FORMATTING_KEY,
+            TAG_FORMAT_ENABLED,
+            TAG_CHAT_MODEL,
+            TAG_TTS_ENABLED,
+            TAG_TTS_PROVIDER,
+            TAG_TTS_URL,
+            TAG_TTS_KEY,
+            TAG_TTS_MODEL,
+            TAG_TTS_VOICE,
+            TAG_TTS_FORMAT,
+            TAG_DICTIONARY,
+            TAG_SAVE_HISTORY,
+            TAG_RETENTION,
+        ];
+        for tag in writes {
+            assert!(
+                section_of_tag(tag).is_some(),
+                "tag {tag} saves but no card claims it, so its failure would be \
+                 reported on the Providers card"
+            );
+        }
+        let listed: Vec<isize> = TAG_SECTIONS.concat();
+        for tag in &listed {
+            assert_eq!(
+                listed.iter().filter(|other| *other == tag).count(),
+                1,
+                "tag {tag} is claimed by two cards"
+            );
+        }
     }
 
     /// The two boolean spellings the settings table understands.

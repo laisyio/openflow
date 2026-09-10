@@ -68,6 +68,22 @@ fi
 DMG_NAME="OpenFlow_${VERSION}_${ARCH}.dmg"
 DMG_PATH="$ROOT/target/$DMG_NAME"
 
+# Everything the bundle carries that comes out of the repository, as
+# `<path from the repo root>|<path under Contents>`. The executable is not in
+# here: it is built rather than copied, and it is the one file whose absence
+# already stops the script.
+#
+# One table, read twice -- by the copy loop below and by --print-payload -- so
+# a resource that stops being copied also stops being reported, and
+# crates/openflow-native/tests/bundle_payload.rs notices. Nothing else does:
+# `LocalRunner::script_path` falls back to an absolute path into the source
+# tree of the machine that compiled the binary, so a bundle assembled without
+# runner.py runs correctly for whoever built it and fails for everyone else.
+PAYLOAD=(
+  "src-tauri/icons/icon.icns|Resources/icon.icns"
+  "crates/openflow-native/runner/runner.py|Resources/runner/runner.py"
+)
+
 BUILD=1
 DMG=0
 for argument in "$@"; do
@@ -78,6 +94,10 @@ for argument in "$@"; do
       echo "version=$VERSION"
       echo "arch=$ARCH"
       echo "dmg=$DMG_NAME"
+      exit 0
+      ;;
+    --print-payload)
+      printf '%s\n' "${PAYLOAD[@]}"
       exit 0
       ;;
     *) echo "Unknown option: $argument" >&2; exit 2 ;;
@@ -104,17 +124,30 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # The bundle executable keeps the plain name; only the cargo target is suffixed.
 cp "$BINARY" "$APP/Contents/MacOS/openflow"
-cp "$ROOT/src-tauri/icons/icon.icns" "$APP/Contents/Resources/icon.icns"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-# The local transcription sidecar. `LocalRunner::script_path` looks here first,
-# relative to the executable, and falls back to the source tree for a `cargo
-# run`. The virtualenv it runs under is *not* here: a venv hard-codes its own
-# absolute path, so one inside the bundle would break the first time the app
-# moved and be thrown away by every update. It lives beside the database in the
-# app's data directory instead.
-mkdir -p "$APP/Contents/Resources/runner"
-cp "$ROOT/crates/openflow-native/runner/runner.py" "$APP/Contents/Resources/runner/runner.py"
+# The payload, including the local transcription sidecar:
+# `LocalRunner::script_path` looks for it under Resources relative to the
+# executable, and falls back to the source tree for a `cargo run`. The
+# virtualenv it runs under is *not* here: a venv hard-codes its own absolute
+# path, so one inside the bundle would break the first time the app moved and
+# be thrown away by every update. It lives beside the database in the app's
+# data directory instead.
+#
+# A missing source stops the script rather than producing a bundle with a hole
+# in it, which is the shape this failure has always taken: `cp` of a path that
+# does not exist is the one error `set -e` would have caught, and a payload
+# entry silently deleted is the one it would not.
+for entry in "${PAYLOAD[@]}"; do
+  from="$ROOT/${entry%%|*}"
+  to="$APP/Contents/${entry##*|}"
+  if [ ! -f "$from" ]; then
+    echo "Missing bundle payload: $from" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$to")"
+  cp "$from" "$to"
+done
 
 # Info.plist: the usage strings and LSUIElement come from src-tauri/Info.plist,
 # which Tauri merges into its own bundle, so the two builds ask for the same
