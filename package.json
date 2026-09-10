@@ -15,6 +15,7 @@
   "packageManager": "npm@10.9.8",
   "type": "module",
   "scripts": {
+    "test": "tsc -p tsconfig.tests.json && node --test .test-dist/tests/*.test.mjs",
     "dev": "vite",
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && vite build",

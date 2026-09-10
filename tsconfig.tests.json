@@ -1,0 +1,8 @@
+{
+  "compilerOptions": {
+    "target": "ES2022", "module": "NodeNext", "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM"], "strict": true, "skipLibCheck": true,
+    "allowJs": true, "checkJs": false, "outDir": ".test-dist"
+  },
+  "include": ["src/ttsPlayback.ts", "tests/*.mjs"]
+}
