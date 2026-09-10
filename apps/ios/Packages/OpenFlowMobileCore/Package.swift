@@ -6,9 +6,10 @@ import PackageDescription
 // dependencies at all, so it builds and tests with the Command Line Tools alone
 // (no Xcode, no Metal toolchain) on the macOS host as well as on iOS.
 //
-// The engine packages (OpenFlowQwenEngine, OpenFlowWhisperEngine) are NOT listed
-// here on purpose: they need MLX Swift / WhisperKit and the Metal toolchain, and
-// making them dependencies would take `swift test` away from the CLT gate.
+// The engine package (OpenFlowMoonshineEngine) is NOT listed here on purpose:
+// the dependency runs the other way. The engine depends on this package for the
+// `SpeechEngine` seam it implements, and this package stays dependency-free so
+// the brain builds and tests even where the engine's binary target cannot.
 let package = Package(
     name: "OpenFlowMobileCore",
     platforms: [

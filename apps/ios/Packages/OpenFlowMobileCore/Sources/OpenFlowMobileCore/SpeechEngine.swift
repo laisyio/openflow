@@ -24,8 +24,14 @@ public enum SpeechEngineError: Error, Equatable, Sendable {
     case noSpeechRecognised
     /// Recognition failed outright.
     case transcriptionFailed(String)
-    /// The only accelerator we accept was unavailable. PLAN.md section 5: never
-    /// fall back to CPU silently, fail loudly instead.
+    /// The only accelerator we accept was unavailable.
+    ///
+    /// Unused by the Moonshine engine, and kept deliberately. The rule it came
+    /// from -- never fall back to CPU silently -- was written for a GPU engine;
+    /// Moonshine is CPU-native by design, so there is no accelerator for it to
+    /// lose (`M2-MOONSHINE.md`, "Why Moonshine"). An engine that does need one,
+    /// such as the Qwen accurate option when it returns, throws this rather than
+    /// quietly running somewhere it was never measured.
     case acceleratorUnavailable(String)
 }
 
@@ -33,13 +39,15 @@ public enum SpeechEngineError: Error, Equatable, Sendable {
 ///
 /// Declared as an `Actor` protocol so an implementation gets its state isolation
 /// for free and `ModelManager` can drive it from its own actor without any lock.
-/// Milestone M2 fills this in twice: MLX Swift Qwen3-ASR-0.6B and WhisperKit.
+/// Milestone M2 fills it in once, with `MoonshineSpeechEngine`.
 public protocol SpeechEngine: Actor {
-    /// A short identifier for the diagnostics screen, e.g. "qwen3-asr-0.6b-8bit".
+    /// A short identifier for the diagnostics screen, e.g. "moonshine-base-en".
     nonisolated var identifier: String { get }
 
     /// Bytes the weights occupy right now. Zero when unloaded. Surfaced in
-    /// Settings so the 1 GB cost from PLAN.md section 0 is visible, not implied.
+    /// Settings so the memory cost from PLAN.md section 0 is visible, not
+    /// implied. An engine that can measure this should measure it rather than
+    /// return the size of the weights on disk.
     var residentBytes: Int { get }
 
     /// Bring the weights into memory. Must be idempotent: calling it while
@@ -57,13 +65,19 @@ public protocol SpeechEngine: Actor {
     /// is executing and runs when the actor is next free.
     ///
     /// That is only a guarantee for an implementation that does its work in one
-    /// unbroken stretch. An engine that suspends *inside* `transcribe` -- which
-    /// M2's MLX engine will, awaiting GPU work between decoder steps -- gives
-    /// this call a window to run in the middle of a recognition. Such an engine
-    /// must either hold the weights alive for the take in progress and free them
-    /// when it finishes, or cancel that take and throw
-    /// `SpeechEngineError.transcriptionFailed`. Freeing memory out from under a
-    /// suspended `transcribe` is a crash, not an optimisation.
+    /// unbroken stretch. `MoonshineSpeechEngine` is that kind: its recognition
+    /// is a single synchronous call into a C++ library
+    /// (`transcribeWithoutStreaming`) with no suspension point inside it, so an
+    /// unload arriving mid-take is queued behind the take and runs after it, and
+    /// the engine needs no defence of its own.
+    ///
+    /// An engine that suspends *inside* `transcribe` -- awaiting GPU work
+    /// between decoder steps, say -- gives this call a window to run in the
+    /// middle of a recognition. Such an engine must either hold the weights
+    /// alive for the take in progress and free them when it finishes, or cancel
+    /// that take and throw `SpeechEngineError.transcriptionFailed`. Freeing
+    /// memory out from under a suspended `transcribe` is a crash, not an
+    /// optimisation.
     func unload() async
 
     /// Recognise 16 kHz mono Float32 samples in [-1, 1].

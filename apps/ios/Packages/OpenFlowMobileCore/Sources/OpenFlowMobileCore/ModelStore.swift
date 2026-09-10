@@ -3,10 +3,14 @@ import CryptoKit
 
 /// Where the weights live on disk, and the proof they are the ones we pinned.
 ///
-/// PLAN.md section 5: about 700 MB, never bundled, under Application Support with
-/// `isExcludedFromBackup = true` -- iCloud should not carry a gigabyte of model
-/// weights that a re-download reproduces exactly -- and checked with SHA-256
-/// against a value compiled into the app.
+/// PLAN.md section 5: 141 MB for base-en and 44 MB for tiny-en, three files each,
+/// never bundled, under Application Support with `isExcludedFromBackup = true`
+/// -- iCloud should not carry a model a re-download reproduces exactly -- and
+/// every file checked with SHA-256 against a value compiled into the app.
+///
+/// One store is one directory. A model that is a set of files lives in its own
+/// subdirectory, reached with `subdirectory(_:)`, so base-en and tiny-en can both
+/// be installed without their same-named files colliding.
 public struct ModelStore: Sendable {
     public enum StoreError: Error, Equatable, Sendable {
         case directoryUnavailable(String)
@@ -22,13 +26,24 @@ public struct ModelStore: Sendable {
     }
 
     /// `Application Support/Models`. Application Support and not Caches: the
-    /// system may purge Caches at any time, and re-downloading 700 MB because
+    /// system may purge Caches at any time, and re-downloading 141 MB because
     /// the phone wanted disk space is not a trade we want to make silently.
     public static func applicationSupport() throws -> ModelStore {
         guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             throw StoreError.directoryUnavailable("No Application Support directory")
         }
         return ModelStore(directory: base.appendingPathComponent("OpenFlow/Models", isDirectory: true))
+    }
+
+    /// A store rooted at a subdirectory of this one. The path is relative and is
+    /// created by `prepare()` along with everything above it, so callers do not
+    /// have to make the intermediate directories themselves.
+    ///
+    /// Only the top of the tree carries the exclude-from-backup flag, which is
+    /// how the flag works: it is inherited by everything underneath, and setting
+    /// it again on each engine's directory would be noise.
+    public func subdirectory(_ relativePath: String) -> ModelStore {
+        ModelStore(directory: directory.appendingPathComponent(relativePath, isDirectory: true))
     }
 
     public func url(for name: String) -> URL {
@@ -59,8 +74,9 @@ public struct ModelStore: Sendable {
         (try? directory.resourceValues(forKeys: [.isExcludedFromBackupKey]))?.isExcludedFromBackup ?? false
     }
 
-    /// Streaming SHA-256. Chunked because the file is about 700 MB and reading it
-    /// into memory to hash it would undo the whole point of the memory budget.
+    /// Streaming SHA-256. Chunked because the largest of these files is 109 MB
+    /// and reading it into memory to hash it would undo the whole point of the
+    /// memory budget.
     public static func sha256Hex(ofFileAt url: URL, chunkBytes: Int = 1 << 20) throws -> String {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
             throw StoreError.fileMissing(url.lastPathComponent)
@@ -89,6 +105,17 @@ public struct ModelStore: Sendable {
         let target = url(for: name)
         if FileManager.default.fileExists(atPath: target.path) {
             try FileManager.default.removeItem(at: target)
+        }
+    }
+
+    /// Delete the whole directory this store is rooted at.
+    ///
+    /// What a half-installed model set is cleaned up with: a model is three
+    /// files, and two of them verified is not a model, so the directory goes
+    /// rather than being left for the next launch to mistake for an install.
+    public func removeAll() throws {
+        if FileManager.default.fileExists(atPath: directory.path) {
+            try FileManager.default.removeItem(at: directory)
         }
     }
 
