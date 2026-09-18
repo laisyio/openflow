@@ -35,12 +35,98 @@ public enum SilenceGate {
     public static func speechLevel(_ samples: [Float]) -> Float {
         guard !samples.isEmpty else { return 0 }
         var magnitudes = samples.map { abs($0) }
-        magnitudes.sort()
-        // Rust: ((len as f32 * 0.95) as usize).min(len - 1) -- truncating, not
-        // rounding. Float32 arithmetic is used deliberately so the index matches.
+        return percentile(ofMagnitudes: &magnitudes)
+    }
+
+    /// The same measurement, over a buffer the caller owns and reuses.
+    ///
+    /// The capture tap asks for this once per block while stop-on-silence is
+    /// armed, so the magnitudes buffer is the caller's to keep: emptying it
+    /// with `keepingCapacity` and refilling it allocates nothing after the
+    /// first block, where `speechLevel(_:)` allocates a fresh copy every time.
+    /// `scratch` is left holding those magnitudes, in no useful order.
+    public static func speechLevel(of samples: [Float], scratch: inout [Float]) -> Float {
+        scratch.removeAll(keepingCapacity: true)
+        guard !samples.isEmpty else { return 0 }
+        scratch.reserveCapacity(samples.count)
+        for sample in samples { scratch.append(abs(sample)) }
+        return percentile(ofMagnitudes: &scratch)
+    }
+
+    /// The 95th-percentile index rule, applied to a buffer this is free to
+    /// reorder. Rust: `((len as f32 * 0.95) as usize).min(len - 1)` -- truncating,
+    /// not rounding. Float32 arithmetic is used deliberately so the index matches.
+    private static func percentile(ofMagnitudes magnitudes: inout [Float]) -> Float {
         let scaled = Float(magnitudes.count) * 0.95
         let index = min(Int(scaled), magnitudes.count - 1)
-        return magnitudes[index]
+        return selectNth(&magnitudes, index)
+    }
+
+    /// The element that would sit at `index` if `values` were sorted, found
+    /// without sorting it.
+    ///
+    /// A selection, not a sort, for the reason audio.rs gives for
+    /// `select_nth_unstable_by`: O(n) instead of O(n log n) over a copy that is
+    /// tens of megabytes for the longest take, on a path the user is waiting on.
+    /// On the phone it also runs per block on the audio thread, where the sort
+    /// was the largest thing happening between two microphone callbacks.
+    ///
+    /// The partition is three-way, which is what makes the adversarial inputs
+    /// cheap rather than quadratic: an all-equal block, a block that is already
+    /// sorted, and a block of two distinct values all finish in one pass each,
+    /// and every one of them is a real capture (a muted input, a fade, a square
+    /// wave). `values` is left partitioned around the answer, not sorted.
+    static func selectNth(_ values: inout [Float], _ index: Int) -> Float {
+        guard !values.isEmpty else { return 0 }
+        let target = min(max(index, 0), values.count - 1)
+        return values.withUnsafeMutableBufferPointer { buffer -> Float in
+            var low = 0
+            var high = buffer.count - 1
+            while low < high {
+                // Median of the two ends and the middle: cheap, and it is what
+                // keeps an already-sorted block off the quadratic path.
+                let middle = low + (high - low) / 2
+                let pivot = medianOfThree(buffer[low], buffer[middle], buffer[high])
+
+                var less = low
+                var scan = low
+                var greater = high
+                while scan <= greater {
+                    let value = buffer[scan]
+                    if value < pivot {
+                        buffer.swapAt(less, scan)
+                        less += 1
+                        scan += 1
+                    } else if value > pivot {
+                        buffer.swapAt(scan, greater)
+                        greater -= 1
+                    } else {
+                        // Equal to the pivot, and so is anything NaN: Rust's
+                        // comparator falls back to `Ordering::Equal` for those
+                        // too, so neither implementation lets one loop forever.
+                        scan += 1
+                    }
+                }
+
+                if target < less {
+                    high = less - 1
+                } else if target > greater {
+                    low = greater + 1
+                } else {
+                    return pivot
+                }
+            }
+            return buffer[low]
+        }
+    }
+
+    private static func medianOfThree(_ a: Float, _ b: Float, _ c: Float) -> Float {
+        if a < b {
+            if b < c { return b }
+            return a < c ? c : a
+        }
+        if a < c { return a }
+        return b < c ? c : b
     }
 
     /// A take whose loud part sits under -60 dBFS carried no voice.
@@ -64,8 +150,11 @@ public enum SilenceGate {
     }
 
     /// The desktop refuses to upload a dead take rather than let Whisper
-    /// hallucinate over it. On the phone there is no upload, but the same take
-    /// would make Qwen invent a sentence, so the sheet says so instead.
+    /// hallucinate over it. On the phone there is no upload, and Moonshine
+    /// answers silence with nothing rather than an invented sentence, which the
+    /// engine turns into `noSpeechRecognised`. The gate still runs first,
+    /// because "no sound reached OpenFlow from this microphone" tells the user
+    /// what to fix and "nothing was recognised" does not.
     public static func rejectionMessage(deviceName: String) -> String {
         "No sound reached OpenFlow from \"\(deviceName)\". Check the microphone permission in Settings."
     }

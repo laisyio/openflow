@@ -83,7 +83,14 @@ public struct TranscriptStore: Sendable {
         try data.write(to: lastURL, options: [.atomic])
     }
 
-    public func loadLast() -> TranscriptRecord? {
+    /// The newest take, at the cost of one small file.
+    ///
+    /// This is the read path for everything that wants the last transcript and
+    /// not the list: the keyboard, which inserts it, and the app, which shows it
+    /// at the top of History after a delivery. `last.json` holds exactly one
+    /// record, so it costs the same whether the history behind it is one take or
+    /// a month of them, and `history.json` is never opened.
+    public func lastEntry() -> TranscriptRecord? {
         if case .record(let record) = readLast() { return record }
         return nil
     }
@@ -102,7 +109,7 @@ public struct TranscriptStore: Sendable {
     }
 
     /// Distinguishes "nothing saved" from "not allowed to look", which
-    /// `loadLast()` collapses into nil.
+    /// `lastEntry()` collapses into nil.
     public func readLast() -> LastTranscript {
         do {
             let data = try Data(contentsOf: lastURL)
@@ -145,6 +152,18 @@ public struct TranscriptStore: Sendable {
 
     // MARK: - History
 
+    /// The most records `history.json` is ever allowed to hold.
+    ///
+    /// The retention setting bounds the file in days, which is not a bound on
+    /// its size: thirty days of somebody who dictates all day is however many
+    /// takes that is, and every append decodes the lot and writes it back. A
+    /// cap turns that into a ceiling somebody can reason about, and five hundred
+    /// records is already more than the History list is usable at.
+    ///
+    /// The cap keeps the newest records, which is the same end retention keeps
+    /// and the same end the ring keeps: what falls off is always the oldest.
+    public static let maxEntries = 500
+
     public func loadHistory() -> [TranscriptRecord] {
         guard let data = try? Data(contentsOf: historyURL) else { return [] }
         return (try? Self.decoder.decode([TranscriptRecord].self, from: data)) ?? []
@@ -152,6 +171,11 @@ public struct TranscriptStore: Sendable {
 
     /// Append and prune in one write. `retentionDays` comes from settings;
     /// `now` is injected so retention is testable without waiting 30 days.
+    ///
+    /// This still decodes the file it is about to rewrite, which is the price of
+    /// pruning by date, but `maxEntries` is what stops that decode growing
+    /// without limit: past the cap the file stays the same size no matter how
+    /// long the user keeps dictating.
     @discardableResult
     public func append(_ record: TranscriptRecord, retentionDays: Int, now: Date = Date()) throws -> [TranscriptRecord] {
         try ensureDirectory()
@@ -188,9 +212,11 @@ public struct TranscriptStore: Sendable {
     static func pruned(_ history: [TranscriptRecord], retentionDays: Int, now: Date) -> [TranscriptRecord] {
         guard retentionDays > 0 else { return [] }
         let cutoff = now.addingTimeInterval(-Double(retentionDays) * 86_400)
-        return history
+        let kept = history
             .filter { $0.createdAt >= cutoff }
             .sorted { $0.createdAt < $1.createdAt }
+        guard kept.count > maxEntries else { return kept }
+        return Array(kept.suffix(maxEntries))
     }
 
     private func writeHistory(_ records: [TranscriptRecord]) throws {

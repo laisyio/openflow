@@ -5,9 +5,11 @@ analytics, no third-party SDK. The only network request it can make is the
 one-time model download, and that lives in one file so you can check the claim
 rather than believe it.
 
-This directory is Milestone M1 of `docs/mobile/PLAN.md`: the core package with
-its tests, the four targets with real Swift in them, and an XcodeGen spec that
-generates a project. There is no speech engine yet -- M2 adds that.
+This directory is Milestones M1 and M2 of `docs/mobile/PLAN.md`: the core package
+with its tests, the four targets with real Swift in them, an XcodeGen spec that
+generates a project, and the recogniser. The engine is Moonshine, base-en by
+default and tiny-en for older phones, on the CPU where it was measured; the
+decision and the numbers behind it are in `docs/mobile/M2-MOONSHINE.md`.
 
 ## What iOS lets us build, and what it does not
 
@@ -21,10 +23,12 @@ around them with tricks that get apps rejected:
 2. **Keyboard extensions cannot use the microphone**, and live under a memory cap
    measured in tens of megabytes. The model can never run inside the keyboard.
    The keyboard is a one-key "insert my last dictation" surface and nothing more.
-3. **Background execution does not keep a 1 GB model resident.** A suspended app
-   holding that much memory is the first thing jetsam kills. So "runs in the
+3. **Background execution does not keep a large model resident for free.** A
+   suspended app holding hundreds of megabytes is high on jetsam's list, and at
+   the 1 GB the original Qwen plan needed it was first. So "runs in the
    background" means the app loads the model on demand, fast, and drops it when
-   the system asks, without losing the user's text.
+   the system asks, without losing the user's text. Moonshine is what makes that
+   cheap: the reload it causes costs about half a second, not three.
 
 The resulting interaction: trigger from the Action Button, Back Tap, a Control
 Center control, a Lock Screen widget or the app icon; a small capture sheet
@@ -43,8 +47,7 @@ apps/ios/
   OpenFlowWidgets/            Live Activity + ControlWidget
   Packages/
     OpenFlowMobileCore/       the brain: state machine, audio maths, stores
-    OpenFlowQwenEngine/       M2, MLX Swift. Stub; not in the CLT gate
-    OpenFlowWhisperEngine/    M2, WhisperKit. Stub; not in the CLT gate
+    OpenFlowMoonshineEngine/  the recogniser, on the pinned moonshine-swift
 ```
 
 ## Build and run
@@ -74,26 +77,35 @@ their own. If a generate ever wipes them, that is why.
 
 The Debug configuration defines `OPENFLOW_FAKE_ENGINE`, which swaps in
 `FakeEngine`: it loads instantly, returns a canned line, and reports a simulated
-1 GB resident. Every screen, the keyboard, the Live Activity and the App Intent
+420 MB resident, which is base-en's order of magnitude rather than a round
+gigabyte. Every screen, the keyboard, the Live Activity and the App Intent
 can be exercised end to end before any weights exist. Nothing about the fake is
 subtle -- the text it returns says it is the fake, so a fake build cannot be
 mistaken for a working one.
 
 To build without it, use the Release configuration or remove
 `OPENFLOW_FAKE_ENGINE` from `SWIFT_ACTIVE_COMPILATION_CONDITIONS` in
-`project.yml`. The app then reports that no engine is installed, which is the
-truth until M2.
+`project.yml`. The app then runs Moonshine for real, and the download screen is
+what stands between a fresh install and the first take.
 
 ## Tests
 
-The core package builds and tests with the Command Line Tools alone -- no Xcode,
-no simulator, no Metal toolchain:
+Both packages build and test with the Command Line Tools alone -- no Xcode, no
+simulator, no Metal toolchain:
 
 ```bash
-cd apps/ios/Packages/OpenFlowMobileCore
-swift build
-swift test
+cd apps/ios/Packages/OpenFlowMobileCore && swift build && swift test
+
+cd apps/ios/Packages/OpenFlowMoonshineEngine && swift build
+OPENFLOW_MOONSHINE_MODEL_DIR="$HOME/Library/Caches/moonshine_voice/download.moonshine.ai/model/base-en/quantized/base-en" \
+  swift test
 ```
+
+The engine package is in that gate because Moonshine ships a prebuilt C++ static
+library whose xcframework carries a `macos-arm64_x86_64` slice, so the real
+recogniser runs here against the real weights. Its four model-backed tests skip,
+loudly, when `OPENFLOW_MOONSHINE_MODEL_DIR` is unset; see
+`Packages/OpenFlowMoonshineEngine/README.md`.
 
 That is the gate this milestone was held to. It covers the model manager's
 transitions for every trigger in PLAN.md section 2 (driven on a hand-cranked
@@ -117,15 +129,31 @@ host, once, to download the recogniser.
 How to verify it without trusting the claim:
 
 ```bash
-# Only ModelDownloader.swift may appear.
-grep -rn "URLSession\|https://" apps/ios --include='*.swift'
+# Three files may appear, and nothing else: ModelDownloader.swift, its
+# test, and OpenFlowMoonshineEngine/Package.swift, whose https is the
+# pinned source of the dependency rather than a host the app calls.
+grep -rn "URLSession\|https://" apps/ios --include='*.swift' \
+  --exclude-dir=.build
 ```
 
-`ModelDownloader` is the only type allowed to touch the network. Its URL and its
-SHA-256 are compile-time constants -- there is no manifest fetch, no redirect
-chasing, no remote config -- so the host the app can reach is fixed at build
-time and visible in the source. A file whose digest does not match is deleted,
-not used.
+`ModelDownloader` is the only type in our code allowed to touch the network. Its
+URLs and its six SHA-256 digests are compile-time constants -- there is no
+manifest fetch, no redirect chasing, no remote config -- so the host the app can
+reach is fixed at build time and visible in the source. A set of files whose
+digests do not all match is deleted, not used.
+
+The `--exclude-dir=.build` is not a way of hiding something, and here is what it
+hides. `MoonshineVoice` ships an `AssetDownloader` and a `TextToSpeech` that do
+use `URLSession`, and both are checked out under `.build` when SwiftPM resolves
+the dependency. Neither is called from anything here, on purpose: the app keeps
+its own `ModelDownloader` as the only network code in the product, and dead code
+stripping is on for every configuration, so nothing that reaches them is linked
+into the binary. The check that matters is the one below, on the built app:
+
+```bash
+# The hosts a built binary carries. download.moonshine.ai and nothing else.
+strings "$APP/OpenFlow" | grep -Eo 'https?://[a-z0-9.-]+' | sort -u
+```
 
 Two more things a reviewer can check:
 
@@ -166,7 +194,13 @@ specification, copied deliberately so the two can be cross-checked:
 
 ## Status
 
-Milestone M1. No speech engine: `SpeechEngine` has a fake and two stubs, and the
-model pin in `ModelDownloader` is a placeholder that refuses to download rather
-than installing something the app cannot verify. M2 ports Qwen3-ASR-0.6B to MLX
-Swift, wires WhisperKit, measures both on a real iPhone and picks one.
+Milestone M2. `MoonshineSpeechEngine` runs base-en and tiny-en, and the pins in
+`ModelDownloader` are the six measured digests rather than placeholders. On this
+Mac base-en transcribes the 8.5 s reference clip in 0.48 s after a 0.64 s load,
+for a 317 MB footprint delta.
+
+What is left of M2 is the phone: load time, the footprint delta shown in
+Settings, and a dictation after four hours locked, all on real hardware. The
+resident figure the download screen quotes is still an estimate until that
+happens. Qwen3-ASR returns later as an "accurate" option behind the same
+`SpeechEngine` seam if a phone measurement earns it; WhisperKit is dropped.

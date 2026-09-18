@@ -51,7 +51,7 @@ struct HistoryView: View {
                     }
                 }
             }
-            .task { await controller.refresh() }
+            .task { await controller.loadHistory() }
         }
     }
 

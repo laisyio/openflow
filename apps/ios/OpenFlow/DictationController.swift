@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import OpenFlowMobileCore
+import OpenFlowMoonshineEngine
 
 #if canImport(UIKit)
 import UIKit
@@ -33,6 +34,10 @@ final class DictationController {
     private(set) var modelState: ModelState = .unloaded
     private(set) var residentBytes: Int = 0
     private(set) var history: [TranscriptRecord] = []
+    /// One line the capture sheet shows under a finished transcript when there
+    /// is something about the take the user could not otherwise tell, which is
+    /// currently only the length ceiling. Cleared when the next take starts.
+    private(set) var captureNotice: String?
     /// Set by the App Intent so the app opens straight onto the capture sheet.
     var isCaptureSheetPresented = false
 
@@ -57,13 +62,20 @@ final class DictationController {
         let settings = SettingsStore.shared()
         self.settings = settings
 
-        // The Simulator has no weights and no Metal-backed engine, so a build
-        // with -D OPENFLOW_FAKE_ENGINE exercises the whole product -- sheet,
-        // history, keyboard, Live Activity -- against a stub. PLAN.md section 6.
+        // A build with -D OPENFLOW_FAKE_ENGINE exercises the whole product --
+        // sheet, history, keyboard, Live Activity -- before any weights have been
+        // downloaded. PLAN.md section 6.
         #if OPENFLOW_FAKE_ENGINE
         let engine: any SpeechEngine = FakeEngine(loadSeconds: 0, transcribeSeconds: 0)
         #else
-        let engine: any SpeechEngine = UnavailableEngine(choice: settings.engine)
+        // Moonshine, reading the weights `ModelDownloader` installed. The engine
+        // is constructed even when nothing is downloaded yet: `load()` throws
+        // `modelUnavailable` naming the missing file, which is what the download
+        // screen is for, and constructing it costs nothing until then.
+        let engine: any SpeechEngine = MoonshineSpeechEngine(
+            choice: settings.engine,
+            store: ModelStore.applicationSupportOrTemporary()
+        )
         #endif
         self.engineIdentifier = engine.identifier
         self.manager = ModelManager(
@@ -127,12 +139,27 @@ final class DictationController {
         await refresh()
     }
 
+    /// The two numbers the sheet and the Settings screen draw from.
+    ///
+    /// It does not touch history. This runs after every take, every scene
+    /// change, every memory warning and every thermal notification, and it used
+    /// to read and decode the whole history file each time: a glance at Control
+    /// Centre cost a full parse of a month of dictations, on the main actor,
+    /// for a list that was very likely not even on screen.
     func refresh() async {
         modelState = await manager.state
         residentBytes = await manager.residentBytes
-        if let store {
-            history = store.loadHistory().reversed()
-        }
+    }
+
+    /// The History tab's own load, called from its `.task`.
+    ///
+    /// Reading the file when the list appears is the only time the whole list is
+    /// needed. Everything else that changes it -- a delivery, a delete -- knows
+    /// what changed and says so, so the file is read once per visit rather than
+    /// once per notification.
+    func loadHistory() async {
+        guard let store else { return }
+        history = store.loadHistory().reversed()
     }
 
     func transitionLog() async -> [ModelTransition] {
@@ -152,9 +179,13 @@ final class DictationController {
     func startRecording() async {
         guard phase != .recording else { return }
         silenceRunSeconds = 0
+        captureNotice = nil
         #if canImport(AVFoundation)
         do {
-            try await capture.start()
+            // Only stop-on-silence reads a running level, and taking one costs
+            // a pass over every block on the audio thread, so the tap is told
+            // up front whether anybody is going to ask.
+            try await capture.start(measuringLevel: settings.stopOnSilence)
         } catch {
             phase = .failed(describe(error))
             await endLiveActivity(preview: nil)
@@ -197,6 +228,11 @@ final class DictationController {
             await endLiveActivity(preview: nil)
             return
         }
+        // The ceiling has been reported by the capture since it was built and
+        // read by nobody. A take that lost its opening looks like a take that
+        // started late, and the user has no way to tell those apart, so the
+        // sheet says it alongside the transcript rather than instead of it.
+        captureNotice = result.hitWatchdog ? CaptureRingBuffer.ceilingNotice : nil
         await transcribe(result)
         #else
         phase = .failed("Audio capture is not available on this platform.")
@@ -283,6 +319,15 @@ final class DictationController {
         if settings.saveHistory {
             try? store.append(record, retentionDays: settings.historyRetentionDays)
         }
+
+        // Bring the History tab up to date without re-reading the file it is
+        // already showing. `lastEntry()` reads one small file rather than the
+        // whole list, and it reads back what was actually written: a delivery
+        // that never reached disk does not put a row on the tab. The tab's own
+        // `.task` still reloads from the file the next time it appears.
+        if settings.saveHistory, let saved = store.lastEntry(), saved.id == record.id {
+            history.insert(saved, at: 0)
+        }
     }
 
     /// Stop-on-silence, when the setting is on: the level has to stay under the
@@ -295,7 +340,10 @@ final class DictationController {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(step * 1_000_000_000))
                 guard let self else { return }
-                let level = await self.capture.currentLevel
+                // Nil means the take was opened without level measurement, so
+                // there is no reading to judge. Stopping on a number nobody took
+                // would end the take on the user, which is the worse failure.
+                guard let level = await self.capture.currentLevel else { return }
                 if level < SilenceGate.silenceLevel {
                     self.silenceRunSeconds += step
                 } else {
@@ -318,12 +366,12 @@ final class DictationController {
 
     func deleteHistory(id: UUID) async {
         try? store?.delete(id: id)
-        await refresh()
+        await loadHistory()
     }
 
     func deleteAllHistory() async {
         try? store?.deleteAll()
-        await refresh()
+        history = []
     }
 
     func copyToClipboard(_ text: String) {
@@ -354,31 +402,5 @@ final class DictationController {
             }
         }
         return (error as NSError).localizedDescription
-    }
-}
-
-/// The engine slot before M2 fills it. It refuses rather than pretending, which
-/// is the same rule PLAN.md section 7 applies to CPU fallback: fail loudly.
-actor UnavailableEngine: SpeechEngine {
-    nonisolated let identifier: String
-    private let choice: EngineChoice
-
-    init(choice: EngineChoice) {
-        self.choice = choice
-        self.identifier = choice.rawValue
-    }
-
-    var residentBytes: Int { 0 }
-
-    func load() async throws {
-        throw SpeechEngineError.modelUnavailable(
-            "\(choice.displayName) is not built into this version yet. Milestone M2 adds it."
-        )
-    }
-
-    func unload() async {}
-
-    func transcribe(samples16k: [Float]) async throws -> Transcript {
-        throw SpeechEngineError.modelUnavailable("No speech engine is installed.")
     }
 }

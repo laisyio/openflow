@@ -5,12 +5,17 @@ import Foundation
 ///
 /// PLAN.md section 0 makes a promise -- "the only network request it ever makes
 /// is the one-time model download" -- and section 6 turns it into a check a
-/// reviewer can run: `grep -rn "URLSession" apps/ios --include=*.swift` must
-/// return this file and nothing else. Anything that wants to reach the network
-/// from anywhere else in the app is a bug, not a feature request.
+/// reviewer can run. `apps/ios/README.md` has the exact grep and what it is
+/// allowed to return: this file, its test, and the engine package's manifest,
+/// whose URL is where the dependency comes from rather than a host the app
+/// calls. Anything else in our code that wants to reach the network is a bug,
+/// not a feature request.
+///
+/// A Moonshine model is three files, not one (`M2-MOONSHINE.md`), so the unit of
+/// download is `ModelPin`: a set of `Pin`s that install together or not at all.
 public actor ModelDownloader {
 
-    /// The pinned artefact. Nothing here is discovered at runtime: no manifest
+    /// One pinned file. Nothing here is discovered at runtime: no manifest
     /// fetch, no redirect chasing, no remote config. Change these and ship a new
     /// build, which is also what makes the App Store privacy answer honest.
     public struct Pin: Sendable, Equatable {
@@ -27,50 +32,121 @@ public actor ModelDownloader {
         }
     }
 
-    /// The digest a pin carries until M2 fills in a real one. A pin still
+    /// One engine's weights: the files, and the directory under the model store
+    /// they live in.
+    ///
+    /// The set is the unit because a model is only a model when all of it is
+    /// there. Two of base-en's three files verified is not two thirds of a
+    /// recogniser, it is a directory that would make `Transcriber.init` fail at
+    /// the worst moment, so `download` installs the set atomically and removes a
+    /// partial one.
+    public struct ModelPin: Sendable, Equatable {
+        /// Where the set lives, relative to the model store, e.g.
+        /// `moonshine/base-en`. Per engine, so base-en and tiny-en can both be
+        /// installed even though their file names are identical.
+        public let subdirectory: String
+        public let files: [Pin]
+
+        public init(subdirectory: String, files: [Pin]) {
+            self.subdirectory = subdirectory
+            self.files = files
+        }
+
+        /// The whole transfer. `EngineProfile` quotes this, and the progress bar
+        /// is drawn against it, so the bar rises once across three files rather
+        /// than resetting twice.
+        public var expectedBytes: Int64 {
+            files.reduce(0) { $0 + $1.expectedBytes }
+        }
+    }
+
+    /// The digest a pin carries until a real one is measured. A pin still
     /// wearing it refuses to download rather than installing something the app
-    /// cannot check.
+    /// cannot check. Nothing uses it today; it stays for the next engine that is
+    /// pinned before its artefact is published.
     public static let placeholderDigest = String(repeating: "0", count: 64)
 
-    /// TODO(M2): replace host, path, digest and size with the real published
-    /// artefact once the Qwen3-ASR-0.6B 8-bit conversion is pinned. The values
-    /// below are placeholders and are deliberately not a working URL: a build
-    /// that ships them fails its checksum rather than installing something
-    /// unverified.
-    public static let qwen06Pin = Pin(
-        fileName: "qwen3-asr-0.6b-8bit.safetensors",
-        remote: URL(string: "https://models.invalid/openflow/TODO-qwen3-asr-0.6b-8bit.safetensors")!,
-        sha256: placeholderDigest,
-        expectedBytes: 700 * 1_000 * 1_000
+    /// Moonshine's CDN, the only host the app ever contacts.
+    private static let base = "https://download.moonshine.ai/model"
+
+    /// base-en: 141 MB across three files, sizes and digests measured on
+    /// 2026-09-10 from the files the desktop benchmark downloaded
+    /// (`M2-MOONSHINE.md`, "Weights and pins").
+    public static let moonshineBasePin = ModelPin(
+        subdirectory: "moonshine/base-en",
+        files: [
+            Pin(
+                fileName: "encoder_model.ort",
+                remote: URL(string: "\(base)/base-en/quantized/base-en/encoder_model.ort")!,
+                sha256: "7c66495948d0d08ec1af454cd4b5514862ae6511e94712a60e6d83eaec8dc8cf",
+                expectedBytes: 31_326_816
+            ),
+            Pin(
+                fileName: "decoder_model_merged.ort",
+                remote: URL(string: "\(base)/base-en/quantized/base-en/decoder_model_merged.ort")!,
+                sha256: "d9d7b333af34bc552580576ddcf248a1c6c839e0d3b43b09afb9376ed009899d",
+                expectedBytes: 109_424_400
+            ),
+            Pin(
+                fileName: "tokenizer.bin",
+                remote: URL(string: "\(base)/base-en/quantized/base-en/tokenizer.bin")!,
+                sha256: "6884b35fd6377d4c4d32336a0bc152f36b64d1e45b6503683cdc238250a8472d",
+                expectedBytes: 249_974
+            ),
+        ]
     )
 
-    /// TODO(M2): the WhisperKit fallback artefact, per PLAN.md section 3.
-    public static let whisperPin = Pin(
-        fileName: "whisper-large-v3-turbo.mlmodelc.zip",
-        remote: URL(string: "https://models.invalid/openflow/TODO-whisper-large-v3-turbo.zip")!,
-        sha256: placeholderDigest,
-        expectedBytes: 600 * 1_000 * 1_000
+    /// tiny-en: 44 MB across three files. The tokenizer is byte for byte the
+    /// same file as base-en's, and it is still downloaded and verified into
+    /// tiny-en's own directory: sharing it would tie the two installs together
+    /// and make removing one engine able to break the other.
+    public static let moonshineTinyPin = ModelPin(
+        subdirectory: "moonshine/tiny-en",
+        files: [
+            Pin(
+                fileName: "encoder_model.ort",
+                remote: URL(string: "\(base)/tiny-en/quantized/tiny-en/encoder_model.ort")!,
+                sha256: "94e90a4654fc45cdfedb77c4c08e1739f48862998e58fada384b25118134f221",
+                expectedBytes: 13_281_600
+            ),
+            Pin(
+                fileName: "decoder_model_merged.ort",
+                remote: URL(string: "\(base)/tiny-en/quantized/tiny-en/decoder_model_merged.ort")!,
+                sha256: "cf524c4862d36e9e5ab032eddc73637efd822d70e868ac575cf1a46e1e4708a0",
+                expectedBytes: 30_412_256
+            ),
+            Pin(
+                fileName: "tokenizer.bin",
+                remote: URL(string: "\(base)/tiny-en/quantized/tiny-en/tokenizer.bin")!,
+                sha256: "6884b35fd6377d4c4d32336a0bc152f36b64d1e45b6503683cdc238250a8472d",
+                expectedBytes: 249_974
+            ),
+        ]
     )
 
-    public static func pin(for engine: EngineChoice) -> Pin {
+    public static func pin(for engine: EngineChoice) -> ModelPin {
         switch engine {
-        case .qwen06: return qwen06Pin
-        case .whisper: return whisperPin
+        case .moonshineBase: return moonshineBasePin
+        case .moonshineTiny: return moonshineTinyPin
         }
     }
 
     public enum DownloadError: Error, Equatable, Sendable {
         case transport(String)
         case badStatus(Int)
-        case checksumMismatch(expected: String, actual: String)
+        case checksumMismatch(file: String, expected: String, actual: String)
         case cancelled
         case placeholderPin
     }
 
     public enum Progress: Sendable, Equatable {
+        /// Bytes across the whole set, so the bar rises once.
         case downloading(received: Int64, expected: Int64)
-        case verifying
+        /// Hashing the file just downloaded, named so the screen can say which.
+        case verifying(file: String)
+        /// Every file is verified; the set is being moved into place.
         case installing
+        /// The model directory, ready for the engine to open.
         case finished(URL)
     }
 
@@ -82,64 +158,102 @@ public actor ModelDownloader {
         self.session = session
     }
 
-    /// Download, verify, install. Emits progress as an `AsyncThrowingStream` so
-    /// the download screen can show the 700 MB honestly instead of a spinner.
+    /// Download, verify, install, as one transaction over the whole set. Emits
+    /// progress as an `AsyncThrowingStream` so the download screen can show the
+    /// 141 MB honestly instead of a spinner.
     ///
     /// A download task rather than a byte stream: `URLSession.AsyncBytes`
     /// delivers one `UInt8` per iteration, which is fine for a JSON response and
-    /// hopeless for 700 MB. The task streams to a file the system manages and
+    /// hopeless for 109 MB. The task streams to a file the system manages and
     /// reports progress through the delegate; the digest is then taken over that
     /// file in 1 MB pieces, so nothing large is ever held in memory.
     ///
-    /// Verification is not optional and not a warning: a mismatch deletes the
-    /// file and throws, because the alternative is running unknown weights on
-    /// someone's voice.
-    public func download(pin: Pin) -> AsyncThrowingStream<Progress, Error> {
-        AsyncThrowingStream { continuation in
+    /// Verification is not optional and not a warning: a mismatch on any file
+    /// throws and takes the whole set with it, because the alternative is
+    /// running unknown weights on someone's voice.
+    ///
+    /// Files land in a sibling `.partial` directory and are moved across only
+    /// once all three have passed. That is what makes an interrupted download
+    /// safe to walk away from: the model directory either does not exist or is
+    /// complete, and `isInstalled` never has to decide what a half a model means.
+    ///
+    /// A failure removes the staging directory and **nothing else**. An install
+    /// that is already there is somebody's working recogniser, and a flaky
+    /// network on a re-download is not a reason to take it away: they would be
+    /// left unable to dictate by an operation they only started because they
+    /// were told a newer model existed. The installed set is touched at exactly
+    /// one point, after every file has been verified, when the replacement is
+    /// two directory operations from done.
+    public func download(pin: ModelPin) -> AsyncThrowingStream<Progress, Error> {
+        let store = self.store
+        let session = self.session
+        return AsyncThrowingStream { continuation in
             let work = Task {
+                let target = store.subdirectory(pin.subdirectory)
+                let staging = store.subdirectory(pin.subdirectory + ".partial")
                 do {
-                    guard pin.sha256 != Self.placeholderDigest else {
+                    guard !pin.files.contains(where: { $0.sha256 == Self.placeholderDigest }) else {
                         throw DownloadError.placeholderPin
                     }
                     try store.prepare()
+                    try staging.removeAll()
+                    try staging.prepare()
 
-                    let observer = DownloadProgressObserver { received, expected in
-                        continuation.yield(
-                            .downloading(
-                                received: received,
-                                expected: expected > 0 ? expected : pin.expectedBytes
+                    let total = pin.expectedBytes
+                    var finishedBytes: Int64 = 0
+
+                    for file in pin.files {
+                        let alreadyDone = finishedBytes
+                        let observer = DownloadProgressObserver { received, _ in
+                            continuation.yield(
+                                .downloading(received: alreadyDone + received, expected: total)
                             )
+                        }
+                        let (temporary, response) = try await session.download(
+                            from: file.remote,
+                            delegate: observer
                         )
-                    }
-                    let (temporary, response) = try await self.session.download(
-                        from: pin.remote,
-                        delegate: observer
-                    )
-                    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                        try? FileManager.default.removeItem(at: temporary)
-                        throw DownloadError.badStatus(http.statusCode)
-                    }
-                    if Task.isCancelled {
-                        try? FileManager.default.removeItem(at: temporary)
-                        throw DownloadError.cancelled
+                        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                            try? FileManager.default.removeItem(at: temporary)
+                            throw DownloadError.badStatus(http.statusCode)
+                        }
+                        if Task.isCancelled {
+                            try? FileManager.default.removeItem(at: temporary)
+                            throw DownloadError.cancelled
+                        }
+
+                        continuation.yield(.verifying(file: file.fileName))
+                        let actual = try ModelStore.sha256Hex(ofFileAt: temporary)
+                        guard actual.caseInsensitiveCompare(file.sha256) == .orderedSame else {
+                            try? FileManager.default.removeItem(at: temporary)
+                            throw DownloadError.checksumMismatch(
+                                file: file.fileName,
+                                expected: file.sha256.lowercased(),
+                                actual: actual
+                            )
+                        }
+
+                        try staging.install(from: temporary, as: file.fileName)
+                        finishedBytes += file.expectedBytes
+                        continuation.yield(.downloading(received: finishedBytes, expected: total))
                     }
 
-                    continuation.yield(.verifying)
-                    let actual = try ModelStore.sha256Hex(ofFileAt: temporary)
-                    guard actual.caseInsensitiveCompare(pin.sha256) == .orderedSame else {
-                        try? FileManager.default.removeItem(at: temporary)
-                        throw DownloadError.checksumMismatch(expected: pin.sha256.lowercased(), actual: actual)
-                    }
-
+                    // The only moment the installed set is touched: every file
+                    // is downloaded and verified, and the replacement is two
+                    // directory operations away from done.
                     continuation.yield(.installing)
-                    try store.install(from: temporary, as: pin.fileName)
-                    continuation.yield(.finished(store.url(for: pin.fileName)))
+                    try target.removeAll()
+                    try FileManager.default.moveItem(at: staging.directory, to: target.directory)
+                    continuation.yield(.finished(target.directory))
                     continuation.finish()
                 } catch let error as DownloadError {
+                    try? staging.removeAll()
                     continuation.finish(throwing: error)
                 } catch let error as ModelStore.StoreError {
+                    try? staging.removeAll()
                     continuation.finish(throwing: error)
                 } catch {
+                    try? staging.removeAll()
                     continuation.finish(throwing: DownloadError.transport(error.localizedDescription))
                 }
             }
@@ -147,12 +261,50 @@ public actor ModelDownloader {
         }
     }
 
-    /// True when the pinned file is already installed and passes its checksum.
-    /// The download screen calls this before offering to download anything.
-    public func isInstalled(pin: Pin) -> Bool {
-        guard store.exists(pin.fileName) else { return false }
-        guard pin.sha256 != Self.placeholderDigest else { return true }
-        return (try? store.verify(pin.fileName, sha256Hex: pin.sha256)) != nil
+    /// Where the engine opens the model from. Valid whether or not it is
+    /// installed; ask `isInstalled` for that.
+    public nonisolated func directory(for pin: ModelPin) -> URL {
+        store.subdirectory(pin.subdirectory).directory
+    }
+
+    /// Cheap: every file is there and is the size it was pinned at.
+    ///
+    /// What the download screen should ask on appear. It reads three directory
+    /// entries rather than 141 MB, and it is enough to answer "is there anything
+    /// to download", which is the question that screen is actually asking.
+    ///
+    /// It cannot catch a file that was corrupted in place without changing size,
+    /// which is why it is not what gates loading. `isInstalled` is, and `load()`
+    /// fails loudly behind it.
+    public func isPresent(pin: ModelPin) -> Bool {
+        let target = store.subdirectory(pin.subdirectory)
+        for file in pin.files {
+            guard target.exists(file.fileName) else { return false }
+            guard target.sizeOnDisk(file.fileName) == file.expectedBytes else { return false }
+        }
+        return true
+    }
+
+    /// True when every file in the set is present and passes its checksum.
+    ///
+    /// All three are hashed, not just counted: a file truncated by a full disk
+    /// exists and is the wrong file, and finding that out here costs a second
+    /// once, where finding it out in `Transcriber.init` costs the user a take.
+    ///
+    /// **This reads and hashes all 141 MB, every call.** It is not something to
+    /// put in a SwiftUI computed property, a `body`, or anything else that runs
+    /// more than once: a view that asked it on every redraw would hash the model
+    /// repeatedly while the user scrolled. The download screen should call
+    /// `isPresent` for the cheap answer, or call this once and hold the verdict
+    /// in state.
+    public func isInstalled(pin: ModelPin) -> Bool {
+        let target = store.subdirectory(pin.subdirectory)
+        for file in pin.files {
+            guard target.exists(file.fileName) else { return false }
+            guard file.sha256 != Self.placeholderDigest else { continue }
+            guard (try? target.verify(file.fileName, sha256Hex: file.sha256)) != nil else { return false }
+        }
+        return true
     }
 }
 

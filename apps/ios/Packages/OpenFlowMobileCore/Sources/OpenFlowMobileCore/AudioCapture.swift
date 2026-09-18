@@ -137,29 +137,42 @@ public struct StreamingDownsampler: Sendable {
     /// Convert one block. Returns only the output samples the filter can produce
     /// without seeing the future.
     public mutating func process(_ block: [Float]) -> [Float] {
-        guard !block.isEmpty else { return [] }
+        var output = [Float]()
+        block.withUnsafeBufferPointer { process($0, into: &output) }
+        return output
+    }
+
+    /// The same conversion, writing into a buffer the caller owns.
+    ///
+    /// The tap calls this once per microphone callback, so `output` is emptied
+    /// with `keepingCapacity` rather than replaced: after the first few blocks
+    /// it is already large enough and the conversion allocates nothing.
+    public mutating func process(_ block: UnsafeBufferPointer<Float>, into output: inout [Float]) {
+        output.removeAll(keepingCapacity: true)
+        guard !block.isEmpty else { return }
         if passthrough || taps.isEmpty {
             inputCount += block.count
             outputCount += block.count
-            return block
+            output.append(contentsOf: block)
+            return
         }
         pending.append(contentsOf: block)
         inputCount += block.count
-        return emit(upTo: inputCount, zeroPadTail: false)
+        emit(upTo: inputCount, zeroPadTail: false, into: &output)
     }
 
     /// Close out the take: emit every remaining output sample, padding past the
     /// end of the input with zeros exactly as the batch converter does.
     public mutating func flush() -> [Float] {
         guard !passthrough, !taps.isEmpty else { return [] }
-        let tail = emit(upTo: inputCount, zeroPadTail: true)
+        var tail = [Float]()
+        emit(upTo: inputCount, zeroPadTail: true, into: &tail)
         pending.removeAll(keepingCapacity: true)
         return tail
     }
 
-    private mutating func emit(upTo availableInputs: Int, zeroPadTail: Bool) -> [Float] {
+    private mutating func emit(upTo availableInputs: Int, zeroPadTail: Bool, into output: inout [Float]) {
         let totalOutputs = Int(Double(availableInputs) / ratio)
-        var output = [Float]()
         while outputCount < totalOutputs {
             let center = Int(Double(outputCount) * ratio)
             let lastNeeded = center + taps.count - 1 - half
@@ -184,7 +197,6 @@ public struct StreamingDownsampler: Sendable {
                 pendingBase = keepFrom
             }
         }
-        return output
     }
 }
 
@@ -198,6 +210,27 @@ public struct StreamingDownsampler: Sendable {
 public struct CaptureRingBuffer: Sendable {
     public static let sampleRate: Double = 16_000
     public static let maxSeconds: Double = 600
+
+    /// What the user is told when a take ran past `maxSeconds`.
+    ///
+    /// It lives here, next to the constant that makes it true, for the reason
+    /// audio.rs gives for `CAPTURE_CEILING_WARNING`: the sentence and the
+    /// ceiling have to change together.
+    ///
+    /// It names no duration. The desktop's reason is that its ceiling is a frame
+    /// count that means different clock times on different hardware; ours is
+    /// that a figure in a sentence is one more thing to forget to update when
+    /// `maxSeconds` moves, and a wrong figure is worse than none.
+    ///
+    /// It says the *beginning* was lost, which is the opposite of what the
+    /// desktop says, because this is a ring and that is a bounded vector. The
+    /// desktop drops frames as they arrive, so the opening survives; here the
+    /// newest samples overwrite the oldest, so the closing survives. Which half
+    /// is missing is the one thing the user cannot guess, so the two messages
+    /// have to disagree.
+    public static let ceilingNotice =
+        "This take reached OpenFlow's length limit, so the beginning of it was not kept. "
+        + "Everything said after that point is here."
 
     public let capacity: Int
     private var storage: [Float]
@@ -214,11 +247,42 @@ public struct CaptureRingBuffer: Sendable {
     public var seconds: Double { Double(count) / Self.sampleRate }
 
     public mutating func append(_ samples: [Float]) {
-        for sample in samples {
-            storage[writeIndex] = sample
-            writeIndex = (writeIndex + 1) % capacity
-            totalWritten += 1
+        samples.withUnsafeBufferPointer { append($0) }
+    }
+
+    /// One block into the ring, in at most two copies.
+    ///
+    /// The sample-at-a-time version this replaces did a bounds check, a modulo
+    /// and a retain-free-but-still-real store per sample, several thousand times
+    /// per microphone callback on the audio thread. The ring wraps in at most
+    /// one place, so a block is one copy to the end of the storage and, when it
+    /// wraps, a second copy to the front.
+    public mutating func append(_ samples: UnsafeBufferPointer<Float>) {
+        guard let source = samples.baseAddress, !samples.isEmpty else { return }
+
+        var offset = 0
+        var index = writeIndex
+        var remaining = samples.count
+        // A block longer than the whole ring can only leave its own last
+        // `capacity` samples behind, so start at those and copy each slot once.
+        // The write index lands where the per-sample loop left it either way.
+        if remaining > capacity {
+            offset = remaining - capacity
+            index = (writeIndex + offset) % capacity
+            remaining = capacity
         }
+
+        storage.withUnsafeMutableBufferPointer { destination in
+            guard let base = destination.baseAddress else { return }
+            let head = min(remaining, capacity - index)
+            (base + index).update(from: source + offset, count: head)
+            if remaining > head {
+                base.update(from: source + offset + head, count: remaining - head)
+            }
+        }
+
+        writeIndex = (index + remaining) % capacity
+        totalWritten += samples.count
     }
 
     /// The take, oldest sample first.
@@ -264,25 +328,86 @@ final class CaptureBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var ring: CaptureRingBuffer
     private var downsampler: StreamingDownsampler
+
+    /// Whether the per-block level is worth computing at all. Only
+    /// stop-on-silence reads it, and it is the one measurement in the tap that
+    /// touches every sample twice, so a user who has the setting off should not
+    /// be paying for it on the audio thread.
+    private let measuresLevel: Bool
     private var lastLevel: Float = 0
 
-    init(inputRate: Double) {
+    /// Buffers the tap reuses. Each one grows to a block's working size on the
+    /// first callbacks and is then refilled in place, so the steady state of a
+    /// take allocates nothing on the audio thread.
+    private var mono: [Float] = []
+    private var converted: [Float] = []
+    private var levelScratch: [Float] = []
+
+    init(inputRate: Double, measuresLevel: Bool = false) {
         self.ring = CaptureRingBuffer()
         self.downsampler = StreamingDownsampler(from: inputRate, to: CaptureRingBuffer.sampleRate)
+        self.measuresLevel = measuresLevel
     }
 
-    func write(mono: [Float]) {
-        let converted = downsampler.process(mono)
+    func write(mono block: [Float]) {
+        block.withUnsafeBufferPointer { write($0) }
+    }
+
+    /// Average every channel into the reused mono buffer, then convert and store
+    /// it. Same rule as the desktop's `mix_frame_to_mono`: average every
+    /// channel, never pick channel 0 and hope.
+    ///
+    /// The mix writes into a buffer owned by this object rather than a fresh
+    /// array per callback, because a callback is an audio thread and an
+    /// allocation there is a malloc lock the microphone is waiting on.
+    func writeMixedMono(
+        channels: UnsafePointer<UnsafeMutablePointer<Float>>,
+        channelCount: Int,
+        frames: Int
+    ) {
+        guard frames > 0, channelCount > 0 else { return }
+        if mono.count < frames {
+            mono = [Float](repeating: 0, count: frames)
+        }
+        mono.withUnsafeMutableBufferPointer { destination in
+            guard let base = destination.baseAddress else { return }
+            if channelCount == 1 {
+                base.update(from: channels[0], count: frames)
+                return
+            }
+            let scale = 1 / Float(channelCount)
+            base.update(from: channels[0], count: frames)
+            for channel in 1..<channelCount {
+                let source = channels[channel]
+                for frame in 0..<frames { base[frame] += source[frame] }
+            }
+            for frame in 0..<frames { base[frame] *= scale }
+        }
+        mono.withUnsafeBufferPointer { filled in
+            write(UnsafeBufferPointer(rebasing: filled[0..<frames]))
+        }
+    }
+
+    private func write(_ block: UnsafeBufferPointer<Float>) {
+        downsampler.process(block, into: &converted)
         guard !converted.isEmpty else { return }
-        let level = SilenceGate.speechLevel(converted)
+        let level = measuresLevel
+            ? SilenceGate.speechLevel(of: converted, scratch: &levelScratch)
+            : 0
         lock.lock()
         ring.append(converted)
-        lastLevel = level
+        if measuresLevel { lastLevel = level }
         lock.unlock()
     }
 
     /// The most recent block's 95th-percentile level, for stop-on-silence.
-    var level: Float {
+    ///
+    /// `nil` when this take was opened without level measurement. Not zero: a
+    /// zero is a perfectly good reading of a muted microphone, so anything that
+    /// compares it against the silence line would conclude silence from a
+    /// measurement nobody took.
+    var level: Float? {
+        guard measuresLevel else { return nil }
         lock.lock()
         defer { lock.unlock() }
         return lastLevel
@@ -320,8 +445,9 @@ public actor AudioCapture {
     public var isRecording: Bool { engine != nil }
 
     /// The most recent block level, so the sheet can run stop-on-silence without
-    /// reaching into the audio thread itself.
-    public var currentLevel: Float { buffer?.level ?? 0 }
+    /// reaching into the audio thread itself. `nil` when the take was not opened
+    /// with `measuringLevel`, which is also when nothing is asking.
+    public var currentLevel: Float? { buffer?.level }
 
     /// True once the ten-minute watchdog has tripped.
     public var watchdogTripped: Bool { buffer?.didOverflow ?? false }
@@ -334,7 +460,13 @@ public actor AudioCapture {
     /// silence that the whole-take gate then rejects as a dead input. Neither
     /// tells the user the one thing they can act on, which is that the switch in
     /// Settings is off.
-    public func start() async throws {
+    ///
+    /// `measuringLevel` is stop-on-silence asking for a running level. It is a
+    /// parameter and not something the tap always does because the measurement
+    /// walks the block twice and runs on the audio thread: with the setting off
+    /// there is no reader for the number, and the desktop likewise only computes
+    /// what it is about to use.
+    public func start(measuringLevel: Bool = false) async throws {
         guard engine == nil else { return }
         #if os(iOS)
         // iOS 17 replaced AVAudioSession.requestRecordPermission with this. The
@@ -359,23 +491,18 @@ public actor AudioCapture {
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw AudioCaptureError.engineUnavailable("The input node reported no usable format")
         }
-        let capture = CaptureBuffer(inputRate: format.sampleRate)
+        let capture = CaptureBuffer(inputRate: format.sampleRate, measuresLevel: measuringLevel)
         input.installTap(onBus: 0, bufferSize: 4_096, format: format) { pcm, _ in
             guard let channels = pcm.floatChannelData else { return }
             let frames = Int(pcm.frameLength)
             guard frames > 0 else { return }
-            let channelCount = Int(pcm.format.channelCount)
-            var mono = [Float](repeating: 0, count: frames)
-            // Same rule as the desktop's `mix_frame_to_mono`: average every
-            // channel, never pick channel 0 and hope.
-            for frame in 0..<frames {
-                var sum: Float = 0
-                for channel in 0..<channelCount {
-                    sum += channels[channel][frame]
-                }
-                mono[frame] = sum / Float(channelCount)
-            }
-            capture.write(mono: mono)
+            // Everything this callback needs already exists: the mix, the
+            // conversion and the ring all write into buffers the capture owns.
+            capture.writeMixedMono(
+                channels: channels,
+                channelCount: Int(pcm.format.channelCount),
+                frames: frames
+            )
         }
         do {
             engine.prepare()
