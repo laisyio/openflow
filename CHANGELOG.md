@@ -4,6 +4,15 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Desktop: guided setup, link-first home, and measured performance improvements
+By: Codex
+Impact: `crates/openflow-native`, `crates/openflow-core/{src/agreement.rs,src/audio.rs,src/db.rs}`, `DESIGN.md`, `docs/*performance*.md`
+
+- A native, editorial-style home puts setup, history, providers and privacy one click away. Guided onboarding makes local versus cloud processing explicit, checks provider access, explains installation and permissions, and preserves the user's choice about history. Local-only connection checks allow loopback services without allowing hosted or LAN endpoints.
+- Refined Settings, History and Plugins layouts retain native controls, keyboard behavior, accessible labels and light/dark appearances. A synthetic AppKit snapshot harness exercises layouts without opening a microphone, reading personal history or contacting a provider.
+- History uses a timestamp-only index and cached row text, while the home preview reads a bounded portion of a transcript and retains the full copy payload.
+- Agreement scoring skips shared token edges; audio preparation reuses the loudness calculation and owned buffer; resampling skips redundant interior bounds checks without changing filter arithmetic. Synthetic equivalence tests preserve existing scores and audio output. Release benchmarks, independent review rounds and testing limits are recorded in the validation documents; these are component measurements, not claims about cloud response time.
+
 ### Benchmark: Cohere Transcribe measured
 By: Titan (with Claude)
 Impact: `docs/native-port/local-runner-benchmark.md`

@@ -199,10 +199,11 @@ CI runs these checks from a clean install and compiles the desktop app on macOS,
 
 ## Native build (experimental, macOS only)
 
-`crates/openflow-native` is the same app with AppKit windows instead of a WKWebView: a status item, one main window whose sidebar holds Dictate, History, Plugins and Settings, a setup wizard presented as a sheet on it, and the overlay pill as an `NSPanel`. It drives the same `openflow-core` engine as the Tauri build and reads the same database and keychain items, so the two can be swapped without reconfiguring anything. The plan is `docs/native-port/PLAN.md`; the local transcription runner is what is left of Milestone B.
-`crates/openflow-native` is the same app with AppKit windows instead of a WKWebView: a status item, a setup wizard, Settings, History and Plugins windows, and the overlay pill as an `NSPanel`. It drives the same `openflow-core` engine as the Tauri build and reads the same database and keychain items, so the two can be swapped without reconfiguring anything. It can also transcribe on-device (see [Local transcription](#local-transcription-private)). The plan is `docs/native-port/PLAN.md`; streaming TTS is what is left of Milestone B.
+`crates/openflow-native` uses native AppKit windows: a menu-bar item, one workspace with Dictate, History, Plugins and Settings, a guided setup sheet, and a compact recording overlay. It drives the same `openflow-core` engine as the Tauri build and shares its database and keychain entries. It can transcribe on-device (see [Local transcription](#local-transcription-private)).
 
-A launch with no provider saved opens the setup wizard instead of Settings: provider, key, a connection test, then microphone and shortcut. Settings has a "Run setup again" button that reopens it.
+A first launch opens guided setup. Choose cloud processing (provider, API key and connection test) or **On this Mac** (no API key). Both paths let you choose a microphone, recording shortcut and whether future dictations are saved. Cloud setup offers optional wording cleanup with a separate disclosure that it sends transcript text. History is stored locally without encryption.
+
+Choosing private setup enables Local-only protection and disables cloud cleanup, then takes you directly to Settings → Providers to install the engine and download a model. Downloads require internet access; speech processing stays on your Mac. Enabled plugins are separate programs and are **not** confined by Local-only protection. Finish installation before trying a phrase. Dictate's **Set up OpenFlow** link reopens the guide without resetting history.
 
 ```bash
 # Build the binary
@@ -213,6 +214,10 @@ cargo build -p openflow-native --release
 
 # Which build is this? Version from Cargo.toml, commit baked in at build time
 ./target/release/openflow-native --version      # OpenFlow 0.1.0 (a1b2c3d)
+
+# Render actual native light/dark layout fixtures into a NEW directory.
+# No Engine, personal settings, keychain reads, network or microphone access.
+./target/release/openflow-native --ui-snapshots target/ui-review
 
 # Transcribe one file with the saved settings and print the text and timing
 ./target/release/openflow-native --transcribe clip.wav
