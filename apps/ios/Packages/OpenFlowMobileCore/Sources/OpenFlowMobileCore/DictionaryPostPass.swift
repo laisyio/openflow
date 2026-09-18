@@ -4,17 +4,19 @@ import Foundation
 ///
 /// On the desktop the dictionary is a Whisper `prompt` (see `dictionary_prompt`
 /// in `src-tauri/src/transcribe.rs`): the model is told the spellings and gets
-/// them right itself. Qwen3-ASR ignores prompts (PLAN.md section 3, where 0.6B
-/// wrote "intro dot lie" for "entro.ly"), so on the phone the same string drives
-/// a deterministic replacement over the finished text.
+/// them right itself. Moonshine has no prompt, and its key-term biasing works
+/// only on the streaming architectures this app does not load, so on the phone
+/// the same string drives a deterministic replacement over the finished text.
+/// base-en writes "enterol I" for "entro.ly" and "fast pay" for "FastPay"; this
+/// is what fixes both.
 ///
 /// ## The format
 ///
 /// Exactly the desktop's: one free-text field, trimmed, capped at 800 Unicode
 /// scalars, entries separated by commas or newlines. `capped(_:)` reproduces
-/// `dictionary_prompt` so the two stay interchangeable -- the same string can be
-/// handed to WhisperKit as a prompt and to this post-pass, and neither sees
-/// something the other did not.
+/// `dictionary_prompt` so the two stay interchangeable -- the same string is the
+/// desktop's prompt, this post-pass, and the key terms the engine is offered,
+/// and none of the three sees something the others did not.
 ///
 /// Two entry shapes:
 /// - `Term` -- match `Term` case-insensitively, rewrite it with this spelling.

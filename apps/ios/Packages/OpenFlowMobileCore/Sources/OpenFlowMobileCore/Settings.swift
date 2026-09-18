@@ -1,17 +1,24 @@
 import Foundation
 
-/// Which recogniser runs. PLAN.md section 3: both sit behind `SpeechEngine`, and
-/// Milestone M2 decides which one ships first.
+/// Which recogniser runs. PLAN.md section 3 and `M2-MOONSHINE.md`: Moonshine,
+/// base-en by default and tiny-en for a phone that would rather spend 44 MB than
+/// 141 MB. Both sit behind `SpeechEngine`, so the accurate Qwen option can come
+/// back later as a third case without anything above this line noticing.
+///
+/// The raw values are what `SettingsStore` writes into the App Group, so they are
+/// part of the on-disk format. `qwen06` and `whisper` were the M1 cases and are
+/// gone; a phone that stored one of them reads back the default instead, which is
+/// what `SettingsStore.engine`'s `??` is there for.
 public enum EngineChoice: String, Sendable, CaseIterable, Identifiable {
-    case qwen06
-    case whisper
+    case moonshineBase
+    case moonshineTiny
 
     public var id: String { rawValue }
 
     public var displayName: String {
         switch self {
-        case .qwen06: return "Qwen3-ASR 0.6B"
-        case .whisper: return "Whisper (Neural Engine)"
+        case .moonshineBase: return "Moonshine base-en"
+        case .moonshineTiny: return "Moonshine tiny-en"
         }
     }
 }
@@ -30,7 +37,7 @@ public final class SettingsStore: @unchecked Sendable {
     /// The defaults from PLAN.md section 4, in one place so the tests and the UI
     /// cannot drift from the plan independently.
     public enum Defaults {
-        public static let engine: EngineChoice = .qwen06
+        public static let engine: EngineChoice = .moonshineBase
         public static let stopOnSilence = false
         public static let silenceHoldMs = 1_200
         public static let dictionary = ""
@@ -72,6 +79,10 @@ public final class SettingsStore: @unchecked Sendable {
 
     // MARK: - Values
 
+    /// A stored value that no longer names a case falls back to the default
+    /// rather than refusing to read the suite. That is not defensive coding for
+    /// its own sake: M2 removed two cases that shipped in M1 builds, so an
+    /// upgrade really does find `qwen06` sitting in the App Group.
     public var engine: EngineChoice {
         get { (defaults.string(forKey: Key.engine.rawValue).flatMap(EngineChoice.init(rawValue:))) ?? Defaults.engine }
         set { defaults.set(newValue.rawValue, forKey: Key.engine.rawValue) }
@@ -90,8 +101,9 @@ public final class SettingsStore: @unchecked Sendable {
     }
 
     /// Names and terms, same 800-character budget as the desktop's Whisper
-    /// prompt. On the phone it drives `DictionaryPostPass`, because Qwen ignores
-    /// prompts (PLAN.md section 3).
+    /// prompt. On the phone it drives `DictionaryPostPass`, and is also offered
+    /// to the engine as key terms where the loaded model can take them
+    /// (`M2-MOONSHINE.md`). The post-pass is the part that is guaranteed.
     public var dictionary: String {
         get { defaults.string(forKey: Key.dictionary.rawValue) ?? Defaults.dictionary }
         set { defaults.set(DictionaryPostPass.capped(newValue) ?? "", forKey: Key.dictionary.rawValue) }

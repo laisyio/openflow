@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import OpenFlowMobileCore
+import OpenFlowMoonshineEngine
 
 #if canImport(UIKit)
 import UIKit
@@ -61,13 +62,20 @@ final class DictationController {
         let settings = SettingsStore.shared()
         self.settings = settings
 
-        // The Simulator has no weights and no Metal-backed engine, so a build
-        // with -D OPENFLOW_FAKE_ENGINE exercises the whole product -- sheet,
-        // history, keyboard, Live Activity -- against a stub. PLAN.md section 6.
+        // A build with -D OPENFLOW_FAKE_ENGINE exercises the whole product --
+        // sheet, history, keyboard, Live Activity -- before any weights have been
+        // downloaded. PLAN.md section 6.
         #if OPENFLOW_FAKE_ENGINE
         let engine: any SpeechEngine = FakeEngine(loadSeconds: 0, transcribeSeconds: 0)
         #else
-        let engine: any SpeechEngine = UnavailableEngine(choice: settings.engine)
+        // Moonshine, reading the weights `ModelDownloader` installed. The engine
+        // is constructed even when nothing is downloaded yet: `load()` throws
+        // `modelUnavailable` naming the missing file, which is what the download
+        // screen is for, and constructing it costs nothing until then.
+        let engine: any SpeechEngine = MoonshineSpeechEngine(
+            choice: settings.engine,
+            store: ModelStore.applicationSupportOrTemporary()
+        )
         #endif
         self.engineIdentifier = engine.identifier
         self.manager = ModelManager(
@@ -394,31 +402,5 @@ final class DictationController {
             }
         }
         return (error as NSError).localizedDescription
-    }
-}
-
-/// The engine slot before M2 fills it. It refuses rather than pretending, which
-/// is the same rule PLAN.md section 7 applies to CPU fallback: fail loudly.
-actor UnavailableEngine: SpeechEngine {
-    nonisolated let identifier: String
-    private let choice: EngineChoice
-
-    init(choice: EngineChoice) {
-        self.choice = choice
-        self.identifier = choice.rawValue
-    }
-
-    var residentBytes: Int { 0 }
-
-    func load() async throws {
-        throw SpeechEngineError.modelUnavailable(
-            "\(choice.displayName) is not built into this version yet. Milestone M2 adds it."
-        )
-    }
-
-    func unload() async {}
-
-    func transcribe(samples16k: [Float]) async throws -> Transcript {
-        throw SpeechEngineError.modelUnavailable("No speech engine is installed.")
     }
 }

@@ -11,6 +11,11 @@ import Foundation
 public actor FakeEngine: SpeechEngine {
     public nonisolated let identifier = "fake"
 
+    /// The default resident figure is Moonshine base-en's order of magnitude
+    /// (`EngineProfile`), not a round gigabyte: a Simulator build reading a cost
+    /// four times the real one out of the Settings footer would send somebody
+    /// looking for a memory problem that does not exist.
+    ///
     /// Injected so a test can make a load take as long as it needs to without
     /// any real waiting. Nil means "return immediately".
     private let clock: IdleClock?
@@ -33,7 +38,7 @@ public actor FakeEngine: SpeechEngine {
         clock: IdleClock? = nil,
         loadSeconds: Double = 0,
         transcribeSeconds: Double = 0,
-        residentBytes: Int = 1_000_000_000
+        residentBytes: Int = 420_000_000
     ) {
         self.clock = clock
         self.loadSeconds = loadSeconds
