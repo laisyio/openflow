@@ -234,26 +234,11 @@ impl AudioRecorder {
                                 continue;
                             }
                         };
-                        if samples_data.is_empty() {
-                            let _ =
-                                reply
-                                    .send(Err("No audio recorded. Check microphone permissions."
-                                        .to_string()));
-                            continue;
-                        }
-                        let Some(mono_16k) = prepare_take(&samples_data, native_sample_rate) else {
-                            let _ = reply.send(Err("Recording too short.".to_string()));
-                            continue;
-                        };
-                        if is_silent(&mono_16k) {
-                            let _ = reply.send(Err(format!(
-                                "No sound reached OpenFlow from \"{}\". Pick a different microphone in Settings.",
-                                active_device_name
-                            )));
-                            continue;
-                        }
-                        let result = encode_wav(&auto_gain(&mono_16k), 16_000);
-                        let _ = reply.send(result);
+                        let _ = reply.send(encode_stopped(
+                            &samples_data,
+                            native_sample_rate,
+                            &active_device_name,
+                        ));
                     }
                     RecordCommand::Snapshot(reply) => {
                         if active_stream.is_none() {
@@ -553,22 +538,34 @@ const MAX_GAIN: f32 = 20.0;
 /// Measured across clean speech / speech+transient / speech+2s leading silence,
 /// this holds the gain within ~18% (4.38 / 4.21 / 5.06) where the peak rule
 /// swings 10.31 / 1.00 / 10.31 and plain RMS swings 6.90 / 1.76 / 8.90.
-fn auto_gain(samples: &[f32]) -> Vec<f32> {
-    if samples.is_empty() {
-        return Vec::new();
-    }
-
-    let level = speech_level(samples);
-
+fn apply_gain(samples: &mut [f32], level: f32) {
     if level < 1e-4 {
-        return samples.to_vec();
+        return;
     }
-
     let gain = (TARGET_PEAK / level).clamp(1.0, MAX_GAIN);
-    samples
-        .iter()
-        .map(|sample| (sample * gain).clamp(-1.0, 1.0))
-        .collect()
+    for sample in samples {
+        *sample = (*sample * gain).clamp(-1.0, 1.0);
+    }
+}
+
+/// Gate and boost the already-owned resampled take using one percentile
+/// selection. The magnitude scratch buffer is gone before the in-place gain
+/// and WAV encoding; no second p95 scratch or boosted-sample copy is needed.
+fn gain_if_audible(samples: &mut [f32]) -> bool {
+    let level = speech_level(samples);
+    if level < SILENCE_LEVEL {
+        return false;
+    }
+    apply_gain(samples, level);
+    true
+}
+
+#[cfg(test)]
+fn auto_gain(samples: &[f32]) -> Vec<f32> {
+    let level = speech_level(samples);
+    let mut gained = samples.to_vec();
+    apply_gain(&mut gained, level);
+    gained
 }
 
 /// 95th percentile of |sample|: the level of the loud part of a take, which
@@ -597,6 +594,7 @@ const SILENCE_LEVEL: f32 = 1e-3;
 /// Refuse the upload instead. This is a whole-take gate, not the per-sample
 /// silence stripping removed twice (3a9ebee, 0865284) for cutting speech from
 /// low-gain mics: a quiet real take still measures 10x to 50x above the line.
+#[cfg(test)]
 fn is_silent(samples: &[f32]) -> bool {
     speech_level(samples) < SILENCE_LEVEL
 }
@@ -676,10 +674,25 @@ fn downsample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     for i in 0..output_len {
         let center = (i as f64 * ratio) as isize;
         let mut acc = 0.0_f32;
-        for (k, &tap) in taps.iter().enumerate() {
-            let index = center + k as isize - half;
-            if index >= 0 && (index as usize) < samples.len() {
-                acc += samples[index as usize] * tap;
+        // Almost every window is entirely inside the recording. Check that
+        // once, rather than branching for each of its 63 taps. Keep the same
+        // left-to-right f32 operations: no reassociation, FMA or filter change.
+        let window = usize::try_from(center - half)
+            .ok()
+            .and_then(|start| samples.get(start..))
+            .and_then(|remaining| remaining.get(..taps.len()));
+        if let Some(window) = window {
+            for (&sample, &tap) in window.iter().zip(&taps) {
+                acc += sample * tap;
+            }
+        } else {
+            // At the two ends preserve the original skipped out-of-bounds
+            // taps, including the first/last samples and very short takes.
+            for (k, &tap) in taps.iter().enumerate() {
+                let index = center + k as isize - half;
+                if index >= 0 && (index as usize) < samples.len() {
+                    acc += samples[index as usize] * tap;
+                }
             }
         }
         output.push(acc);
@@ -714,13 +727,34 @@ fn prepare_take(captured: &[f32], native_sample_rate: u32) -> Option<Vec<f32>> {
 /// The caller treats every `Err` here as a reading skipped, so a silent window
 /// costs one update of a preview and nothing else.
 fn encode_partial(captured: &[f32], native_sample_rate: u32) -> Result<Vec<u8>, String> {
-    let Some(mono_16k) = prepare_take(captured, native_sample_rate) else {
+    let Some(mut mono_16k) = prepare_take(captured, native_sample_rate) else {
         return Err("Not enough audio yet".to_string());
     };
-    if is_silent(&mono_16k) {
+    if !gain_if_audible(&mut mono_16k) {
         return Err("Nothing to preview yet".to_string());
     }
-    encode_wav(&auto_gain(&mono_16k), 16_000)
+    encode_wav(&mono_16k, 16_000)
+}
+
+/// The stop encoder is separate from device control so its exact user-facing
+/// errors and audio bytes can be checked without opening a microphone.
+fn encode_stopped(
+    captured: &[f32],
+    native_sample_rate: u32,
+    device: &str,
+) -> Result<Vec<u8>, String> {
+    if captured.is_empty() {
+        return Err("No audio recorded. Check microphone permissions.".to_string());
+    }
+    let Some(mut mono_16k) = prepare_take(captured, native_sample_rate) else {
+        return Err("Recording too short.".to_string());
+    };
+    if !gain_if_audible(&mut mono_16k) {
+        return Err(format!(
+            "No sound reached OpenFlow from \"{device}\". Pick a different microphone in Settings."
+        ));
+    }
+    encode_wav(&mono_16k, 16_000)
 }
 
 fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, String> {
@@ -756,6 +790,14 @@ pub fn wav_duration_ms(bytes: &[u8]) -> Option<i64> {
     }
     Some((u64::from(reader.duration()) * 1_000 / u64::from(sample_rate)) as i64)
 }
+
+#[cfg(test)]
+#[path = "audio_gain_perf_tests.rs"]
+mod gain_perf_tests;
+
+#[cfg(test)]
+#[path = "audio_resample_perf_tests.rs"]
+mod resample_perf_tests;
 
 #[cfg(test)]
 mod tests {

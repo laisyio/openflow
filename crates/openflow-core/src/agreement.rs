@@ -107,6 +107,24 @@ pub fn disagreement(preview: &str, take: &str) -> f64 {
 }
 
 fn edit_distance(a: &[String], b: &[String]) -> usize {
+    // Preview and final take usually share most of their words. Equal ends
+    // cannot change Levenshtein distance, so keep the quadratic work confined
+    // to the changed middle. Trim the suffix after the prefix to avoid overlap.
+    let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let (a, b) = (&a[prefix..], &b[prefix..]);
+    let suffix = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (a, b) = (&a[..a.len() - suffix], &b[..b.len() - suffix]);
+    if a.is_empty() || b.is_empty() {
+        return a.len().max(b.len());
+    }
+    // Distance is symmetric; use the shorter side for the two working rows.
+    // The public score still uses the original take length as its denominator.
+    let (a, b) = if a.len() < b.len() { (b, a) } else { (a, b) };
     let mut previous: Vec<usize> = (0..=b.len()).collect();
     let mut current = vec![0usize; b.len() + 1];
     for (i, x) in a.iter().enumerate() {
@@ -120,6 +138,10 @@ fn edit_distance(a: &[String], b: &[String]) -> usize {
     }
     previous[b.len()]
 }
+
+#[cfg(test)]
+#[path = "agreement_perf_tests.rs"]
+mod performance_tests;
 
 #[cfg(test)]
 mod tests {
