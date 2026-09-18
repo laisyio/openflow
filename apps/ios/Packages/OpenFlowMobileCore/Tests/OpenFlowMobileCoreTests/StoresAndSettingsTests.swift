@@ -69,10 +69,10 @@ import Testing
 
     @Test func testLastTranscriptRoundTrips() throws {
         let store = TranscriptStore(directory: temporaryDirectory())
-        #expect(nil == store.loadLast())
+        #expect(nil == store.lastEntry())
         let record = TranscriptRecord(text: "hello phone", durationSeconds: 2.5, engine: "fake")
         try store.saveLast(record)
-        #expect(store.loadLast() == record)
+        #expect(store.lastEntry() == record)
     }
 
     /// The retention window from PLAN.md section 4, with `now` injected so the
@@ -96,6 +96,56 @@ import Testing
         #expect(tightened.map(\.text) == ["today"])
     }
 
+    /// Retention bounds the file in days, which is not a bound at all for
+    /// somebody who dictates all day: the cap is what turns it into one. The
+    /// records that fall off are the oldest, the same end retention takes.
+    @Test func testHistoryIsCappedAtItsDocumentedCeiling() throws {
+        let store = TranscriptStore(directory: temporaryDirectory())
+        let now = Date()
+        let overflowing = TranscriptStore.maxEntries + 25
+        let records = (0..<overflowing).map { index in
+            TranscriptRecord(
+                text: "take \(index)",
+                createdAt: now.addingTimeInterval(Double(index) - Double(overflowing))
+            )
+        }
+        try store.append(records[0], retentionDays: 30, now: now)
+        let kept = TranscriptStore.pruned(records, retentionDays: 30, now: now)
+
+        #expect(kept.count == TranscriptStore.maxEntries)
+        #expect(kept.first?.text == "take 25", "the oldest are what the cap drops")
+        #expect(kept.last?.text == "take \(overflowing - 1)", "the newest take survives")
+    }
+
+    /// The cap has to be capable of doing nothing. A history one record short of
+    /// it must come back whole, or the assertion above would pass on a rule that
+    /// truncates everything.
+    @Test func testTheCapLeavesASmallerHistoryAlone() throws {
+        let now = Date()
+        let records = (0..<(TranscriptStore.maxEntries - 1)).map { index in
+            TranscriptRecord(text: "take \(index)", createdAt: now.addingTimeInterval(Double(index) - 86_400))
+        }
+        let kept = TranscriptStore.pruned(records, retentionDays: 30, now: now)
+        #expect(kept.count == TranscriptStore.maxEntries - 1)
+        #expect(kept.first?.text == "take 0")
+    }
+
+    /// `lastEntry()` is the cheap path: it must answer from `last.json` alone,
+    /// so a history file that is missing, or full of something else entirely,
+    /// changes nothing about what it returns.
+    @Test func testLastEntryNeverReadsTheHistoryFile() throws {
+        let directory = temporaryDirectory()
+        let store = TranscriptStore(directory: directory)
+        let newest = TranscriptRecord(text: "the one the keyboard inserts")
+        try store.append(TranscriptRecord(text: "older"), retentionDays: 30)
+        try store.saveLast(newest)
+        #expect(store.lastEntry() == newest)
+
+        try Data("not json at all".utf8).write(to: directory.appendingPathComponent("history.json"))
+        #expect(store.lastEntry() == newest, "a broken history file is not this call's problem")
+        #expect(store.loadHistory().isEmpty, "and the list read is the one that has to cope with it")
+    }
+
     @Test func testDeleteOneAndDeleteAll() throws {
         let store = TranscriptStore(directory: temporaryDirectory())
         let first = TranscriptRecord(text: "one")
@@ -109,12 +159,12 @@ import Testing
 
         try store.deleteAll()
         #expect(store.loadHistory().isEmpty)
-        #expect(nil == store.loadLast())
+        #expect(nil == store.lastEntry())
     }
 
     /// The keyboard extension has to tell "nothing dictated yet" apart from
     /// "the sandbox will not let me look", because only one of them is the
-    /// user's to fix. `loadLast()` collapses both to nil.
+    /// user's to fix. `lastEntry()` collapses both to nil.
     @Test func testReadLastSeparatesAnEmptyStoreFromAnUnreadableOne() throws {
         let directory = temporaryDirectory()
         let store = TranscriptStore(directory: directory)
@@ -138,7 +188,7 @@ import Testing
             return
         }
         #expect(store.readLast() == .unreadable)
-        #expect(store.loadLast() == nil, "loadLast still collapses it, which is why readLast exists")
+        #expect(store.lastEntry() == nil, "lastEntry still collapses it, which is why readLast exists")
     }
 
     @Test func testHistoryIsReadableFromASecondHandleOnTheSameDirectory() throws {
@@ -147,7 +197,7 @@ import Testing
         let writer = TranscriptStore(directory: directory)
         try writer.saveLast(TranscriptRecord(text: "from the app"))
         let reader = TranscriptStore(directory: directory)
-        #expect(reader.loadLast()?.text == "from the app")
+        #expect(reader.lastEntry()?.text == "from the app")
     }
 }
 
