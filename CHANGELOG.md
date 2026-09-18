@@ -4,6 +4,12 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Benchmark: Cohere Transcribe measured
+By: Titan (with Claude)
+Impact: `docs/native-port/local-runner-benchmark.md`
+
+- Cohere Transcribe measured through the canonical gated weights after the terms were accepted: at 8-bit it costs what Qwen 1.7B costs and runs 2.4 times faster, with the best proper nouns and casing of any local engine. First inference in a fresh process pays a 12.7 s Metal compile, and the published repo is gated, so an accurate tier on Cohere needs an ungated 8-bit conversion of our own first.
+- Recommendation revised: Moonshine base-en light tier, Cohere 8-bit accurate tier once converted, Qwen 0.6B dropped.
 ### The phone gets a recogniser, and it is Moonshine
 By: Titan (with Claude)
 Impact: `apps/ios/Packages/OpenFlowMoonshineEngine/**` (new), `apps/ios/Packages/OpenFlowMobileCore/Sources/OpenFlowMobileCore/{Settings,ModelDownloader,ModelStore,EngineProfile,FakeEngine,SpeechEngine,SilenceGate,DictionaryPostPass}.swift`, `apps/ios/Packages/OpenFlowMobileCore/Tests/OpenFlowMobileCoreTests/{ModelDownloaderTests,EngineProfileTests,StoresAndSettingsTests}.swift`, `apps/ios/OpenFlow/{DictationController,SettingsView,ModelDownloadView}.swift`, `apps/ios/project.yml`, `apps/ios/README.md`, `apps/ios/Packages/{OpenFlowQwenEngine,OpenFlowWhisperEngine}` (deleted), `docs/mobile/PLAN.md`
