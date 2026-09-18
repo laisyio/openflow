@@ -516,6 +516,12 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
         NSRect::new(NSPoint::new(0.0, 0.0), size),
     );
     let inner = size.width - MARGIN * 2.0;
+    crate::ui::page_heading(
+        mtm,
+        &view,
+        "Plugins",
+        "Only enable plugins you trust. Local-only protection does not restrict plugin code.",
+    );
 
     // ── Bottom row: the verbs, and the status line above them ──
     let mut x = MARGIN;
@@ -548,7 +554,7 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
 
     // ── The list, on a card above them ──
     let card_bottom = MARGIN + 30.0 + 16.0 + GAP;
-    let card_height = (size.height - MARGIN - card_bottom).max(0.0);
+    let card_height = (size.height - MARGIN - crate::ui::PAGE_HEADER_HEIGHT - card_bottom).max(0.0);
     let card = Card::new(
         mtm,
         NSRect::new(
@@ -591,6 +597,8 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
     table.setUsesAlternatingRowBackgroundColors(false);
     table.setAllowsMultipleSelection(false);
     scroll.setHasVerticalScroller(true);
+    scroll.setHasHorizontalScroller(true);
+    scroll.setAutohidesScrollers(true);
     scroll.setBorderType(objc2_app_kit::NSBorderType::NoBorder);
     scroll.setDrawsBackground(false);
     scroll.setDocumentView(Some(&table));
@@ -628,6 +636,23 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
             reveal,
         },
     )
+}
+
+pub(super) fn preview_views(mtm: MainThreadMarker) -> Vec<(String, Retained<NSView>)> {
+    [
+        ("plugins", NSSize::new(704.0, 620.0)),
+        ("plugins-narrow", NSSize::new(520.0, 440.0)),
+    ]
+    .into_iter()
+    .map(|(name, size)| {
+        let (view, controls) = build_content(mtm, size);
+        controls
+            .table
+            .enclosingScrollView()
+            .inspect(|scroll| scroll.setHidden(true));
+        (name.to_string(), view)
+    })
+    .collect()
 }
 
 #[cfg(test)]

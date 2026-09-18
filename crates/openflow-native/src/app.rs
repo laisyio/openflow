@@ -661,6 +661,22 @@ pub fn main() {
         std::process::exit(self_check());
     }
     let arguments: Vec<String> = std::env::args().collect();
+    if let Some(index) = arguments.iter().position(|a| a == "--ui-snapshots") {
+        let Some(path) = arguments.get(index + 1) else {
+            eprintln!("--ui-snapshots needs a new output directory");
+            std::process::exit(2);
+        };
+        match crate::ui::snapshots::run(std::path::Path::new(path)) {
+            Ok(count) => {
+                println!("Rendered {count} native layout snapshots to {path}");
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("Native snapshots failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Some(index) = arguments.iter().position(|a| a == "--transcribe") {
         let Some(path) = arguments.get(index + 1) else {
             eprintln!("--transcribe needs the path to a .wav file");

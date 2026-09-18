@@ -7,13 +7,10 @@
 //! the way out of a wizard the user does not want to finish.
 //! First-run setup: the native form of `App.tsx`'s onboarding screen.
 //!
-//! The web wizard has three steps (provider, credentials, models). This one has
-//! five, because two things the web build did elsewhere have nowhere else to go
-//! in a menu bar app: a welcome panel that says what the hotkey does, and a
-//! closing panel that says setup is saved and hands the user to Settings. The
-//! copy, the provider list, the recommended badge, the "an empty key is only
-//! valid for a custom endpoint" rule and the model defaults are the web
-//! screen's, verbatim where they fit an AppKit control.
+//! Cloud setup has five panels; private setup skips the credential panel but
+//! keeps microphone, shortcut and history preferences. The final panel reports
+//! saved configuration, not permission or model readiness. Private setup hands
+//! off to the existing runner installer and model downloader in Settings.
 //!
 //! Nothing is written until the user finishes: the web wizard also saves once,
 //! in `finishOnboarding`, and a wizard that wrote as it went would leave a
@@ -45,31 +42,18 @@ use openflow_core::engine::Engine;
 use openflow_core::transcribe::ModelInfo;
 
 use crate::ui::recorder::ChordRecorder;
-use crate::ui::settings::{join_provider, split_provider};
+use crate::ui::settings::{join_provider, provider_is_loopback, split_provider};
 use crate::ui::{
     allow_wrapping, button, combo, label, note, popup, radio, secure_field, switch_control,
-    text_field, wire, wrap, Form, ROW,
+    text_field, wire, Form, ROW,
 };
 
-const WINDOW_WIDTH: f64 = 520.0;
-/// The panel area, and the window that has to hold the tallest panel.
-///
-/// `Form` lays out downward from the height it was given and does not stop at
-/// zero, and an `NSView` does not clip its subviews, so a panel that outgrows
-/// [`STEP_HEIGHT`] is not cropped -- it keeps going past the bottom of the tab
-/// view and draws on top of the error line and the Back/Continue row. That is
-/// what the provider panel was doing: measured at build time the five panels
-/// come to 170, **461**, 257, 205 and 150pt, and the provider one was being
-/// laid out into 380.
-///
-/// So this is the tallest panel, not a guess, and the window is that plus the
-/// 140pt of chrome around it (68 above for the kicker and heading, 72 below for
-/// the error line and the buttons). A panel that grows past it goes back to
-/// drawing over the buttons, so re-measure when one does: the number is the
-/// lowest subview origin in each panel view, subtracted from `STEP_HEIGHT`.
-const WINDOW_HEIGHT: f64 = STEP_HEIGHT + 140.0;
-const STEP_WIDTH: f64 = 488.0;
-const STEP_HEIGHT: f64 = 461.0;
+const WINDOW_WIDTH: f64 = 640.0;
+/// Fixed-size sheet with a separate heading and navigation region. Form does
+/// not clip overflowing rows: the snapshot/layout checks must cover all steps.
+const WINDOW_HEIGHT: f64 = STEP_HEIGHT + 164.0;
+const STEP_WIDTH: f64 = WINDOW_WIDTH - 48.0;
+const STEP_HEIGHT: f64 = 500.0;
 
 /// The box the line under the microphone picker gets.
 ///
@@ -127,17 +111,12 @@ impl Step {
     /// The heading, matching the web wizard where the panel matches.
     pub fn title(self) -> &'static str {
         match self {
-            Step::Welcome => "Say it once. Keep moving.",
-            Step::Provider => "Choose how OpenFlow listens",
+            Step::Welcome => "Less typing. More flow.",
+            Step::Provider => "Where should your words go?",
             Step::Credentials => "Connect your provider",
             Step::Preferences => "Make it yours",
-            Step::Done => "OpenFlow is ready",
+            Step::Done => "Your preferences are saved",
         }
-    }
-
-    /// The web wizard's step kicker, counted over this wizard's panels.
-    pub fn kicker(self) -> String {
-        format!("Setup · {} of {}", self.index() + 1, Self::ORDER.len())
     }
 
     /// What the primary button says on this panel.
@@ -147,7 +126,7 @@ impl Step {
             Step::Provider => "Continue to connection",
             Step::Credentials => "Continue to preferences",
             Step::Preferences => "Finish setup",
-            Step::Done => "Open settings",
+            Step::Done => "Open my workspace",
         }
     }
 }
@@ -293,12 +272,84 @@ pub const PROVIDER_OPTIONS: &[ProviderOption] = &[
 /// The stored value the on-this-Mac card stands for. Not a member of
 /// [`PROVIDER_OPTIONS`]: it is a *backend*, not a provider -- it has no key, no
 /// endpoint and no model list to test -- so it sits beside the grid as its own
-/// radio and short-circuits the rest of the wizard.
+/// radio and skips only the cloud credential panel.
 pub const LOCAL_CARD: &str = "local";
 /// The card's title and the sentence under it.
 pub const LOCAL_CARD_LABEL: &str = "On this Mac (private)";
 pub const LOCAL_CARD_DESCRIPTION: &str =
-    "Runs Qwen3-ASR on this Mac. No key, no network, and no audio leaves the machine. Needs Python and a one-time download.";
+    "No API key. Speech stays on your Mac. Requires Python and a one-time model download; works offline after setup.";
+
+/// Local setup skips credentials, never microphone and privacy preferences.
+fn next_step(step: Step, local: bool) -> Step {
+    if step == Step::Provider && local {
+        Step::Preferences
+    } else {
+        step.next()
+    }
+}
+
+fn previous_step(step: Step, local: bool) -> Step {
+    if step == Step::Preferences && local {
+        Step::Provider
+    } else {
+        step.back()
+    }
+}
+
+fn progress_text(step: Step, local: bool) -> String {
+    if local && step != Step::Credentials {
+        let position = match step {
+            Step::Welcome => 1,
+            Step::Provider => 2,
+            Step::Preferences => 3,
+            _ => 4,
+        };
+        format!("SET UP OPENFLOW  ·  {position} OF 4")
+    } else {
+        format!("SET UP OPENFLOW  ·  {} OF 5", step.index() + 1)
+    }
+}
+
+const PRIVATE_INTRO: &str = "Choose your microphone and history preference. Next, install the private engine in Settings → Providers. Cloud cleanup is turned off; no API key is needed.";
+const PRIVATE_SUMMARY: &str = "1   Install the engine in Settings → Providers.\n\n2   Download a speech model there.\n\n3   Wait for both to report ready, then try a short phrase.\n\nSpeech stays on your Mac. Downloads need internet. Enabled plugins are separate programs, not confined by Local-only protection; review them in Plugins.";
+const CLOUD_BLOCKED_MESSAGE: &str = "Local-only protection is enabled. In Settings → Providers, select On this Mac to reveal Local-only, then turn that protection off explicitly before returning to cloud setup.";
+
+fn connection_allowed(local_only: bool, provider: &str) -> bool {
+    !local_only || provider_is_loopback(provider)
+}
+
+fn cleanup_setting(local: bool, requested: bool) -> &'static str {
+    bool_setting(!local && requested)
+}
+
+/// A model-list check proves only the transcription endpoint and its key.
+/// Never treat a different cleanup endpoint as tested by that same request.
+fn cleanup_verified(
+    stt_kind: &str,
+    stt_url: &str,
+    cleanup_kind: &str,
+    cleanup_url: &str,
+    connected: bool,
+) -> bool {
+    connected
+        && !is_local_card(stt_kind)
+        && crate::ui::settings::serves_cleanup(cleanup_kind)
+        && join_provider(stt_kind, stt_url).trim_end_matches('/')
+            == join_provider(cleanup_kind, cleanup_url).trim_end_matches('/')
+}
+
+const CLEANUP_DISCLOSURE: &str =
+    "Optional: sends transcript text to your cleanup provider for rewriting.";
+const SEPARATE_CLEANUP_DISCLOSURE: &str =
+    "Cleanup is off. Set up a separate cleanup provider in Settings → Providers.";
+
+fn finish_destination(local: bool) -> &'static str {
+    if local {
+        "providers"
+    } else {
+        "dictate"
+    }
+}
 
 /// Whether a wizard selection is the on-this-Mac card rather than a provider.
 pub fn is_local_card(kind: &str) -> bool {
@@ -336,7 +387,7 @@ pub fn summary_line(kind: &str, model: &str, microphone: &str, shortcut: &str) -
         );
     }
     format!(
-        "{} · {} · {} · hold {} to dictate, active now",
+        "{} · {} · {} · shortcut: {}. Microphone and Accessibility permission may still be needed.",
         provider, model, microphone, shortcut
     )
 }
@@ -402,7 +453,7 @@ pub fn microphone_note(listed: Result<usize, &str>) -> String {
 /// costs a panel the user reads anyway, rather than at the first hotkey press.
 pub fn done_heading(microphone: &str) -> &'static str {
     if microphone == NO_MICROPHONE {
-        return "Setup is saved, but there is no microphone";
+        return "Saved. Connect a microphone next.";
     }
     Step::Done.title()
 }
@@ -443,6 +494,12 @@ struct Controls {
     microphone_ids: RefCell<Vec<String>>,
     refresh: Retained<NSButton>,
     hotkey: Retained<NSButton>,
+    save_history: Retained<NSSwitch>,
+    preferences_intro: Retained<NSTextField>,
+    model_labels: Vec<Retained<NSTextField>>,
+    format_enabled: Retained<NSSwitch>,
+    cleanup_note: Retained<NSTextField>,
+    done_support: Vec<Retained<NSTextField>>,
 
     summary: Retained<NSTextField>,
 }
@@ -454,6 +511,7 @@ pub struct OnboardingIvars {
     controls: Controls,
     step: Cell<Step>,
     connection: Cell<Connection>,
+    connection_generation: Cell<u64>,
     recorder: ChordRecorder,
     recording: Cell<bool>,
 }
@@ -476,9 +534,7 @@ define_class!(
         /// the wizard is built once and kept.
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
-            self.stop_recording_hotkey();
-            self.ivars().window.makeFirstResponder(None);
-            crate::ui::dismiss_sheet(&self.ivars().window, "onboarding");
+            self.dismiss();
             false
         }
     }
@@ -498,7 +554,7 @@ define_class!(
         #[unsafe(method(stepBack:))]
         fn step_back(&self, _sender: &NSControl) {
             let step = self.ivars().step.get();
-            self.show_step(step.back());
+            self.show_step(previous_step(step, is_local_card(&self.selected_provider())));
         }
 
         #[unsafe(method(stepNext:))]
@@ -511,8 +567,7 @@ define_class!(
         /// unconfigured, as it was before this was opened.
         #[unsafe(method(skipSetup:))]
         fn skip_setup(&self, _sender: &NSControl) {
-            self.ivars().window.makeFirstResponder(None);
-            crate::ui::dismiss_sheet(&self.ivars().window, "onboarding");
+            self.dismiss();
         }
 
         #[unsafe(method(providerChanged:))]
@@ -520,6 +575,19 @@ define_class!(
             // A different provider is a different key and a different model
             // list, so the connection has to be proven again.
             self.invalidate_connection();
+            // Replace shipped defaults when changing providers, but preserve
+            // explicitly entered model identifiers.
+            let controls = &self.ivars().controls;
+            let selected = self.selected_provider();
+            let option = option_for(&selected);
+            let speech = string_value(&controls.stt_model);
+            if should_replace_default(&speech, "stt") {
+                controls.stt_model.setStringValue(&NSString::from_str(option.stt_default));
+            }
+            let cleanup = string_value(&controls.chat_model);
+            if should_replace_default(&cleanup, "chat") {
+                controls.chat_model.setStringValue(&NSString::from_str(option.chat_default));
+            }
             self.apply_provider_defaults();
             self.update_chrome();
         }
@@ -581,6 +649,7 @@ impl OnboardingWindow {
             controls,
             step: Cell::new(Step::Welcome),
             connection: Cell::new(Connection::default()),
+            connection_generation: Cell::new(0),
             recorder: ChordRecorder::default(),
             recording: Cell::new(false),
         });
@@ -660,6 +729,8 @@ impl OnboardingWindow {
             &settings.api_key().ok().flatten().unwrap_or_default(),
         );
         set_switch(&controls.same_provider, settings.same_provider());
+        set_switch(&controls.save_history, settings.save_history());
+        set_switch(&controls.format_enabled, settings.format_enabled());
         let (formatting, _) = split_provider(
             &settings
                 .formatting_provider_name()
@@ -677,6 +748,9 @@ impl OnboardingWindow {
         self.set_text(&controls.connection_status, "");
         self.set_text(&controls.error, "");
         ivars.connection.set(Connection::default());
+        ivars
+            .connection_generation
+            .set(ivars.connection_generation.get().wrapping_add(1));
         self.apply_provider_defaults();
         self.show_step(Step::Welcome);
     }
@@ -738,8 +812,11 @@ impl OnboardingWindow {
         let ivars = self.ivars();
         let controls = &ivars.controls;
         let step = ivars.step.get();
-        self.set_text(&controls.kicker, &step.kicker());
-        let heading = if step == Step::Done {
+        let local = is_local_card(&self.selected_provider());
+        self.set_text(&controls.kicker, &progress_text(step, local));
+        let heading = if step == Step::Done && local {
+            "Next: install your private engine"
+        } else if step == Step::Done {
             done_heading(&self.selected_microphone())
         } else {
             step.title()
@@ -748,7 +825,24 @@ impl OnboardingWindow {
         controls
             .primary
             .setTitle(&NSString::from_str(step.primary_title()));
-        controls.back.setHidden(step == Step::Welcome);
+        controls
+            .back
+            .setHidden(step == Step::Welcome || step == Step::Done);
+        controls.later.setHidden(step == Step::Done);
+        controls.stt_model.setEnabled(!local);
+        controls.chat_model.setEnabled(!local);
+        configure_private_preferences(controls, local);
+        configure_done(controls, local);
+        self.set_text(&controls.preferences_intro, if local {
+            PRIVATE_INTRO
+        } else {
+            "Defaults are filled in for you. Microphone permission lets OpenFlow hear you; Accessibility permission lets it insert text into other apps."
+        });
+        if local && step == Step::Done {
+            controls
+                .primary
+                .setTitle(&NSString::from_str("Continue to local setup"));
+        }
 
         // Deepgram transcribes only, so one provider cannot serve both. The web
         // wizard disables the toggle for it (src/App.tsx:934); here it is
@@ -758,13 +852,13 @@ impl OnboardingWindow {
         if step == Step::Provider && is_local_card(&kind) {
             controls
                 .primary
-                .setTitle(&NSString::from_str("Set up on this Mac"));
+                .setTitle(&NSString::from_str("Continue privately"));
         }
         let deepgram = kind == "deepgram";
         if deepgram && is_on(&controls.same_provider) {
             set_switch(&controls.same_provider, false);
         }
-        controls.same_provider.setEnabled(!deepgram);
+        controls.same_provider.setEnabled(!deepgram && !local);
 
         // The web wizard hides the cleanup provider behind the same-provider
         // toggle; here it is present and inert, so the panel does not reflow.
@@ -775,7 +869,24 @@ impl OnboardingWindow {
         if same {
             select_provider_popup(&controls.formatting_provider, &kind);
         }
-        controls.formatting_provider.setEnabled(!same);
+        controls.formatting_provider.setEnabled(!same && !local);
+        controls.provider_url.setEnabled(kind == "custom");
+        let cleanup_allowed = self.cleanup_is_verified();
+        controls
+            .format_enabled
+            .setEnabled(cleanup_allowed && !local);
+        controls.chat_model.setEnabled(cleanup_allowed && !local);
+        if !cleanup_allowed && matches!(step, Step::Preferences | Step::Done) {
+            set_switch(&controls.format_enabled, false);
+        }
+        self.set_text(
+            &controls.cleanup_note,
+            if cleanup_allowed {
+                CLEANUP_DISCLOSURE
+            } else {
+                SEPARATE_CLEANUP_DISCLOSURE
+            },
+        );
     }
 
     fn advance(&self) {
@@ -785,24 +896,7 @@ impl OnboardingWindow {
             self.finish();
             return;
         }
-        // The on-this-Mac card has nothing left to ask: no key to test, no
-        // endpoint to type, no model list to fetch. Save the choice and hand
-        // the user to the panel where the install and the download live.
-        if step == Step::Provider && is_local_card(&self.selected_provider()) {
-            if let Err(error) = self.save_local() {
-                self.set_text(&ivars.controls.error, &error);
-                return;
-            }
-            // Same exit as `finish`: the wizard is a sheet on the main window
-            // now, and the runner's Install and Download live on the Settings
-            // page, so that is where the local card lands the user.
-            crate::ui::dismiss_sheet(&self.ivars().window, "onboarding");
-            crate::app::with_app(|app| {
-                app.with_settings(|page| page.reload());
-                app.show_main(Some("settings"));
-            });
-            return;
-        }
+        let local = is_local_card(&self.selected_provider());
         let (kind, url, key) = self.provider_fields();
         let proven = ivars.connection.get().proven();
         if let Err(error) = can_advance(step, &kind, &url, &key, proven) {
@@ -810,12 +904,16 @@ impl OnboardingWindow {
             return;
         }
         if step == Step::Preferences {
-            if let Err(error) = self.save() {
+            if let Err(error) = if local {
+                self.save_local()
+            } else {
+                self.save()
+            } {
                 self.set_text(&ivars.controls.error, &error);
                 return;
             }
         }
-        self.show_step(step.next());
+        self.show_step(next_step(step, local));
     }
 
     /// The provider kind, its endpoint URL and its key as the controls hold
@@ -826,6 +924,30 @@ impl OnboardingWindow {
         let url = string_value(&controls.provider_url);
         let key = string_value(&controls.api_key);
         (kind, url, key)
+    }
+
+    fn selected_cleanup_provider(&self) -> String {
+        let controls = &self.ivars().controls;
+        if is_on(&controls.same_provider) {
+            return self.selected_provider();
+        }
+        let index = controls.formatting_provider.indexOfSelectedItem().max(0) as usize;
+        formatting_options()
+            .get(index)
+            .copied()
+            .unwrap_or("groq")
+            .to_string()
+    }
+
+    fn cleanup_is_verified(&self) -> bool {
+        let (kind, url, _) = self.provider_fields();
+        cleanup_verified(
+            &kind,
+            &url,
+            &self.selected_cleanup_provider(),
+            &url,
+            self.ivars().connection.get().proven(),
+        )
     }
 
     fn selected_provider(&self) -> String {
@@ -894,6 +1016,10 @@ impl OnboardingWindow {
         let controls = &ivars.controls;
         let microphone = self.selected_microphone();
         let shortcut = controls.hotkey.title().to_string();
+        if is_local_card(&self.selected_provider()) {
+            self.set_text(&controls.summary, PRIVATE_SUMMARY);
+            return;
+        }
         let line = summary_line(
             &self.selected_provider(),
             &string_value(&controls.stt_model),
@@ -913,6 +1039,21 @@ impl OnboardingWindow {
         let controls = &ivars.controls;
         let (kind, url, key) = self.provider_fields();
         validate_provider(&kind, &url, &key)?;
+        can_advance(
+            Step::Credentials,
+            &kind,
+            &url,
+            &key,
+            ivars.connection.get().proven(),
+        )?;
+        settings.set("save_history", bool_setting(is_on(&controls.save_history)))?;
+        settings.set(
+            "format_enabled",
+            cleanup_setting(
+                false,
+                self.cleanup_is_verified() && is_on(&controls.format_enabled),
+            ),
+        )?;
 
         // Finishing the wizard on a provider is also how a user leaves the
         // local backend; without this the rows below would be saved and
@@ -922,36 +1063,18 @@ impl OnboardingWindow {
         settings.set("api_key", key.trim())?;
         settings.set(
             "same_provider",
-            bool_setting(is_on(&controls.same_provider)),
+            // Identical verified endpoints must use the tested primary key,
+            // not an older, separately stored formatting key.
+            bool_setting(is_on(&controls.same_provider) || self.cleanup_is_verified()),
         )?;
-        // Written every time, never conditionally, and the earlier note here
-        // was wrong about why. The pipeline does not read this row while "same
-        // for cleanup" is on: `run_pipeline` takes the transcription provider
-        // in that branch and only reaches `formatting_provider_name` in the
-        // else (crates/openflow-core/src/engine.rs:438-445). Nothing was
-        // unsafe. It is written anyway so the row describes the provider the
-        // engine would actually use, which is what Settings reads back and what
-        // a later flip of "same" starts from; a stale row means the Settings
-        // window shows a cleanup provider that is not the one cleaning up.
-        //
-        // One divergence from the web build, deliberate: App.tsx:654-660 leaves
-        // this row alone while "same" is on, so turning "same" off later
-        // restores the cleanup provider chosen before. Here the row carries the
-        // transcription provider, which is what the disabled popup shows, so
-        // that earlier choice is not preserved.
-        let index = controls.formatting_provider.indexOfSelectedItem().max(0) as usize;
-        let formatting = if is_on(&controls.same_provider) {
-            kind.as_str()
-        } else {
-            formatting_options()
-                .get(index)
-                .copied()
-                .unwrap_or(PROVIDER_OPTIONS[0].value)
-        };
-        // A custom cleanup endpoint reuses the transcription URL: the wizard
-        // asks for one endpoint, and Settings is where a second one is
-        // configured.
-        settings.set("formatting_provider", &join_provider(formatting, &url))?;
+        // Leave a separate provider's saved endpoint and credentials intact.
+        // This wizard cannot verify its key; configure it in Settings instead.
+        if self.cleanup_is_verified() {
+            settings.set(
+                "formatting_provider",
+                &join_provider(&self.selected_cleanup_provider(), &url),
+            )?;
+        }
         settings.set("stt_model", string_value(&controls.stt_model).trim())?;
         settings.set("chat_model", string_value(&controls.chat_model).trim())?;
         let index = controls.microphone.indexOfSelectedItem().max(0) as usize;
@@ -963,18 +1086,26 @@ impl OnboardingWindow {
         Ok(())
     }
 
-    /// What the on-this-Mac card saves: the backend, and nothing else.
+    /// Save the private backend, request protection and user preferences.
     ///
     /// No provider row is written, deliberately. The user has not chosen an
     /// online provider, and inventing one would put a service they never picked
     /// in front of any later switch back to online transcription. Setup still
-    /// counts as complete, because `Settings::onboarding_complete` treats the
-    /// local backend as an answer in its own right.
+    /// counts as configured, not installed: the closing panel explicitly hands
+    /// off to the runner and model installation controls.
     fn save_local(&self) -> Result<(), String> {
         let ivars = self.ivars();
         let settings = ivars.engine.settings();
+        // Arm the actual request guard before selecting the backend. Local
+        // speech alone must not leave a previously configured cloud cleanup on.
+        settings.set("local_only", "true")?;
+        settings.set(
+            "format_enabled",
+            cleanup_setting(true, is_on(&ivars.controls.format_enabled)),
+        )?;
         settings.set("transcription_backend", "local")?;
         let controls = &ivars.controls;
+        settings.set("save_history", bool_setting(is_on(&controls.save_history)))?;
         let index = controls.microphone.indexOfSelectedItem().max(0) as usize;
         let ids = controls.microphone_ids.borrow();
         settings.set(
@@ -991,11 +1122,21 @@ impl OnboardingWindow {
     /// until the main window existed there was no workspace to open. There is
     /// now, so the two agree again.
     fn finish(&self) {
-        crate::ui::dismiss_sheet(&self.ivars().window, "onboarding");
+        let destination = finish_destination(is_local_card(&self.selected_provider()));
+        self.dismiss();
         crate::app::with_app(|app| {
             app.with_settings(|page| page.reload());
-            app.show_main(Some("dictate"));
+            app.show_main(Some(destination));
         });
+    }
+
+    /// Every exit must restore the global shortcut and remove its temporary
+    /// recorder monitor, even Escape while capturing a new shortcut.
+    fn dismiss(&self) {
+        self.stop_recording_hotkey();
+        self.invalidate_connection();
+        self.ivars().window.makeFirstResponder(None);
+        crate::ui::dismiss_sheet(&self.ivars().window, "onboarding");
     }
 
     // ── Connection test ───────────────────────────────────
@@ -1003,20 +1144,30 @@ impl OnboardingWindow {
     fn request_models(&self) {
         let ivars = self.ivars();
         let (kind, url, key) = self.provider_fields();
+        let provider = join_provider(&kind, &url);
+        if !connection_allowed(ivars.engine.settings().local_only(), &provider) {
+            self.set_text(&ivars.controls.connection_status, CLOUD_BLOCKED_MESSAGE);
+            return;
+        }
         if let Err(error) = validate_provider(&kind, &url, &key) {
             self.set_text(&ivars.controls.connection_status, &error);
             return;
         }
         self.set_text(&ivars.controls.connection_status, "Checking access...");
+        let generation = ivars.connection_generation.get().wrapping_add(1);
+        ivars.connection_generation.set(generation);
         let engine = Arc::clone(&ivars.engine);
-        let provider = join_provider(&kind, &url);
         let key = key.trim().to_string();
         let key = (!key.is_empty()).then_some(key);
         crate::app::spawn(async move {
             let result = engine.fetch_models(Some(provider), key).await;
             crate::events::on_main(move || {
                 crate::app::with_app(|app| {
-                    app.with_onboarding(|window| window.models_loaded(&result))
+                    app.with_onboarding(|window| {
+                        if window.ivars().connection_generation.get() == generation {
+                            window.models_loaded(&result);
+                        }
+                    })
                 });
             });
         });
@@ -1037,7 +1188,7 @@ impl OnboardingWindow {
                 self.set_text(
                     &controls.connection_status,
                     &format!(
-                        "Connected to {}. Your key is valid and {} models are ready.",
+                        "Connected to {}. Access checked; {} models listed. Speech support depends on your selected model.",
                         provider,
                         models.len()
                     ),
@@ -1108,6 +1259,9 @@ impl OnboardingWindow {
     /// Forget whatever the last Test connection proved, and stop saying it.
     fn invalidate_connection(&self) {
         let ivars = self.ivars();
+        ivars
+            .connection_generation
+            .set(ivars.connection_generation.get().wrapping_add(1));
         let mut connection = ivars.connection.get();
         connection.invalidated();
         ivars.connection.set(connection);
@@ -1137,12 +1291,32 @@ fn set_switch(switch: &NSSwitch, on: bool) {
     });
 }
 
+fn name_switch(switch: &NSSwitch, name: &str) {
+    // SAFETY: NSSwitch is an accessibility element, created and updated on
+    // AppKit's main thread; AppKit copies the supplied NSString label.
+    unsafe {
+        let _: () = msg_send![switch, setAccessibilityLabel: &*NSString::from_str(name)];
+    }
+}
+
 fn bool_setting(on: bool) -> &'static str {
     if on {
         "true"
     } else {
         "false"
     }
+}
+
+fn should_replace_default(model: &str, kind: &str) -> bool {
+    model.trim().is_empty()
+        || PROVIDER_OPTIONS.iter().any(|option| {
+            model.trim()
+                == if kind == "stt" {
+                    option.stt_default
+                } else {
+                    option.chat_default
+                }
+        })
 }
 
 /// Deepgram transcribes only, so it is not offered for cleanup. Same exclusion
@@ -1172,13 +1346,62 @@ fn fill_combo(combo: &NSComboBox, models: &[ModelInfo], kind: &str) {
     }
 }
 
+/// Hide cloud-specific fields and close their two-row gap without discarding
+/// their values. Returning to cloud setup restores exactly the same layout.
+fn configure_private_preferences(controls: &Controls, local: bool) {
+    if controls.stt_model.isHidden() != local {
+        let delta = (controls.stt_model.frame().origin.y - controls.chat_model.frame().origin.y)
+            * 2.0
+            + controls.cleanup_note.frame().size.height
+            + crate::ui::GAP;
+        // SAFETY: these retained AppKit controls and their parent are created
+        // and accessed exclusively on the main thread; no view is removed here.
+        if let Some(view) = unsafe { controls.stt_model.superview() } {
+            let fixed: Vec<&NSView> = vec![
+                &controls.stt_model,
+                &controls.chat_model,
+                &controls.preferences_intro,
+                &controls.model_labels[0],
+                &controls.model_labels[1],
+                &controls.format_enabled,
+                &controls.cleanup_note,
+            ];
+            for child in view.subviews() {
+                if !fixed.iter().any(|item| std::ptr::eq(*item, &*child)) {
+                    let mut frame = child.frame();
+                    frame.origin.y += if local { delta } else { -delta };
+                    child.setFrame(frame);
+                }
+            }
+        }
+    }
+    controls.stt_model.setHidden(local);
+    controls.chat_model.setHidden(local);
+    controls.format_enabled.setHidden(local);
+    controls.cleanup_note.setHidden(local);
+    for field in &controls.model_labels {
+        field.setHidden(local);
+    }
+}
+
+fn configure_done(controls: &Controls, local: bool) {
+    let mut frame = controls.summary.frame();
+    let top = frame.origin.y + frame.size.height;
+    frame.size.height = if local { 230.0 } else { 120.0 };
+    frame.origin.y = top - frame.size.height;
+    controls.summary.setFrame(frame);
+    for field in &controls.done_support {
+        field.setHidden(local);
+    }
+}
+
 // ── Panel construction ────────────────────────────────────
 
 fn build_panels(mtm: MainThreadMarker) -> (Retained<NSTabView>, Controls) {
     let panels = NSTabView::initWithFrame(
         NSTabView::alloc(mtm),
         NSRect::new(
-            NSPoint::new(16.0, 72.0),
+            NSPoint::new(24.0, 84.0),
             NSSize::new(STEP_WIDTH, STEP_HEIGHT),
         ),
     );
@@ -1189,9 +1412,21 @@ fn build_panels(mtm: MainThreadMarker) -> (Retained<NSTabView>, Controls) {
     let (provider_view, providers, local_card, same_provider, formatting_provider) =
         build_provider(mtm);
     let (credentials_view, provider_url, api_key, connection_status, test) = build_credentials(mtm);
-    let (preferences_view, stt_model, chat_model, microphone, microphone_note, refresh, hotkey) =
-        build_preferences(mtm);
-    let (done_view, summary) = build_done(mtm);
+    let (
+        preferences_view,
+        stt_model,
+        chat_model,
+        microphone,
+        microphone_note,
+        refresh,
+        hotkey,
+        save_history,
+        preferences_intro,
+        model_labels,
+        format_enabled,
+        cleanup_note,
+    ) = build_preferences(mtm);
+    let (done_view, summary, done_support) = build_done(mtm);
 
     for (title, view) in [
         ("Welcome", &welcome_view),
@@ -1215,23 +1450,25 @@ fn build_panels(mtm: MainThreadMarker) -> (Retained<NSTabView>, Controls) {
         mtm,
         "",
         NSRect::new(
-            NSPoint::new(20.0, WINDOW_HEIGHT - 34.0),
+            NSPoint::new(24.0, WINDOW_HEIGHT - 32.0),
             NSSize::new(STEP_WIDTH, 14.0),
         ),
     );
+    kicker.setFont(Some(&crate::ui::body_font(11.0)));
     let heading = NSTextField::labelWithString(&NSString::from_str(""), mtm);
     heading.setFrame(NSRect::new(
-        NSPoint::new(20.0, WINDOW_HEIGHT - 60.0),
-        NSSize::new(STEP_WIDTH, 22.0),
+        NSPoint::new(24.0, WINDOW_HEIGHT - 74.0),
+        NSSize::new(STEP_WIDTH, 36.0),
     ));
-    heading.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(15.0)));
+    heading.setFont(Some(&crate::ui::display_font(28.0)));
 
     let error = note(
         mtm,
         "",
-        NSRect::new(NSPoint::new(20.0, 48.0), NSSize::new(STEP_WIDTH, 16.0)),
+        NSRect::new(NSPoint::new(24.0, 52.0), NSSize::new(STEP_WIDTH, 28.0)),
     );
     error.setTextColor(Some(&objc2_app_kit::NSColor::systemRedColor()));
+    allow_wrapping(&error, STEP_WIDTH);
 
     let back = button(
         mtm,
@@ -1284,6 +1521,12 @@ fn build_panels(mtm: MainThreadMarker) -> (Retained<NSTabView>, Controls) {
         microphone_ids: RefCell::new(vec![String::new()]),
         refresh,
         hotkey,
+        save_history,
+        preferences_intro,
+        model_labels,
+        format_enabled,
+        cleanup_note,
+        done_support,
         summary,
     };
     (panels, controls)
@@ -1291,25 +1534,38 @@ fn build_panels(mtm: MainThreadMarker) -> (Retained<NSTabView>, Controls) {
 
 fn build_welcome(mtm: MainThreadMarker) -> Retained<NSView> {
     let mut form = Form::new(mtm, STEP_WIDTH, STEP_HEIGHT);
-    let frame = form.full(44.0);
-    form.add(&note(
-        mtm,
-        "Hold a shortcut, speak naturally, and polished text lands where you are working.",
-        frame,
-    ));
-    let frame = form.full(44.0);
-    form.add(&note(
-        mtm,
-        "Your key stays on this device, in the macOS keychain. Audio goes only to the provider you choose.",
-        frame,
-    ));
-    let frame = form.full(44.0);
-    form.add(&note(
-        mtm,
-        "Setup takes three panels: pick a provider, connect it, and choose a microphone and a shortcut.",
-        frame,
-    ));
+    add_paragraph(&mut form, mtm,
+        "Turn a thought into text, without leaving what you’re doing. A short setup puts you in control of how it works.", 54.0);
+    for (title, body) in [
+        ("01   Choose your comfort zone", "Keep speech on this Mac, or connect a cloud provider. You can change this later."),
+        ("02   Make it feel natural", "Pick a microphone and a shortcut. Hold to speak; release to turn your words into text."),
+        ("03   Start where you work", "Use OpenFlow in messages, documents and other apps. Review or copy your latest result in the workspace."),
+    ] {
+        let frame = form.full(26.0);
+        let title = label(mtm, title, frame);
+        title.setFont(Some(&crate::ui::display_font(17.0)));
+        title.setAlignment(objc2_app_kit::NSTextAlignment::Left);
+        form.add(&title);
+        add_paragraph(&mut form, mtm, body, 42.0);
+        form.full(6.0);
+    }
+    add_paragraph(&mut form, mtm,
+        "No microphone is started during setup. Nothing is saved until you finish, except a shortcut you choose to record.", 42.0);
     form.view.clone()
+}
+
+fn add_paragraph(
+    form: &mut Form,
+    mtm: MainThreadMarker,
+    text: &str,
+    height: f64,
+) -> Retained<NSTextField> {
+    let frame = form.full(height);
+    let field = note(mtm, text, frame);
+    field.setFont(Some(&crate::ui::body_font(13.0)));
+    allow_wrapping(&field, frame.size.width);
+    form.add(&field);
+    field
 }
 
 #[allow(clippy::type_complexity)]
@@ -1323,12 +1579,14 @@ fn build_provider(
     Retained<NSPopUpButton>,
 ) {
     let mut form = Form::new(mtm, STEP_WIDTH, STEP_HEIGHT);
-    let frame = form.full(28.0);
-    form.add(&note(
-        mtm,
-        "Groq is the fastest path: one key covers Whisper transcription, cleanup, and Orpheus voice.",
-        frame,
-    ));
+    add_paragraph(&mut form, mtm,
+        "Choose private, on-device speech or a cloud service. Cloud dictation sends audio to your provider; optional cleanup sends transcript text.", 40.0);
+
+    let frame = form.full(24.0);
+    let local_card = radio(mtm, frame, LOCAL_CARD_LABEL, TAG_LOCAL_CARD);
+    local_card.setFont(Some(&crate::ui::display_font(15.0)));
+    form.add(&local_card);
+    add_paragraph(&mut form, mtm, LOCAL_CARD_DESCRIPTION, 36.0);
 
     let mut providers = Vec::new();
     for (index, option) in PROVIDER_OPTIONS.iter().enumerate() {
@@ -1340,6 +1598,7 @@ fn build_provider(
             TAG_PROVIDER_BASE + index as isize,
         );
         form.add(&button);
+        button.setFont(Some(&crate::ui::body_font(13.0)));
         if let Some(badge) = badge_text(option) {
             let badge_frame = NSRect::new(
                 NSPoint::new(STEP_WIDTH - 100.0, frame.origin.y),
@@ -1359,34 +1618,6 @@ fn build_provider(
         ));
     }
 
-    // The on-this-Mac card: last, and in the same radio group, because it is an
-    // answer to the same question. It carries no key and no endpoint, so
-    // choosing it ends setup on this panel.
-    let frame = form.full(18.0);
-    let local_card = radio(
-        mtm,
-        NSRect::new(frame.origin, NSSize::new(STEP_WIDTH - 110.0, 18.0)),
-        LOCAL_CARD_LABEL,
-        TAG_LOCAL_CARD,
-    );
-    form.add(&local_card);
-    // The sentence under the card is 607pt of text in a 468pt column, in a row
-    // that was tall enough for two lines but never had wrapping turned on. So
-    // it drew as one line and was cut mid-word: "...No key, no network, and no
-    // audio leaves the machine. Needs Pyth". Wrapped, it is 26pt -- which is
-    // what the 28 was guessing at -- so the row is measured rather than guessed.
-    let note_x = frame.origin.x + 20.0;
-    let note_width = STEP_WIDTH - 20.0 - frame.origin.x;
-    let local_note = note(
-        mtm,
-        LOCAL_CARD_DESCRIPTION,
-        NSRect::new(NSPoint::new(note_x, 0.0), NSSize::new(note_width, 14.0)),
-    );
-    wrap(&local_note, note_width);
-    let frame = form.full(local_note.frame().size.height);
-    local_note.setFrameOrigin(NSPoint::new(note_x, frame.origin.y));
-    form.add(&local_note);
-
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Same for cleanup", l));
     let same_provider = switch_control(
@@ -1394,6 +1625,7 @@ fn build_provider(
         NSRect::new(c.origin, NSSize::new(38.0, c.size.height)),
         TAG_SAME_PROVIDER,
     );
+    name_switch(&same_provider, "Use transcription provider for cleanup");
     form.add(&same_provider);
 
     let (l, c) = form.row(ROW);
@@ -1406,7 +1638,7 @@ fn build_provider(
     form.add(&formatting_provider);
     form.note_row(
         mtm,
-        "Deepgram handles speech only; it cannot clean text up.",
+        "Cleanup is optional text rewriting. Cloud cleanup is disabled for private setup.",
     );
 
     (
@@ -1429,12 +1661,8 @@ fn build_credentials(
     Retained<NSButton>,
 ) {
     let mut form = Form::new(mtm, STEP_WIDTH, STEP_HEIGHT);
-    let frame = form.full(28.0);
-    form.add(&note(
-        mtm,
-        "We check access before saving anything. OpenFlow never sends your key anywhere else.",
-        frame,
-    ));
+    add_paragraph(&mut form, mtm,
+        "An API key is a credential that lets OpenFlow use your provider account. Create one in the provider’s dashboard, then paste it below. Provider usage may require payment or credits.", 64.0);
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Endpoint URL", l));
@@ -1458,7 +1686,11 @@ fn build_credentials(
     form.add(&test);
     let frame = form.full(40.0);
     let connection_status = note(mtm, "", frame);
+    connection_status.setFont(Some(&crate::ui::body_font(13.0)));
+    allow_wrapping(&connection_status, STEP_WIDTH);
     form.add(&connection_status);
+    add_paragraph(&mut form, mtm,
+        "Your key is stored in macOS Keychain. Audio is sent only when you dictate. A successful connection checks access, not the accuracy of a speech model.", 54.0);
 
     (
         form.view.clone(),
@@ -1480,24 +1712,49 @@ fn build_preferences(
     Retained<NSTextField>,
     Retained<NSButton>,
     Retained<NSButton>,
+    Retained<NSSwitch>,
+    Retained<NSTextField>,
+    Vec<Retained<NSTextField>>,
+    Retained<NSSwitch>,
+    Retained<NSTextField>,
 ) {
     let mut form = Form::new(mtm, STEP_WIDTH, STEP_HEIGHT);
-    let frame = form.full(28.0);
-    form.add(&note(
+    let frame = form.full(42.0);
+    let preferences_intro = note(
         mtm,
         "Smart defaults are ready. Change a model now or paste any compatible model id later.",
         frame,
-    ));
+    );
+    preferences_intro.setFont(Some(&crate::ui::body_font(13.0)));
+    allow_wrapping(&preferences_intro, STEP_WIDTH);
+    form.add(&preferences_intro);
 
     let (l, c) = form.row(ROW);
-    form.add(&label(mtm, "Speech-to-text model", l));
+    let stt_label = label(mtm, "Speech-to-text model", l);
+    form.add(&stt_label);
     let stt_model = combo(mtm, c, 0);
     form.add(&stt_model);
 
     let (l, c) = form.row(ROW);
-    form.add(&label(mtm, "Cleanup model", l));
-    let chat_model = combo(mtm, c, 0);
+    let chat_label = label(mtm, "Clean up wording", l);
+    form.add(&chat_label);
+    let format_enabled = switch_control(
+        mtm,
+        NSRect::new(c.origin, NSSize::new(38.0, c.size.height)),
+        0,
+    );
+    name_switch(&format_enabled, "Clean up wording");
+    form.add(&format_enabled);
+    let chat_model = combo(
+        mtm,
+        NSRect::new(
+            NSPoint::new(c.origin.x + 48.0, c.origin.y),
+            NSSize::new(c.size.width - 48.0, c.size.height),
+        ),
+        0,
+    );
     form.add(&chat_model);
+    let cleanup_note = add_paragraph(&mut form, mtm, CLEANUP_DISCLOSURE, 26.0);
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Microphone", l));
@@ -1532,6 +1789,19 @@ fn build_preferences(
         "Click, then press the chord. Hold it to record, release it to transcribe.",
     );
 
+    let (l, c) = form.row(ROW);
+    form.add(&label(mtm, "Save dictation history", l));
+    let save_history = switch_control(
+        mtm,
+        NSRect::new(c.origin, NSSize::new(38.0, c.size.height)),
+        0,
+    );
+    set_switch(&save_history, true);
+    name_switch(&save_history, "Save dictation history");
+    form.add(&save_history);
+    add_paragraph(&mut form, mtm,
+        "History is optional and stored locally, without encryption. Turn it off to avoid keeping future dictations. Existing history is not deleted.", 36.0);
+
     (
         form.view.clone(),
         stt_model,
@@ -1540,10 +1810,21 @@ fn build_preferences(
         microphone_note,
         refresh,
         hotkey,
+        save_history,
+        preferences_intro,
+        vec![stt_label, chat_label],
+        format_enabled,
+        cleanup_note,
     )
 }
 
-fn build_done(mtm: MainThreadMarker) -> (Retained<NSView>, Retained<NSTextField>) {
+fn build_done(
+    mtm: MainThreadMarker,
+) -> (
+    Retained<NSView>,
+    Retained<NSTextField>,
+    Vec<Retained<NSTextField>>,
+) {
     let mut form = Form::new(mtm, STEP_WIDTH, STEP_HEIGHT);
     let frame = form.full(28.0);
     form.add(&note(
@@ -1551,21 +1832,273 @@ fn build_done(mtm: MainThreadMarker) -> (Retained<NSView>, Retained<NSTextField>
         "Setup is saved. Here is what OpenFlow will use:",
         frame,
     ));
-    let frame = form.full(40.0);
+    let frame = form.full(120.0);
     let summary = note(mtm, "", frame);
+    summary.setFont(Some(&crate::ui::body_font(14.0)));
+    allow_wrapping(&summary, STEP_WIDTH);
     form.add(&summary);
-    let frame = form.full(44.0);
-    form.add(&note(
-        mtm,
-        "OpenFlow lives in the menu bar. Open Settings from there any time, and find past dictations under History.",
-        frame,
-    ));
-    (form.view.clone(), summary)
+    let workspace_help = add_paragraph(&mut form, mtm,
+        "Try a short phrase in your workspace first. macOS may ask for Microphone and Accessibility access. You can always copy a result if automatic insertion is unavailable.", 54.0);
+    let settings_help = add_paragraph(&mut form, mtm,
+        "OpenFlow stays in the menu bar. Settings keeps your processing, privacy and shortcut choices in one place. Only enable plugins you trust; Local-only does not sandbox plugin code.", 58.0);
+    (
+        form.view.clone(),
+        summary,
+        vec![workspace_help, settings_help],
+    )
+}
+
+/// Actual views with synthetic display values only: never constructs an Engine,
+/// opens Keychain, enumerates microphones, or starts a connection/recording.
+pub(super) fn preview_views(mtm: MainThreadMarker) -> Vec<(String, Retained<NSView>)> {
+    let mut scenarios: Vec<_> = Step::ORDER
+        .into_iter()
+        .map(|step| (step, false, "", format!("onboarding-{}", step.index() + 1)))
+        .collect();
+    scenarios.extend([
+        (
+            Step::Preferences,
+            true,
+            "",
+            "onboarding-private-preferences".to_string(),
+        ),
+        (Step::Done, true, "", "onboarding-private-done".to_string()),
+        (
+            Step::Preferences,
+            false,
+            "cleanup-on",
+            "onboarding-cleanup-enabled".to_string(),
+        ),
+        (
+            Step::Preferences,
+            false,
+            "cleanup-off",
+            "onboarding-cleanup-disabled".to_string(),
+        ),
+        (
+            Step::Preferences,
+            false,
+            "cleanup-separate",
+            "onboarding-cleanup-needs-setup".to_string(),
+        ),
+        (
+            Step::Credentials,
+            false,
+            "checking",
+            "onboarding-connection-checking".to_string(),
+        ),
+        (
+            Step::Credentials,
+            false,
+            "error",
+            "onboarding-connection-error".to_string(),
+        ),
+    ]);
+    scenarios.into_iter().map(|(step, local, state, name)| {
+        let (panels, controls) = build_panels(mtm);
+        panels.selectTabViewItemAtIndex(step.index() as isize);
+        controls.kicker.setStringValue(&NSString::from_str(&progress_text(step, local)));
+        controls.heading.setStringValue(&NSString::from_str(step.title()));
+        controls.primary.setTitle(&NSString::from_str(step.primary_title()));
+        controls.back.setHidden(step == Step::Welcome || step == Step::Done);
+        controls.later.setHidden(step == Step::Done);
+        controls.providers[0].setState(NSControlStateValueOn);
+        set_switch(&controls.format_enabled, state != "cleanup-off");
+        controls.stt_model.setStringValue(&NSString::from_str("whisper-large-v3-turbo"));
+        controls.chat_model.setStringValue(&NSString::from_str("openai/gpt-oss-20b"));
+        controls.microphone.addItemWithTitle(&NSString::from_str("System default"));
+        controls.microphone_note.setStringValue(&NSString::from_str("Microphone permission is checked when recording starts."));
+        controls.preferences_intro.setStringValue(&NSString::from_str("Defaults are filled in for you. Microphone permission lets OpenFlow hear you; Accessibility permission lets it insert text into other apps."));
+        controls.summary.setStringValue(&NSString::from_str(&summary_line("groq", "whisper-large-v3-turbo", "System default", "Option+V")));
+        if local {
+            configure_private_preferences(&controls, true);
+            configure_done(&controls, true);
+            controls.preferences_intro.setStringValue(&NSString::from_str(PRIVATE_INTRO));
+            controls.summary.setStringValue(&NSString::from_str(PRIVATE_SUMMARY));
+            if step == Step::Done {
+                controls.heading.setStringValue(&NSString::from_str("Next: install your private engine"));
+                controls.primary.setTitle(&NSString::from_str("Continue to local setup"));
+            }
+        }
+        if state == "checking" {
+            controls.connection_status.setStringValue(&NSString::from_str("Checking access…"));
+        } else if state == "error" {
+            controls.connection_status.setStringValue(&NSString::from_str("Connection could not be verified. Check that your key is active and your provider account has access, then test again."));
+            controls.error.setStringValue(&NSString::from_str("Test the connection before continuing."));
+        } else if state == "cleanup-separate" {
+            set_switch(&controls.format_enabled, false);
+            controls.format_enabled.setEnabled(false);
+            controls.chat_model.setEnabled(false);
+            controls.cleanup_note.setStringValue(&NSString::from_str(SEPARATE_CLEANUP_DISCLOSURE));
+        }
+        let view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_WIDTH, WINDOW_HEIGHT)));
+        view.addSubview(&panels);
+        for child in [&*controls.kicker as &NSView, &controls.heading, &controls.error, &controls.back, &controls.later, &controls.primary] {
+            view.addSubview(child);
+        }
+        (name, view)
+    }).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_setup_reaches_preferences_without_credentials_and_can_go_back() {
+        assert_eq!(next_step(Step::Provider, true), Step::Preferences);
+        assert_eq!(previous_step(Step::Preferences, true), Step::Provider);
+        assert_eq!(next_step(Step::Preferences, true), Step::Done);
+        assert_eq!(next_step(Step::Provider, false), Step::Credentials);
+        assert_eq!(previous_step(Step::Preferences, false), Step::Credentials);
+        assert_eq!(
+            progress_text(Step::Preferences, true),
+            "SET UP OPENFLOW  ·  3 OF 4"
+        );
+        assert_eq!(
+            progress_text(Step::Done, false),
+            "SET UP OPENFLOW  ·  5 OF 5"
+        );
+    }
+
+    #[test]
+    fn private_copy_discloses_initial_download_and_never_promises_ready() {
+        assert!(LOCAL_CARD_DESCRIPTION.contains("one-time model download"));
+        assert!(LOCAL_CARD_DESCRIPTION.contains("offline after setup"));
+        assert!(!Step::Done.title().contains("ready"));
+        assert!(PRIVATE_SUMMARY.contains("plugins are separate programs"));
+        assert!(PRIVATE_SUMMARY.contains("not confined by Local-only"));
+        assert_eq!(finish_destination(true), "providers");
+        assert!(crate::ui::settings::section_index(finish_destination(true)).is_some());
+        assert!(summary_line("groq", "", "System default", "Option+V")
+            .contains("permission may still be needed"));
+    }
+
+    #[test]
+    fn cleanup_consent_is_respected_and_private_setup_forces_it_off() {
+        assert_eq!(cleanup_setting(false, true), "true");
+        assert_eq!(cleanup_setting(false, false), "false");
+        assert_eq!(cleanup_setting(true, true), "false");
+        assert_eq!(cleanup_setting(true, false), "false");
+        let source = include_str!("onboarding.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            implementation.contains("settings.format_enabled()"),
+            "reload respects saved consent"
+        );
+        assert!(
+            implementation
+                .contains("self.cleanup_is_verified() && is_on(&controls.format_enabled)"),
+            "cloud save independently guards the visible choice"
+        );
+    }
+
+    #[test]
+    fn cleanup_requires_the_verified_speech_endpoint_and_capability() {
+        for (stt, cleanup) in [
+            ("deepgram", "groq"),
+            ("deepgram", "deepgram"),
+            ("groq", "openai"),
+        ] {
+            assert!(!cleanup_verified(stt, "", cleanup, "", true));
+        }
+        assert!(cleanup_verified("groq", "", "groq", "", true));
+        assert!(!cleanup_verified("groq", "", "groq", "", false));
+        assert!(cleanup_verified(
+            "custom",
+            "http://localhost:8080/v1",
+            "custom",
+            "http://localhost:8080/v1/",
+            true
+        ));
+        assert!(!cleanup_verified(
+            "custom",
+            "http://localhost:8080/v1",
+            "custom",
+            "http://localhost:8081/v1",
+            true
+        ));
+        assert!(!cleanup_verified("local", "", "groq", "", true));
+        for requested in [false, true] {
+            assert_eq!(
+                cleanup_setting(
+                    false,
+                    requested && cleanup_verified("deepgram", "", "groq", "", true)
+                ),
+                "false"
+            );
+        }
+    }
+
+    #[test]
+    fn privacy_switches_have_explicit_accessibility_names() {
+        let source = include_str!("onboarding.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap();
+        for expected in [
+            "name_switch(&format_enabled, \"Clean up wording\")",
+            "name_switch(&save_history, \"Save dictation history\")",
+            "name_switch(&same_provider, \"Use transcription provider for cleanup\")",
+        ] {
+            assert!(
+                implementation.contains(expected),
+                "missing AX name: {expected}"
+            );
+        }
+        assert!(implementation.contains("setAccessibilityLabel:"));
+    }
+
+    #[test]
+    fn connection_checks_respect_local_only_without_blocking_this_mac() {
+        for provider in [
+            "custom:http://localhost:8123/v1",
+            "custom:http://127.0.0.1:8123/v1",
+            "custom:http://[::1]:8123/v1",
+        ] {
+            assert!(connection_allowed(true, provider), "{provider}");
+            assert!(connection_allowed(false, provider), "{provider}");
+        }
+        for provider in [
+            "openrouter",
+            "groq",
+            "custom:https://api.example.com/v1",
+            "custom:http://192.168.1.10:8123/v1",
+            "custom:http://localhost.example.com/v1",
+            "custom:not-a-url",
+            "",
+        ] {
+            assert!(!connection_allowed(true, provider), "{provider}");
+            assert!(connection_allowed(false, provider), "{provider}");
+        }
+    }
+
+    #[test]
+    fn local_only_recovery_points_to_the_section_owning_the_control() {
+        assert!(CLOUD_BLOCKED_MESSAGE.contains("Settings → Providers"));
+        assert!(CLOUD_BLOCKED_MESSAGE.contains("select On this Mac"));
+        assert_eq!(finish_destination(true), "providers");
+        let source = include_str!("settings.rs");
+        let local_panel = source
+            .split("fn build_local")
+            .nth(1)
+            .expect("local settings panel exists");
+        assert!(
+            local_panel
+                .split("\nfn ")
+                .next()
+                .unwrap()
+                .contains("TAG_LOCAL_ONLY"),
+            "recovery target must contain the actual privacy control"
+        );
+    }
+
+    #[test]
+    fn changing_providers_updates_shipped_defaults_but_preserves_custom_models() {
+        assert!(should_replace_default("whisper-large-v3-turbo", "stt"));
+        assert!(should_replace_default("gpt-4o-mini", "chat"));
+        assert!(should_replace_default("  ", "stt"));
+        assert!(!should_replace_default("my-custom-speech-model", "stt"));
+        assert!(!should_replace_default("my-custom-cleanup-model", "chat"));
+    }
 
     /// The wizard's captions are one line each, and have to stay one line.
     ///
@@ -1635,8 +2168,57 @@ mod tests {
     /// The kicker counts panels the way the web wizard counts steps, from one.
     #[test]
     fn the_kicker_counts_from_one() {
-        assert_eq!(Step::Welcome.kicker(), "Setup · 1 of 5");
-        assert_eq!(Step::Done.kicker(), "Setup · 5 of 5");
+        assert_eq!(
+            progress_text(Step::Welcome, false),
+            "SET UP OPENFLOW  ·  1 OF 5"
+        );
+        assert_eq!(
+            progress_text(Step::Done, false),
+            "SET UP OPENFLOW  ·  5 OF 5"
+        );
+        assert_eq!(
+            progress_text(Step::Done, true),
+            "SET UP OPENFLOW  ·  4 OF 4"
+        );
+    }
+
+    #[test]
+    fn all_sheet_exit_paths_restore_shortcut_recording() {
+        let source = include_str!("onboarding.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            implementation.matches("crate::ui::dismiss_sheet(").count(),
+            1,
+            "all exits must use the centralized recorder cleanup"
+        );
+        let dismiss = implementation
+            .split("fn dismiss(&self)")
+            .nth(1)
+            .unwrap()
+            .split("\n    }")
+            .next()
+            .unwrap();
+        assert!(
+            dismiss.find("self.stop_recording_hotkey()").unwrap()
+                < dismiss.find("crate::ui::dismiss_sheet(").unwrap()
+        );
+        for handler in [
+            "fn skip_setup(",
+            "fn window_should_close(",
+            "fn finish(&self)",
+        ] {
+            let body = implementation
+                .split(handler)
+                .nth(1)
+                .unwrap()
+                .split("\n    }")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("self.dismiss()"),
+                "{handler} bypasses cleanup"
+            );
+        }
     }
 
     /// The web build's rule: a key is required for every hosted provider, and a
@@ -1794,11 +2376,11 @@ mod tests {
                 "MacBook Pro Microphone",
                 "Option+V"
             ),
-            "Groq · whisper-large-v3 · MacBook Pro Microphone · hold Option+V to dictate, active now"
+            "Groq · whisper-large-v3 · MacBook Pro Microphone · shortcut: Option+V. Microphone and Accessibility permission may still be needed."
         );
         assert_eq!(
             summary_line("groq", "  ", "System default", "Option+V"),
-            "Groq · whisper-large-v3-turbo · System default · hold Option+V to dictate, active now"
+            "Groq · whisper-large-v3-turbo · System default · shortcut: Option+V. Microphone and Accessibility permission may still be needed."
         );
     }
 
@@ -1863,10 +2445,7 @@ mod tests {
     fn the_closing_panel_does_not_claim_a_microphone_it_never_found() {
         let missing = &microphone_items(&[])[0];
 
-        assert_eq!(
-            done_heading(missing),
-            "Setup is saved, but there is no microphone"
-        );
+        assert_eq!(done_heading(missing), "Saved. Connect a microphone next.");
         assert_eq!(
             summary_line("groq", "whisper-large-v3", missing, "Option+V"),
             "Groq · whisper-large-v3 · No microphone detected · connect an input \
@@ -1876,10 +2455,10 @@ device, then hold Option+V to dictate"
         // A real device, or the fallback that only exists when one was found,
         // still gets the ready wording.
         for microphone in microphone_items(&[device("MacBook Pro Microphone", true)]) {
-            assert_eq!(done_heading(&microphone), "OpenFlow is ready");
+            assert_eq!(done_heading(&microphone), "Your preferences are saved");
             assert!(
                 summary_line("groq", "whisper-large-v3", &microphone, "Option+V")
-                    .ends_with("hold Option+V to dictate, active now"),
+                    .ends_with("permission may still be needed."),
                 "{microphone} must keep the ready wording"
             );
         }

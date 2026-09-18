@@ -16,6 +16,7 @@ pub mod onboarding;
 pub mod plugins;
 pub mod recorder;
 pub mod settings;
+pub mod snapshots;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -41,6 +42,23 @@ pub const GAP: f64 = 10.0;
 pub const LABEL_WIDTH: f64 = 132.0;
 /// Where the control column starts.
 pub const CONTROL_X: f64 = LABEL_WIDTH + 10.0;
+
+/// Supplied by macOS, never fetched from a CDN. Native fallback is intentional.
+pub fn display_font(size: f64) -> Retained<NSFont> {
+    NSFont::fontWithName_size(&NSString::from_str("AvenirNext-DemiBold"), size)
+        .unwrap_or_else(|| NSFont::boldSystemFontOfSize(size))
+}
+
+pub fn body_font(size: f64) -> Retained<NSFont> {
+    NSFont::fontWithName_size(&NSString::from_str("AvenirNext-Regular"), size)
+        .unwrap_or_else(|| NSFont::systemFontOfSize(size))
+}
+
+/// A readable editorial heading; navigation and controls keep their native type.
+pub fn editorial_font(size: f64) -> Retained<NSFont> {
+    NSFont::fontWithName_size(&NSString::from_str("Georgia-Bold"), size)
+        .unwrap_or_else(|| display_font(size))
+}
 
 /// How many lines `text` takes when wrapped into a column `width` wide, at the
 /// font [`note`] uses.
@@ -500,6 +518,31 @@ pub fn note(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSText
         field.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
     }
     field
+}
+
+/// Shared page heading for the library screens (coordinates grow upwards).
+pub const PAGE_HEADER_HEIGHT: f64 = 80.0;
+
+pub fn page_heading(mtm: MainThreadMarker, view: &NSView, title: &str, detail: &str) {
+    let size = view.frame().size;
+    let width = (size.width - card::MARGIN * 2.0).max(0.0);
+    for (text, offset, height, font) in [
+        (title, 36.0, 36.0, display_font(28.0)),
+        (detail, 78.0, 40.0, body_font(13.0)),
+    ] {
+        let field = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+        field.setFont(Some(&font));
+        field.setFrame(NSRect::new(
+            NSPoint::new(card::MARGIN, size.height - card::MARGIN - offset),
+            NSSize::new(width, height),
+        ));
+        allow_wrapping(&field, width);
+        field.setMaximumNumberOfLines(2);
+        field.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        view.addSubview(&field);
+    }
 }
 
 pub fn text_field(mtm: MainThreadMarker, frame: NSRect, tag: isize) -> Retained<NSTextField> {

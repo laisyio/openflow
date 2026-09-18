@@ -113,6 +113,7 @@ pub fn provider_label(provider: &str) -> String {
 }
 
 /// What one row shows, in column order.
+#[cfg(test)]
 pub fn row_columns(item: &Transcription) -> (String, String, String) {
     let text = item.formatted_text.as_deref().unwrap_or(&item.raw_text);
     (
@@ -120,6 +121,38 @@ pub fn row_columns(item: &Transcription) -> (String, String, String) {
         preview_of(text),
         provider_label(&item.provider),
     )
+}
+
+/// One loaded row owns its full transcript and its small text/provider projection.
+/// Rebuild on every load/search/history change. Timestamp cells still format in
+/// the current local timezone on each paint, preserving system-timezone changes
+/// while the page stays open. Other cells never parse dates or scan transcripts.
+struct HistoryRow {
+    transcription: Transcription,
+    columns: (String, String),
+}
+
+impl HistoryRow {
+    fn new(transcription: Transcription) -> Self {
+        let text = transcription
+            .formatted_text
+            .as_deref()
+            .unwrap_or(&transcription.raw_text);
+        let columns = (preview_of(text), provider_label(&transcription.provider));
+        Self {
+            transcription,
+            columns,
+        }
+    }
+
+    fn value(&self, column: Option<&str>) -> String {
+        match column {
+            Some(COLUMN_TIME) => return format_time(&self.transcription.created_at),
+            Some(COLUMN_PROVIDER) => &self.columns.1,
+            _ => &self.columns.0,
+        }
+        .clone()
+    }
 }
 
 /// What to say after asking the engine to re-insert a row.
@@ -162,7 +195,7 @@ pub struct HistoryIvars {
     engine: Arc<Engine>,
     view: Retained<NSView>,
     controls: Controls,
-    rows: RefCell<Vec<Transcription>>,
+    rows: RefCell<Vec<HistoryRow>>,
 }
 
 define_class!(
@@ -330,7 +363,7 @@ impl HistoryPage {
         match result {
             Ok(rows) => {
                 let count = rows.len();
-                *ivars.rows.borrow_mut() = rows;
+                *ivars.rows.borrow_mut() = rows.into_iter().map(HistoryRow::new).collect();
                 ivars.controls.table.reloadData();
                 if count == 0 {
                     match query.trim() {
@@ -366,19 +399,18 @@ impl HistoryPage {
     fn cell_value(&self, row: isize, column: Option<&str>) -> Option<String> {
         let rows = self.ivars().rows.borrow();
         let item = rows.get(usize::try_from(row).ok()?)?;
-        let (time, text, provider) = row_columns(item);
-        Some(match column {
-            Some(COLUMN_TIME) => time,
-            Some(COLUMN_PROVIDER) => provider,
-            _ => text,
-        })
+        Some(item.value(column))
     }
 
     fn selected(&self) -> Option<Transcription> {
         let ivars = self.ivars();
         let row = ivars.controls.table.selectedRow();
         let index = usize::try_from(row).ok()?;
-        ivars.rows.borrow().get(index).cloned()
+        ivars
+            .rows
+            .borrow()
+            .get(index)
+            .map(|row| row.transcription.clone())
     }
 
     fn confirm_clear(&self) -> bool {
@@ -430,7 +462,13 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
         NSRect::new(NSPoint::new(0.0, 0.0), size),
     );
     let inner = size.width - MARGIN * 2.0;
-    let top = size.height - MARGIN;
+    crate::ui::page_heading(
+        mtm,
+        &view,
+        "History",
+        "Your words, ready to use again. Saving history is optional.",
+    );
+    let top = size.height - MARGIN - crate::ui::PAGE_HEADER_HEIGHT;
 
     // ── Top row: search, and Clear all pinned to the right ──
     let clear = button(
@@ -566,6 +604,8 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
     table.setUsesAlternatingRowBackgroundColors(false);
     table.setAllowsMultipleSelection(false);
     scroll.setHasVerticalScroller(true);
+    scroll.setHasHorizontalScroller(true);
+    scroll.setAutohidesScrollers(true);
     scroll.setBorderType(objc2_app_kit::NSBorderType::NoBorder);
     scroll.setDrawsBackground(false);
     scroll.setDocumentView(Some(&table));
@@ -615,10 +655,28 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
     )
 }
 
+pub(super) fn preview_views(mtm: MainThreadMarker) -> Vec<(String, Retained<NSView>)> {
+    [
+        ("history", NSSize::new(704.0, 620.0)),
+        ("history-narrow", NSSize::new(520.0, 440.0)),
+    ]
+    .into_iter()
+    .map(|(name, size)| {
+        let (view, controls) = build_content(mtm, size);
+        controls
+            .table
+            .enclosingScrollView()
+            .inspect(|scroll| scroll.setHidden(true));
+        (name.to_string(), view)
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::FixedOffset;
+    use std::hint::black_box;
 
     /// The timestamp is rendered in the viewer's zone, so the test pins the
     /// zone rather than the machine's.
@@ -728,5 +786,140 @@ Grant OpenFlow Accessibility access.";
         item.formatted_text = None;
         let (_, text, _) = row_columns(&item);
         assert_eq!(text, "raw words");
+    }
+
+    fn synthetic_row(index: usize) -> Transcription {
+        Transcription {
+            id: format!("synthetic-{index}"),
+            raw_text: "A synthetic reference sentence with café and 日本語. ".repeat(80),
+            formatted_text: None,
+            provider: "custom:http://localhost:8080/v1".to_string(),
+            duration_ms: Some(10000),
+            context_type: None,
+            window_title: None,
+            language: Some("en".to_string()),
+            created_at: "2026-09-03T07:05:00+00:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn cached_cells_preserve_display_and_the_full_copy_payload() {
+        for formatted in [
+            None,
+            Some("\n  Revised café 日本語.\nA second line.".to_string()),
+        ] {
+            let mut item = synthetic_row(0);
+            item.formatted_text = formatted;
+            let expected = row_columns(&item);
+            let raw = item.raw_text.clone();
+            let formatted = item.formatted_text.clone();
+            let cached = HistoryRow::new(item);
+            assert_eq!(cached.value(Some(COLUMN_TIME)), expected.0);
+            assert_eq!(cached.value(Some(COLUMN_TEXT)), expected.1);
+            assert_eq!(cached.value(Some(COLUMN_PROVIDER)), expected.2);
+            assert_eq!(cached.value(None), expected.1);
+            assert_eq!(cached.value(Some("unknown")), expected.1);
+            assert_eq!(cached.transcription.raw_text, raw);
+            assert_eq!(cached.transcription.formatted_text, formatted);
+            assert!(cached.transcription.raw_text.len() > cached.columns.0.len());
+        }
+    }
+
+    #[test]
+    fn replacing_the_loaded_rows_replaces_every_cached_cell() {
+        let mut rows = vec![HistoryRow::new(synthetic_row(0))];
+        let mut changed = synthetic_row(1);
+        changed.formatted_text = Some("Changed words".to_string());
+        changed.created_at = "unparseable but visible".to_string();
+        rows.splice(.., [HistoryRow::new(changed)]);
+        assert_eq!(rows[0].transcription.id, "synthetic-1");
+        assert_eq!(rows[0].value(Some(COLUMN_TEXT)), "Changed words");
+        assert_eq!(rows[0].value(Some(COLUMN_TIME)), "unparseable but visible");
+        rows.clear();
+        assert!(
+            rows.is_empty(),
+            "errors, empty searches and deletes leave no stale cache"
+        );
+    }
+
+    #[test]
+    fn timestamp_cells_are_formatted_live_instead_of_cached() {
+        let row = HistoryRow::new(synthetic_row(0));
+        assert_eq!(
+            row.value(Some(COLUMN_TIME)),
+            format_time(&row.transcription.created_at)
+        );
+        // Guard the live call without changing this process's global timezone
+        // (which would make parallel date tests unsafe).
+        let source = include_str!("history.rs");
+        let implementation = source.split("mod tests {").next().unwrap();
+        assert!(implementation
+            .contains("Some(COLUMN_TIME) => return format_time(&self.transcription.created_at)"));
+    }
+
+    /// Same synthetic payload, same requested cells. The cached case includes
+    /// the one-time display projection build, not just its cheapest lookup.
+    /// This isolates Rust table-data work, not AppKit drawing or scrolling FPS.
+    #[test]
+    #[ignore = "opt-in synthetic release benchmark; no AppKit or personal data"]
+    fn benchmark_history_cells_compare() {
+        const ROWS: usize = 50;
+        const PAINTS: usize = 20;
+        const REPETITIONS: usize = 31;
+        let fixture: Vec<_> = (0..ROWS).map(synthetic_row).collect();
+        let columns = [COLUMN_TIME, COLUMN_TEXT, COLUMN_PROVIDER];
+        let measure = |cached: bool| {
+            // Both paths receive the same owned query result. Fixture
+            // duplication is outside timing, as SQLite isn't measured here.
+            let items = fixture.clone();
+            let start = std::time::Instant::now();
+            if cached {
+                let rows: Vec<_> = items.into_iter().map(HistoryRow::new).collect();
+                for _ in 0..PAINTS {
+                    for row in &rows {
+                        for column in columns {
+                            black_box(row.value(black_box(Some(column))));
+                        }
+                    }
+                }
+                start.elapsed().as_secs_f64() * 1000.0
+            } else {
+                for _ in 0..PAINTS {
+                    for item in &items {
+                        for column in columns {
+                            // Previous cell_value implementation, preserved
+                            // here as the exact paired baseline.
+                            let (time, text, provider) = row_columns(black_box(item));
+                            black_box(match black_box(column) {
+                                COLUMN_TIME => time,
+                                COLUMN_PROVIDER => provider,
+                                _ => text,
+                            });
+                        }
+                    }
+                }
+                start.elapsed().as_secs_f64() * 1000.0
+            }
+        };
+        let mut samples = [Vec::new(), Vec::new()];
+        for repetition in 0..REPETITIONS + 3 {
+            // Interleave both paths, alternating order to reduce timing bias.
+            for cached in if repetition % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let elapsed = measure(cached);
+                if repetition >= 3 {
+                    samples[usize::from(cached)].push(elapsed);
+                }
+            }
+        }
+        for times in &mut samples {
+            times.sort_by(f64::total_cmp);
+        }
+        let before = samples[0][REPETITIONS / 2];
+        let after = samples[1][REPETITIONS / 2];
+        println!("history-cells rows={ROWS} paints={PAINTS} cells={} repetitions={REPETITIONS} warmups=3 release={} before_median_ms={before:.6} after_median_ms={after:.6} speedup={:.2}x cache_build_included=true order=alternating timestamps=live", ROWS * PAINTS * 3, !cfg!(debug_assertions), before / after);
     }
 }
