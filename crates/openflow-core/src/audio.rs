@@ -610,18 +610,34 @@ impl StreamingResampler {
                 if !finish && center + half >= self.total_input {
                     break;
                 }
-                self.taps
-                    .iter()
-                    .enumerate()
-                    .map(|(k, tap)| {
-                        let index = center as isize + k as isize - half as isize;
-                        if index < 0 {
-                            0.0
-                        } else {
-                            self.sample(index as usize) * tap
-                        }
-                    })
-                    .sum()
+                // The input tail has an absolute offset. Check the complete
+                // window once, keeping the original left-to-right f32 sum;
+                // only boundary windows need per-tap lookup and zero padding.
+                let window = center
+                    .checked_sub(half)
+                    .and_then(|start| start.checked_sub(self.input_start))
+                    .and_then(|start| self.input.get(start..))
+                    .and_then(|remaining| remaining.get(..self.taps.len()));
+                if let Some(window) = window {
+                    window
+                        .iter()
+                        .zip(&self.taps)
+                        .map(|(sample, tap)| sample * tap)
+                        .sum()
+                } else {
+                    self.taps
+                        .iter()
+                        .enumerate()
+                        .map(|(k, tap)| {
+                            let index = center as isize + k as isize - half as isize;
+                            if index < 0 {
+                                0.0
+                            } else {
+                                self.sample(index as usize) * tap
+                            }
+                        })
+                        .sum()
+                }
             };
             self.output.push(value);
         }
@@ -771,22 +787,37 @@ const MAX_GAIN: f32 = 20.0;
 /// this holds the gain within ~18% (4.38 / 4.21 / 5.06) where the peak rule
 /// swings 10.31 / 1.00 / 10.31 and plain RMS swings 6.90 / 1.76 / 8.90.
 #[cfg(test)]
-fn auto_gain(samples: &[f32]) -> Vec<f32> {
-    if samples.is_empty() {
-        return Vec::new();
-    }
-
-    let level = speech_level(samples);
-
+fn apply_gain(samples: &mut [f32], level: f32) {
     if level < 1e-4 {
-        return samples.to_vec();
+        return;
     }
+    let gain = (TARGET_PEAK / level).clamp(1.0, MAX_GAIN);
+    for sample in samples {
+        *sample = (*sample * gain).clamp(-1.0, 1.0);
+    }
+}
 
-    let gain = gain_for_level(level);
-    samples
-        .iter()
-        .map(|sample| (sample * gain).clamp(-1.0, 1.0))
-        .collect()
+/// Gate and boost the already-owned resampled take using one percentile
+/// selection. The magnitude scratch buffer is gone before the in-place gain
+/// and WAV encoding; no second p95 scratch or boosted-sample copy is needed.
+/// Historical batch fixture only: live capture uses CapturePipeline and writes
+/// gain directly into the WAV without mutating its reusable preview samples.
+#[cfg(test)]
+fn gain_if_audible(samples: &mut [f32]) -> bool {
+    let level = speech_level(samples);
+    if level < SILENCE_LEVEL {
+        return false;
+    }
+    apply_gain(samples, level);
+    true
+}
+
+#[cfg(test)]
+fn auto_gain(samples: &[f32]) -> Vec<f32> {
+    let level = speech_level(samples);
+    let mut gained = samples.to_vec();
+    apply_gain(&mut gained, level);
+    gained
 }
 
 fn gain_for_level(level: f32) -> f32 {
@@ -904,10 +935,25 @@ fn downsample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     for i in 0..output_len {
         let center = (i as f64 * ratio) as isize;
         let mut acc = 0.0_f32;
-        for (k, &tap) in taps.iter().enumerate() {
-            let index = center + k as isize - half;
-            if index >= 0 && (index as usize) < samples.len() {
-                acc += samples[index as usize] * tap;
+        // Almost every window is entirely inside the recording. Check that
+        // once, rather than branching for each of its 63 taps. Keep the same
+        // left-to-right f32 operations: no reassociation, FMA or filter change.
+        let window = usize::try_from(center - half)
+            .ok()
+            .and_then(|start| samples.get(start..))
+            .and_then(|remaining| remaining.get(..taps.len()));
+        if let Some(window) = window {
+            for (&sample, &tap) in window.iter().zip(&taps) {
+                acc += sample * tap;
+            }
+        } else {
+            // At the two ends preserve the original skipped out-of-bounds
+            // taps, including the first/last samples and very short takes.
+            for (k, &tap) in taps.iter().enumerate() {
+                let index = center + k as isize - half;
+                if index >= 0 && (index as usize) < samples.len() {
+                    acc += samples[index as usize] * tap;
+                }
             }
         }
         output.push(acc);
@@ -944,14 +990,35 @@ fn prepare_take(captured: &[f32], native_sample_rate: u32) -> Option<Vec<f32>> {
 /// costs one update of a preview and nothing else.
 #[cfg(test)]
 fn encode_partial(captured: &[f32], native_sample_rate: u32) -> Result<Vec<u8>, String> {
-    let Some(mono_16k) = prepare_take(captured, native_sample_rate) else {
+    let Some(mut mono_16k) = prepare_take(captured, native_sample_rate) else {
         return Err("Not enough audio yet".to_string());
     };
-    let level = speech_level(&mono_16k);
-    if level < SILENCE_LEVEL {
+    if !gain_if_audible(&mut mono_16k) {
         return Err("Nothing to preview yet".to_string());
     }
-    encode_wav_with_gain(&mono_16k, 16_000, gain_for_level(level))
+    encode_wav(&mono_16k, 16_000)
+}
+
+/// Historical batch stop encoder retained for the original equivalence tests
+/// and benchmarks. Live stop requests are handled by CapturePipeline.
+#[cfg(test)]
+fn encode_stopped(
+    captured: &[f32],
+    native_sample_rate: u32,
+    device: &str,
+) -> Result<Vec<u8>, String> {
+    if captured.is_empty() {
+        return Err("No audio recorded. Check microphone permissions.".to_string());
+    }
+    let Some(mut mono_16k) = prepare_take(captured, native_sample_rate) else {
+        return Err("Recording too short.".to_string());
+    };
+    if !gain_if_audible(&mut mono_16k) {
+        return Err(format!(
+            "No sound reached OpenFlow from \"{device}\". Pick a different microphone in Settings."
+        ));
+    }
+    encode_wav(&mono_16k, 16_000)
 }
 
 #[cfg(test)]
@@ -992,6 +1059,14 @@ pub fn wav_duration_ms(bytes: &[u8]) -> Option<i64> {
     }
     Some((u64::from(reader.duration()) * 1_000 / u64::from(sample_rate)) as i64)
 }
+
+#[cfg(test)]
+#[path = "audio_gain_perf_tests.rs"]
+mod gain_perf_tests;
+
+#[cfg(test)]
+#[path = "audio_resample_perf_tests.rs"]
+mod resample_perf_tests;
 
 #[cfg(test)]
 mod tests {

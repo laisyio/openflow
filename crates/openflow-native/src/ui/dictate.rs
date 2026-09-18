@@ -1,10 +1,7 @@
-//! The Dictate page: the web build's main screen, which the native host never
-//! had.
+//! The native Dictate workspace: one recording action, an explicit processing
+//! route, and the latest words within reach.
 //!
-//! Everything here already existed in `src/App.tsx`; the strings are that
-//! screen's, verbatim, because the two hosts are meant to be the same app. What
-//! is new is that a native window now has a way in that is not the menu bar:
-//! the big button drives the same `hotkey_pressed` / `hotkey_released` pair the
+//! The big button drives the same `hotkey_pressed` / `hotkey_released` pair the
 //! global shortcut does, so holding it is holding the shortcut, down to the
 //! silence gate and the live preview on the pill.
 //!
@@ -44,33 +41,49 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBezelStyle, NSButton, NSColor, NSControl, NSEvent, NSFont,
-    NSImage, NSImageSymbolConfiguration, NSImageView, NSTextAlignment, NSTextField, NSView,
+    NSAccessibility, NSAttributedStringNSStringDrawing, NSAutoresizingMaskOptions, NSBezelStyle,
+    NSBezierPath, NSBox, NSBoxType, NSButton, NSColor, NSControl, NSEvent, NSFocusRingType,
+    NSFontAttributeName, NSForegroundColorAttributeName, NSScrollView, NSTextAlignment,
+    NSTextField, NSUnderlineStyleAttributeName, NSView,
 };
-use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSAttributedString, NSDictionary, NSNumber, NSObject, NSPoint, NSRect, NSSize, NSString,
+};
 
 use openflow_core::engine::{Engine, EngineEvent, RecordingState};
 use openflow_core::insert::InsertMethod;
+use openflow_core::transcribe::{is_loopback_url, Provider};
 
 use crate::hotkeys;
-use crate::ui::card::{Card, GAP, MARGIN, PADDING};
-use crate::ui::{allow_wrapping, note};
+use crate::ui::card::{Flipped, GAP, MARGIN, PADDING};
+use crate::ui::{allow_wrapping, body_font, display_font, note};
 
-/// The recorder block's total height: glyph, three lines of copy, the button,
-/// the cancel button and the hint, with the gaps between them. Kept as one
-/// number so the block can be centred in a card of any height; the layout below
-/// walks down from the top of it and has to add up to this.
-const BLOCK_HEIGHT: f64 =
-    56.0 + 18.0 + 14.0 + 6.0 + 30.0 + 8.0 + 34.0 + 20.0 + 40.0 + 10.0 + 24.0 + 14.0 + 14.0;
+/// Fixed reading rhythm inside a scrollable document; short windows never
+/// compress the recording or cancellation targets out of reach.
+const RECORDER_HEIGHT: f64 = 272.0;
+const HEADER_HEIGHT: f64 = 198.0;
 
-/// The transcript's own height inside the result card: three lines at the
-/// system font. The preview is cut at `RESULT_CHARS`, which is about that.
-const RESULT_LINES: f64 = 54.0;
-/// Height of the card that shows the last result: a caption, the gap under it,
+const HOME_LINKS: &[(&str, &str)] = &[
+    ("Set up OpenFlow", "onboarding"),
+    ("Your history", "history"),
+    ("Local or cloud", "providers"),
+    ("Privacy & history", "privacy"),
+];
+
+fn home_link_destination(tag: isize) -> Option<&'static str> {
+    HOME_LINKS
+        .get(usize::try_from(tag).ok()?)
+        .map(|entry| entry.1)
+}
+
+/// Space for a wrapped transcript preview. The copy action always keeps the
+/// entire result even when the bounded visible preview is truncated.
+const RESULT_LINES: f64 = 76.0;
+/// Height of the section that shows the last result: a caption, the gap under it,
 /// the three lines, and the padding round all of it.
-const RESULT_HEIGHT: f64 = PADDING + 14.0 + 6.0 + RESULT_LINES + PADDING;
+const RESULT_HEIGHT: f64 = PADDING + 20.0 + 8.0 + RESULT_LINES + PADDING;
 /// Where the last result is cut. The full text is one click away, on the
-/// clipboard, so the card only has to be recognisable.
+/// clipboard, so the preview only has to be recognisable.
 const RESULT_CHARS: usize = 220;
 
 // ── The hold button ───────────────────────────────────────
@@ -95,6 +108,61 @@ define_class!(
     pub struct HoldButton;
 
     impl HoldButton {
+        /// Native push bezels cap their visible height even with a 48pt frame.
+        /// Paint the actual target; retain NSButton's accessibility and focus
+        /// machinery and the existing separate down/up event paths.
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let bounds = self.bounds();
+            let fill = if !self.isEnabled() {
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.32, 0.39, 0.39, 1.0)
+            } else if self.isHighlighted() {
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.06, 0.35, 0.31, 1.0)
+            } else {
+                NSColor::colorWithSRGBRed_green_blue_alpha(22.0 / 255.0, 116.0 / 255.0, 107.0 / 255.0, 1.0)
+            };
+            fill.setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 10.0, 10.0).fill();
+            let font = display_font(17.0);
+            let ink = NSColor::whiteColor();
+            let attributes = NSDictionary::from_slices(
+                &[unsafe { NSFontAttributeName }, unsafe { NSForegroundColorAttributeName }],
+                &[&*font as &AnyObject, &*ink as &AnyObject],
+            );
+            let text = unsafe { NSAttributedString::new_with_attributes(&self.title(), &attributes) };
+            let text_size = text.size();
+            let x = (bounds.size.width - text_size.width - 28.0) / 2.0;
+            text.drawAtPoint(NSPoint::new(x + 28.0, (bounds.size.height - text_size.height) / 2.0));
+            // A compact, crisp microphone silhouette, not a decorative emoji.
+            ink.setFill();
+            ink.setStroke();
+            let cy = bounds.size.height / 2.0;
+            let y = |offset: f64| cy + if self.isFlipped() { -offset } else { offset };
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                NSRect::new(NSPoint::new(x + 5.0, y(-2.0).min(y(11.0))), NSSize::new(8.0, 13.0)), 4.0, 4.0,
+            ).fill();
+            let mic = NSBezierPath::bezierPath();
+            mic.moveToPoint(NSPoint::new(x + 1.0, y(2.0)));
+            mic.curveToPoint_controlPoint1_controlPoint2(
+                NSPoint::new(x + 17.0, y(2.0)),
+                NSPoint::new(x + 1.0, y(-9.0)), NSPoint::new(x + 17.0, y(-9.0)),
+            );
+            mic.moveToPoint(NSPoint::new(x + 9.0, y(-6.0)));
+            mic.lineToPoint(NSPoint::new(x + 9.0, y(-11.0)));
+            mic.moveToPoint(NSPoint::new(x + 4.0, y(-11.0)));
+            mic.lineToPoint(NSPoint::new(x + 14.0, y(-11.0)));
+            mic.setLineWidth(1.7);
+            mic.stroke();
+        }
+
+        #[unsafe(method(focusRingMaskBounds))]
+        fn focus_ring_mask_bounds(&self) -> NSRect { self.bounds() }
+
+        #[unsafe(method(drawFocusRingMask))]
+        fn draw_focus_ring_mask(&self) {
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(self.bounds(), 10.0, 10.0).fill();
+        }
+
         /// Deliberately does not call super. `NSButton`'s `mouseDown:` runs its
         /// own tracking loop and only returns once the button has been
         /// released, which would collapse the press and the release into one
@@ -232,6 +300,8 @@ impl HoldButton {
 // ── The page ──────────────────────────────────────────────
 
 struct Controls {
+    links: Vec<Retained<NSButton>>,
+    route: Retained<NSTextField>,
     eyebrow: Retained<NSTextField>,
     title: Retained<NSTextField>,
     body: Retained<NSTextField>,
@@ -270,6 +340,15 @@ define_class!(
     pub struct DictatePage;
 
     impl DictatePage {
+        #[unsafe(method(openHomeLink:))]
+        fn open_home_link(&self, sender: &NSControl) {
+            if self.ivars().state.get() != RecordingState::Idle { return; }
+            let Some(destination) = home_link_destination(sender.tag()) else { return; };
+            crate::app::with_app(|app| {
+                app.handle_event(EngineEvent::Navigate(destination.to_string()));
+            });
+        }
+
         /// The same entry point the global shortcut uses, so the button and the
         /// hotkey cannot drift apart: silence gate, live preview and insert
         /// method are all decided downstream of here.
@@ -347,6 +426,9 @@ impl DictatePage {
         unsafe { controls.record.setTarget(Some(target)) };
         crate::ui::wire(&controls.cancel, target, sel!(cancelTranscription:));
         crate::ui::wire(&controls.result, target, sel!(copyLast:));
+        for link in &controls.links {
+            crate::ui::wire(link, target, sel!(openHomeLink:));
+        }
 
         this.set_state(RecordingState::Idle);
         this
@@ -380,11 +462,10 @@ impl DictatePage {
         ivars
             .controls
             .hint
-            .setStringValue(&NSString::from_str(&format!(
-                "{} works from any app  ·  {} {} again",
-                record,
-                recopy,
-                insertion_verb(settings.insert_method())
+            .setStringValue(&NSString::from_str(&shortcut_hint(
+                &record,
+                &recopy,
+                settings.insert_method(),
             )));
 
         // The card is the page's "what just happened", and while a take has
@@ -444,18 +525,18 @@ impl DictatePage {
         match newest {
             Some(row) => {
                 let text = row.formatted_text.unwrap_or(row.raw_text);
-                self.set_last(&text, "Your most recent transcription");
+                self.set_last(&text, "Last transcription · Click the text to copy");
             }
             None => {
                 *ivars.last.borrow_mut() = None;
                 ivars.controls.result.setTitle(&NSString::from_str(
-                    "Your first transcription will settle here.",
+                    "Your next transcription appears here. You can copy it without switching apps.",
                 ));
                 ivars.controls.result.setEnabled(false);
                 ivars
                     .controls
                     .result_caption
-                    .setStringValue(&NSString::from_str(""));
+                    .setStringValue(&NSString::from_str("Your words, within reach"));
             }
         }
 
@@ -519,16 +600,28 @@ impl DictatePage {
     /// would be inventing a state the engine does not have.
     pub fn set_state(&self, state: RecordingState) {
         self.ivars().state.set(state);
+        for link in &self.ivars().controls.links {
+            link.setEnabled(state == RecordingState::Idle);
+        }
         let settings = self.ivars().engine.settings();
         let cleanup = settings.format_enabled();
         let idle_body = idle_body(cleanup, settings.insert_method());
         let transcribing_body = transcribing_body(cleanup, settings.is_local_backend());
         let controls = &self.ivars().controls;
+        controls.route.setStringValue(&NSString::from_str(
+            processing_route(
+                settings.is_local_backend(),
+                &settings.provider(),
+                effective_cleanup_provider(settings).as_ref(),
+                settings.local_only(),
+            )
+            .as_str(),
+        ));
         let (eyebrow, title, body, action, enabled, cancel) = match state {
             RecordingState::Recording => (
                 "Listening now",
                 "Keep talking\u{2026}",
-                "Your audio is captured only while you hold the button.",
+                "Release to finish. With VoiceOver, press the recording button again to stop.",
                 "Release to finish",
                 true,
                 false,
@@ -542,8 +635,8 @@ impl DictatePage {
                 true,
             ),
             RecordingState::Idle => (
-                "Ready when you are",
-                "Hold to speak",
+                "A little less typing",
+                "Speak a thought.",
                 idle_body.as_str(),
                 "Hold to record",
                 true,
@@ -563,13 +656,36 @@ impl DictatePage {
 
 /// One line of the result card, cut so the card keeps its shape.
 fn preview_of(text: &str) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let preview: String = flat.chars().take(RESULT_CHARS).collect();
-    if flat.chars().count() > RESULT_CHARS {
-        format!("{}\u{2026}", preview)
-    } else {
-        preview
+    // Retain at most the visible scalar values plus an ellipsis, not the
+    // entire transcript. Scan only until the next normalized scalar proves
+    // truncation. Leading/trailing whitespace still needs scanning to preserve
+    // split_whitespace().join(" ") semantics exactly, including no trailing
+    // separator or ellipsis for an otherwise exactly-at-limit result.
+    let mut preview = String::with_capacity(text.len().min(RESULT_CHARS * 4) + 3);
+    let mut count = 0;
+    let mut separator = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            separator = count != 0;
+            continue;
+        }
+        if separator {
+            if count == RESULT_CHARS {
+                preview.push('\u{2026}');
+                return preview;
+            }
+            preview.push(' ');
+            count += 1;
+            separator = false;
+        }
+        if count == RESULT_CHARS {
+            preview.push('\u{2026}');
+            return preview;
+        }
+        preview.push(ch);
+        count += 1;
     }
+    preview
 }
 
 /// The binding for `action` as the recorder spells it. Same helper Settings
@@ -627,234 +743,348 @@ fn binding_text(settings: &openflow_core::settings::Settings, action: &str) -> S
         .unwrap_or_else(|_| "Not set".to_string())
 }
 
+/// A configured route is not a readiness check. In particular Local only can
+/// coexist with a cloud backend selection; the engine correctly blocks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessingDestination {
+    OnDevice,
+    Loopback,
+    CustomServer,
+    Hosted,
+}
+
+/// Match Engine's effective endpoint, not the separately stored preference:
+/// enabling “same provider” leaves that dormant preference in the database.
+fn effective_cleanup_provider(settings: &openflow_core::settings::Settings) -> Option<Provider> {
+    settings.format_enabled().then(|| {
+        if settings.same_provider() {
+            settings.provider()
+        } else {
+            settings.formatting_provider()
+        }
+    })
+}
+
+impl ProcessingDestination {
+    fn provider(provider: &Provider) -> Self {
+        match provider {
+            Provider::Custom { base_url } if is_loopback_url(base_url) => Self::Loopback,
+            // Custom endpoints can be LAN, VPN, or hosted. Do not infer privacy
+            // from an arbitrary hostname or resolve DNS just to draw the UI.
+            Provider::Custom { .. } => Self::CustomServer,
+            _ => Self::Hosted,
+        }
+    }
+    fn leaves_machine(self) -> bool {
+        matches!(self, Self::CustomServer | Self::Hosted)
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::OnDevice => "on-device",
+            Self::Loopback => "server on this Mac",
+            Self::CustomServer => "custom server",
+            Self::Hosted => "cloud provider",
+        }
+    }
+}
+
+fn processing_route(
+    local: bool,
+    audio: &Provider,
+    cleanup: Option<&Provider>,
+    local_only: bool,
+) -> String {
+    let audio = if local {
+        ProcessingDestination::OnDevice
+    } else {
+        ProcessingDestination::provider(audio)
+    };
+    let cleanup = cleanup.map(ProcessingDestination::provider);
+    if local_only && audio.leaves_machine() {
+        return format!(
+            "Setup needed: Local only blocks audio sent to your {}.",
+            audio.label()
+        );
+    }
+    if local_only && cleanup.is_some_and(ProcessingDestination::leaves_machine) {
+        return "Setup needed: Local only blocks cleanup outside this Mac.".to_string();
+    }
+    let cleanup = cleanup.map_or("off", ProcessingDestination::label);
+    format!("Audio: {} · Text cleanup: {cleanup}", audio.label())
+}
+
+fn shortcut_hint(record: &str, recopy: &str, method: InsertMethod) -> String {
+    let first = if record == "Not set" {
+        "Add a global recording shortcut in Set up OpenFlow.".to_string()
+    } else {
+        format!("Hold {record} in any app to record.")
+    };
+    if recopy == "Not set" {
+        first
+    } else {
+        format!("{first}\n{recopy} {} again.", insertion_verb(method))
+    }
+}
+
 // ── Layout ────────────────────────────────────────────────
 
-/// Everything on this page is centred in its card, so the springs are all
-/// four-way: the horizontal margins keep a control centred as the window
-/// widens, and the vertical ones share the extra height out rather than letting
-/// the block drift to one edge.
-const CENTRED: NSAutoresizingMaskOptions = NSAutoresizingMaskOptions(
-    NSAutoresizingMaskOptions::ViewMinXMargin.0
-        | NSAutoresizingMaskOptions::ViewMaxXMargin.0
-        | NSAutoresizingMaskOptions::ViewMinYMargin.0
-        | NSAutoresizingMaskOptions::ViewMaxYMargin.0,
-);
+/// A bounded document scrolls in short windows instead of squeezing the record
+/// action into the result. Only width springs: the reading order stays stable.
+fn document_height() -> f64 {
+    MARGIN * 2.0 + HEADER_HEIGHT + GAP * 2.0 + RECORDER_HEIGHT + RESULT_HEIGHT
+}
+
+const WIDTH: NSAutoresizingMaskOptions = NSAutoresizingMaskOptions::ViewWidthSizable;
+
+/// Underlined native buttons keep navigation visible and keyboard accessible.
+fn home_link(mtm: MainThreadMarker, title: &str, tag: isize, frame: NSRect) -> Retained<NSButton> {
+    let button = NSButton::initWithFrame(NSButton::alloc(mtm), frame);
+    button.setTitle(&NSString::from_str(title));
+    button.setTag(tag);
+    button.setBordered(false);
+    button.setAlignment(NSTextAlignment::Left);
+    button.setFocusRingType(NSFocusRingType::Exterior);
+    button.setAccessibilityLabel(Some(&NSString::from_str(title)));
+    let font = display_font(15.0);
+    let ink = NSColor::linkColor();
+    let underline = NSNumber::new_i32(1);
+    let attributes = NSDictionary::from_slices(
+        &[
+            unsafe { NSFontAttributeName },
+            unsafe { NSForegroundColorAttributeName },
+            unsafe { NSUnderlineStyleAttributeName },
+        ],
+        &[
+            &*font as &AnyObject,
+            &*ink as &AnyObject,
+            &*underline as &AnyObject,
+        ],
+    );
+    // Each key's value has the AppKit-documented font/color/number type.
+    let attributed =
+        unsafe { NSAttributedString::new_with_attributes(&NSString::from_str(title), &attributes) };
+    button.setAttributedTitle(&attributed);
+    button
+}
+
+fn rule(mtm: MainThreadMarker, frame: NSRect) -> Retained<NSBox> {
+    let line = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
+    line.setBoxType(NSBoxType::Separator);
+    line.setAutoresizingMask(WIDTH);
+    line
+}
 
 fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Controls) {
-    let view = NSView::initWithFrame(
-        NSView::alloc(mtm),
+    let scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
         NSRect::new(NSPoint::new(0.0, 0.0), size),
     );
+    scroll.setHasVerticalScroller(true);
+    scroll.setAutohidesScrollers(true);
+    scroll.setDrawsBackground(false);
+    scroll.setAutoresizingMask(WIDTH | NSAutoresizingMaskOptions::ViewHeightSizable);
+    let document = Flipped::new(
+        mtm,
+        NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(size.width, document_height()),
+        ),
+    );
+    document.setAutoresizingMask(WIDTH);
     let inner = size.width - MARGIN * 2.0;
 
-    // ── The result card, along the bottom ──
-    let result_card = Card::new(
+    let brand = note(
         mtm,
-        NSRect::new(
-            NSPoint::new(MARGIN, MARGIN),
-            NSSize::new(inner, RESULT_HEIGHT),
-        ),
+        "OPENFLOW",
+        NSRect::new(NSPoint::new(MARGIN, MARGIN), NSSize::new(inner, 18.0)),
     );
-    result_card.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
-    );
-    let result_width = inner - PADDING * 2.0;
-
-    let result_caption = note(
+    brand.setFont(Some(&display_font(12.0)));
+    brand.setAutoresizingMask(WIDTH);
+    let page_title = NSTextField::labelWithString(
+        &NSString::from_str("Less typing.\nMore getting on with it."),
         mtm,
-        "",
-        NSRect::new(
-            NSPoint::new(PADDING, RESULT_HEIGHT - PADDING - 14.0),
-            NSSize::new(result_width, 14.0),
-        ),
     );
-    result_caption.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
-    );
-
-    // A borderless button so the whole card reads as one clickable surface,
-    // which is what the web screen's `last-result` is.
-    let result = NSButton::initWithFrame(
-        NSButton::alloc(mtm),
-        NSRect::new(
-            // Directly under the caption, not filling what the card has left.
-            // A button centres its title in whatever frame it is given, so a
-            // frame the height of the card leaves two lines of transcript
-            // floating in the middle of it with air above and below.
-            NSPoint::new(PADDING, RESULT_HEIGHT - PADDING - 14.0 - 6.0 - RESULT_LINES),
-            NSSize::new(result_width, RESULT_LINES),
-        ),
-    );
-    result.setBordered(false);
-    result.setAlignment(NSTextAlignment::Left);
-    result.setFont(Some(&NSFont::systemFontOfSize(NSFont::systemFontSize())));
-    result.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
-    );
-    // The cell wraps rather than truncating to one line: the preview is two
-    // lines of the transcription and the point is to recognise it.
-    if let Some(cell) = result.cell() {
-        cell.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByWordWrapping);
-        cell.setWraps(true);
-    }
-
-    result_card.addSubview(&result);
-    result_card.addSubview(&result_caption);
-
-    // ── The recorder card, filling what is left ──
-    let recorder_bottom = MARGIN + RESULT_HEIGHT + GAP;
-    let recorder_height = (size.height - MARGIN - recorder_bottom).max(0.0);
-    let recorder = Card::new(
-        mtm,
-        NSRect::new(
-            NSPoint::new(MARGIN, recorder_bottom),
-            NSSize::new(inner, recorder_height),
-        ),
-    );
-    recorder.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
-    );
-
-    // Laid out downwards, centred both ways. Starting at the top of the card
-    // instead would drop all the slack in a tall window below the shortcut
-    // hint, which is most of the card.
-    let centre = |width: f64| (inner - width) / 2.0;
-    let mut y = ((recorder_height + BLOCK_HEIGHT) / 2.0).min(recorder_height - PADDING);
-
-    let glyph = NSImageView::initWithFrame(
-        NSImageView::alloc(mtm),
-        NSRect::new(
-            NSPoint::new(centre(56.0), y - 56.0),
-            NSSize::new(56.0, 56.0),
-        ),
-    );
-    if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str("mic.fill"),
-        Some(&NSString::from_str("Microphone")),
-    ) {
-        // `NSFontWeight` is a bare `CGFloat`; 0.0 is the regular weight.
-        let config = NSImageSymbolConfiguration::configurationWithPointSize_weight(44.0, 0.0);
-        glyph.setImage(Some(&image));
-        glyph.setSymbolConfiguration(Some(&config));
-        glyph.setContentTintColor(Some(&NSColor::controlAccentColor()));
-    }
-    glyph.setAutoresizingMask(CENTRED);
-    y -= 56.0 + 18.0;
-
-    let eyebrow = note(
-        mtm,
-        "",
-        NSRect::new(
-            NSPoint::new(PADDING, y - 14.0),
-            NSSize::new(inner - PADDING * 2.0, 14.0),
-        ),
-    );
-    eyebrow.setAlignment(NSTextAlignment::Center);
-    eyebrow.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable
-            | NSAutoresizingMaskOptions::ViewMinYMargin
-            | NSAutoresizingMaskOptions::ViewMaxYMargin,
-    );
-    y -= 14.0 + 6.0;
-
-    let title = NSTextField::labelWithString(&NSString::from_str(""), mtm);
-    title.setFrame(NSRect::new(
-        NSPoint::new(PADDING, y - 30.0),
-        NSSize::new(inner - PADDING * 2.0, 30.0),
+    page_title.setFont(Some(&crate::ui::editorial_font(32.0)));
+    page_title.setFrame(NSRect::new(
+        NSPoint::new(MARGIN, MARGIN + 22.0),
+        NSSize::new(inner, 80.0),
     ));
-    title.setAlignment(NSTextAlignment::Center);
-    // 0.3 is `NSFontWeightSemibold`, which is the weight the web screen's h1
-    // resolves to.
-    title.setFont(Some(&NSFont::systemFontOfSize_weight(24.0, 0.3)));
-    title.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable
-            | NSAutoresizingMaskOptions::ViewMinYMargin
-            | NSAutoresizingMaskOptions::ViewMaxYMargin,
-    );
-    y -= 30.0 + 8.0;
-
-    // The body is the longest string on the page and the one most likely to
-    // need two lines at a narrow width, so it wraps rather than truncating.
-    let body_width = (inner - PADDING * 2.0 - 60.0).max(160.0);
-    let body = note(
+    allow_wrapping(&page_title, inner);
+    page_title.setMaximumNumberOfLines(2);
+    page_title.setAutoresizingMask(WIDTH);
+    let intro = note(
         mtm,
-        "",
+        "Dictate where you work. Keep control of where your words go.",
         NSRect::new(
-            NSPoint::new(centre(body_width), y - 34.0),
-            NSSize::new(body_width, 34.0),
+            NSPoint::new(MARGIN, MARGIN + 106.0),
+            NSSize::new(inner, 38.0),
         ),
     );
-    body.setAlignment(NSTextAlignment::Center);
-    body.setFont(Some(&NSFont::systemFontOfSize(
-        NSFont::smallSystemFontSize(),
-    )));
-    allow_wrapping(&body, body_width);
-    body.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable
-            | NSAutoresizingMaskOptions::ViewMinYMargin
-            | NSAutoresizingMaskOptions::ViewMaxYMargin,
-    );
-    y -= 34.0 + 20.0;
+    intro.setFont(Some(&body_font(14.0)));
+    allow_wrapping(&intro, inner);
+    intro.setAutoresizingMask(WIDTH);
+    document.addSubview(&brand);
+    document.addSubview(&page_title);
+    document.addSubview(&intro);
 
+    // Two short rows keep the useful links above the recording workspace even
+    // in a narrow window. Flexible columns share width changes.
+    let mut links = Vec::new();
+    let column_width = (inner - GAP) / 2.0;
+    for (index, (title, _)) in HOME_LINKS.iter().enumerate() {
+        let column = index % 2;
+        let link = home_link(
+            mtm,
+            title,
+            index as isize,
+            NSRect::new(
+                NSPoint::new(
+                    MARGIN + column as f64 * (column_width + GAP),
+                    MARGIN + 144.0 + (index / 2) as f64 * 28.0,
+                ),
+                NSSize::new(column_width, 28.0),
+            ),
+        );
+        // Flexible width and the opposite margin share the resize delta.
+        link.setAutoresizingMask(
+            WIDTH
+                | if column == 0 {
+                    NSAutoresizingMaskOptions::ViewMaxXMargin
+                } else {
+                    NSAutoresizingMaskOptions::ViewMinXMargin
+                },
+        );
+        document.addSubview(&link);
+        links.push(link);
+    }
+
+    let recorder_top = MARGIN + HEADER_HEIGHT + GAP;
+    document.addSubview(&rule(
+        mtm,
+        NSRect::new(
+            NSPoint::new(MARGIN, recorder_top - 8.0),
+            NSSize::new(inner, 1.0),
+        ),
+    ));
+    let recorder = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(
+            NSPoint::new(MARGIN, recorder_top),
+            NSSize::new(inner, RECORDER_HEIGHT),
+        ),
+    );
+    recorder.setAutoresizingMask(WIDTH);
+    let rect = |top: f64, height: f64| {
+        NSRect::new(
+            NSPoint::new(0.0, RECORDER_HEIGHT - top - height),
+            NSSize::new(inner, height),
+        )
+    };
+    let eyebrow = note(mtm, "", rect(0.0, 18.0));
+    // The state title says the same thing more clearly; keep its existing state
+    // binding without duplicating the visible status.
+    eyebrow.setHidden(true);
+    let title = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+    title.setFont(Some(&display_font(22.0)));
+    title.setFrame(rect(0.0, 32.0));
+    title.setAutoresizingMask(WIDTH);
+    let body = note(mtm, "", rect(36.0, 44.0));
+    body.setFont(Some(&body_font(14.0)));
+    allow_wrapping(&body, inner);
+    body.setAutoresizingMask(WIDTH);
     let record = HoldButton::new(
         mtm,
         NSRect::new(
-            NSPoint::new(centre(220.0), y - 40.0),
-            NSSize::new(220.0, 40.0),
+            NSPoint::new(0.0, RECORDER_HEIGHT - 88.0 - 48.0),
+            NSSize::new(244.0_f64.min(inner), 48.0),
         ),
     );
     record.setBezelStyle(NSBezelStyle::Push);
+    record.setFocusRingType(NSFocusRingType::Exterior);
     record.setControlSize(objc2_app_kit::NSControlSize::Large);
-    // The accent fill is what makes this read as the primary action, which is
-    // what the web screen's `record-button` is. A plain push button of this
-    // size reads as a placeholder next to nothing else on the card.
-    record.setBezelColor(Some(&NSColor::controlAccentColor()));
-    record.setFont(Some(&NSFont::systemFontOfSize_weight(15.0, 0.3)));
-    record.setAutoresizingMask(CENTRED);
-    y -= 40.0 + 10.0;
-
+    record.setFont(Some(&display_font(17.0)));
     let cancel = crate::ui::button(
         mtm,
         NSRect::new(
-            NSPoint::new(centre(170.0), y - 24.0),
-            NSSize::new(170.0, 24.0),
+            NSPoint::new(0.0, RECORDER_HEIGHT - 142.0 - 28.0),
+            NSSize::new(182.0, 28.0),
         ),
         "Cancel transcription",
         0,
     );
     cancel.setHidden(true);
-    cancel.setAutoresizingMask(CENTRED);
-    y -= 24.0 + 14.0;
+    let hint = note(mtm, "", rect(176.0, 42.0));
+    hint.setFont(Some(&body_font(13.0)));
+    allow_wrapping(&hint, inner);
+    hint.setAutoresizingMask(WIDTH);
+    let route = note(mtm, "", rect(228.0, 40.0));
+    route.setFont(Some(&body_font(12.0)));
+    allow_wrapping(&route, inner);
+    route.setAutoresizingMask(WIDTH);
+    for child in [
+        &*eyebrow as &NSView,
+        &title,
+        &body,
+        &record,
+        &cancel,
+        &hint,
+        &route,
+    ] {
+        recorder.addSubview(child);
+    }
+    document.addSubview(&recorder);
 
-    let hint = note(
+    let result_top = recorder_top + RECORDER_HEIGHT + GAP;
+    document.addSubview(&rule(
+        mtm,
+        NSRect::new(
+            NSPoint::new(MARGIN, result_top - 8.0),
+            NSSize::new(inner, 1.0),
+        ),
+    ));
+    let result_area = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(
+            NSPoint::new(MARGIN, result_top),
+            NSSize::new(inner, RESULT_HEIGHT),
+        ),
+    );
+    result_area.setAutoresizingMask(WIDTH);
+    let result_caption = note(
         mtm,
         "",
         NSRect::new(
-            NSPoint::new(PADDING, y - 14.0),
-            NSSize::new(inner - PADDING * 2.0, 14.0),
+            NSPoint::new(0.0, RESULT_HEIGHT - 28.0),
+            NSSize::new(inner, 22.0),
         ),
     );
-    hint.setAlignment(NSTextAlignment::Center);
-    hint.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable
-            | NSAutoresizingMaskOptions::ViewMinYMargin
-            | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    result_caption.setFont(Some(&display_font(13.0)));
+    result_caption.setAutoresizingMask(WIDTH);
+    let result = NSButton::initWithFrame(
+        NSButton::alloc(mtm),
+        NSRect::new(
+            NSPoint::new(0.0, RESULT_HEIGHT - 40.0 - RESULT_LINES),
+            NSSize::new(inner, RESULT_LINES),
+        ),
     );
-
-    recorder.addSubview(&glyph);
-    recorder.addSubview(&eyebrow);
-    recorder.addSubview(&title);
-    recorder.addSubview(&body);
-    recorder.addSubview(&record);
-    recorder.addSubview(&cancel);
-    recorder.addSubview(&hint);
-
-    view.addSubview(&recorder);
-    view.addSubview(&result_card);
-
+    result.setBordered(false);
+    result.setAlignment(NSTextAlignment::Left);
+    result.setFocusRingType(NSFocusRingType::Exterior);
+    result.setFont(Some(&body_font(15.0)));
+    result.setAutoresizingMask(WIDTH);
+    if let Some(cell) = result.cell() {
+        cell.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByWordWrapping);
+        cell.setWraps(true);
+    }
+    result_area.addSubview(&result_caption);
+    result_area.addSubview(&result);
+    document.addSubview(&result_area);
+    scroll.setDocumentView(Some(&document));
     (
-        view,
+        Retained::into_super(scroll),
         Controls {
+            links,
+            route,
             eyebrow,
             title,
             body,
@@ -867,6 +1097,81 @@ fn build_content(mtm: MainThreadMarker, size: NSSize) -> (Retained<NSView>, Cont
     )
 }
 
+/// Render actual native controls without constructing an engine or accessing
+/// settings, credentials, history, network or microphone. Used by UI snapshots.
+pub(super) fn preview_views(mtm: MainThreadMarker) -> Vec<(String, Retained<NSView>)> {
+    [
+        (704.0, 620.0, 704.0, "dictate"),
+        (440.0, 410.0, 440.0, "dictate-narrow"),
+        (704.0, 740.0, 704.0, "dictate-full"),
+        (704.0, 410.0, 440.0, "dictate-resized"),
+        (704.0, 410.0, 440.0, "dictate-transcribing"),
+    ]
+    .into_iter()
+    .map(|(width, height, final_width, name)| {
+        let (view, controls) = build_content(mtm, NSSize::new(width, height));
+        view.setFrameSize(NSSize::new(final_width, height));
+        view.layoutSubtreeIfNeeded();
+        // Exercise actual AppKit springs, not just separately constructed
+        // narrow fixtures. Every link must remain an unobstructed target.
+        for row in controls.links.chunks(2) {
+            let left = row[0].frame();
+            let right = row[1].frame();
+            assert!(left.size.width >= 160.0);
+            assert!(right.size.width >= 160.0);
+            assert!(left.origin.x + left.size.width <= right.origin.x);
+            assert!(right.origin.x + right.size.width <= final_width);
+        }
+        controls
+            .eyebrow
+            .setStringValue(&NSString::from_str("A little less typing"));
+        controls
+            .title
+            .setStringValue(&NSString::from_str("Speak a thought."));
+        controls
+            .body
+            .setStringValue(&NSString::from_str(&idle_body(false, InsertMethod::Paste)));
+        controls
+            .record
+            .setTitle(&NSString::from_str("Hold to record"));
+        controls.hint.setStringValue(&NSString::from_str(
+            "Hold Right Option in any app to record.\nCommand + Shift + V pastes again.",
+        ));
+        controls
+            .route
+            .setStringValue(&NSString::from_str(&processing_route(
+                true,
+                &Provider::Groq,
+                None,
+                true,
+            )));
+        controls.result_caption.setStringValue(&NSString::from_str(
+            "Last transcription · Click the text to copy",
+        ));
+        controls.result.setTitle(&NSString::from_str(
+            "Let's leave a little room to think before we start the next project.",
+        ));
+        if name == "dictate-transcribing" {
+            controls
+                .title
+                .setStringValue(&NSString::from_str("Turning speech into text."));
+            controls.body.setStringValue(&NSString::from_str(
+                "You can cancel if this is taking too long.",
+            ));
+            controls
+                .record
+                .setTitle(&NSString::from_str("Transcribing…"));
+            controls.record.setEnabled(false);
+            controls.cancel.setHidden(false);
+            for link in &controls.links {
+                link.setEnabled(false);
+            }
+        }
+        (name.to_string(), view)
+    })
+    .collect()
+}
+
 impl HoldButton {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(HoldButtonIvars::default());
@@ -877,9 +1182,135 @@ impl HoldButton {
 }
 
 #[cfg(test)]
+#[path = "dictate_link_tests.rs"]
+mod link_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use objc2::ClassType;
+
+    /// Previous production implementation, retained only as an equivalence
+    /// oracle and opt-in comparison baseline. No personal transcripts used.
+    fn preview_reference(text: &str) -> String {
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview: String = flat.chars().take(RESULT_CHARS).collect();
+        if flat.chars().count() > RESULT_CHARS {
+            format!("{preview}\u{2026}")
+        } else {
+            preview
+        }
+    }
+
+    #[test]
+    fn bounded_preview_matches_reference_at_unicode_and_whitespace_boundaries() {
+        let mut cases = vec![
+            String::new(),
+            " \t\n\r\u{a0}\u{2003}".to_string(),
+            "  Hello\tthere\nfriend  ".to_string(),
+            "你好\u{3000}世界\u{a0}👩🏽‍💻 e\u{301}".to_string(),
+            "a".repeat(1024 * 1024),
+            format!("{}word", " \n\t".repeat(2000)),
+        ];
+        for scalar in ["a", "你", "🦀", "e\u{301}"] {
+            for length in [RESULT_CHARS - 1, RESULT_CHARS, RESULT_CHARS + 1] {
+                let word = scalar.repeat(length);
+                cases.extend([
+                    word.clone(),
+                    format!("  {word}  \n"),
+                    format!("{word}\u{2003}next"),
+                    format!("{word}{}", "\u{a0}".repeat(2000)),
+                ]);
+            }
+        }
+        for input in cases {
+            let actual = preview_of(&input);
+            assert_eq!(actual, preview_reference(&input));
+            assert!(actual.chars().count() <= RESULT_CHARS + 1);
+            assert!(actual.capacity() <= RESULT_CHARS * 4 + 3);
+        }
+        // Preserve the old boundary behavior: a normalized separator that is
+        // the 220th scalar is visible immediately before the ellipsis.
+        assert_eq!(
+            preview_of(&format!("{}  b", "a".repeat(219))),
+            format!("{} …", "a".repeat(219))
+        );
+        assert_eq!(
+            preview_of(&format!("{}  ", "a".repeat(220))),
+            "a".repeat(220)
+        );
+    }
+
+    #[test]
+    fn bounded_preview_matches_reference_for_generated_mixed_text() {
+        // Deterministic property-style coverage without a new dependency.
+        let alphabet = [
+            'a', 'z', '你', '界', '🦀', '\u{301}', '\u{200d}', ' ', '\t', '\n', '\r', '\u{a0}',
+            '\u{2003}', '\u{3000}',
+        ];
+        let mut seed = 0x9e37_79b9_u64;
+        for case in 0..1000 {
+            let mut input = String::new();
+            for _ in 0..(case * 17 % 1300) {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                input.push(alphabet[(seed >> 32) as usize % alphabet.len()]);
+            }
+            assert_eq!(
+                preview_of(&input),
+                preview_reference(&input),
+                "generated case {case}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in synthetic performance comparison; run this exact filter only"]
+    fn benchmark_dictate_preview_compare() {
+        use std::{hint::black_box, time::Instant};
+        let phrase = "A synthetic reference transcript with ordinary words and whitespace. ";
+        let long = phrase.repeat((1024_usize * 1024).div_ceil(phrase.len()));
+        let long = &long[..1024 * 1024];
+        let short = "Let's leave a little room to think before starting the next project.";
+        let unicode = "  你好\u{3000}世界\nA small idea 👩🏽‍💻 and café.  ";
+        let measure = |f: fn(&str) -> String, input: &str, iterations: usize| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(f(black_box(input)));
+            }
+            start.elapsed().as_nanos() as f64 / iterations as f64
+        };
+        for (name, input, iterations) in [
+            ("ascii-short", short, 10_000),
+            ("unicode-short", unicode, 10_000),
+            ("transcript-1MiB", long, 10),
+        ] {
+            assert_eq!(
+                black_box(preview_of(input)),
+                black_box(preview_reference(input))
+            );
+            let mut old = Vec::new();
+            let mut new = Vec::new();
+            // Three unrecorded warmups and 31 alternating-order samples.
+            for sample in 0..34 {
+                let (before, after) = if sample % 2 == 0 {
+                    (
+                        measure(preview_reference, input, iterations),
+                        measure(preview_of, input, iterations),
+                    )
+                } else {
+                    let after = measure(preview_of, input, iterations);
+                    (measure(preview_reference, input, iterations), after)
+                };
+                if sample >= 3 {
+                    old.push(before);
+                    new.push(after);
+                }
+            }
+            old.sort_by(f64::total_cmp);
+            new.sort_by(f64::total_cmp);
+            println!("preview benchmark {name}: bytes={} samples=31 warmups=3 iterations={iterations} old_median_ns={:.1} old_p95_ns={:.1} new_median_ns={:.1} new_p95_ns={:.1} median_speedup={:.2}x", input.len(), old[15], old[29], new[15], new[29], old[15] / new[15]);
+        }
+    }
 
     /// Whether `OpenFlowHoldButton` implements `selector` itself rather than
     /// inheriting it. `class_copyMethodList`, which is what this reads, lists
@@ -1017,21 +1448,127 @@ mod tests {
         }
     }
 
-    /// The centring constant has to be the sum of the steps `build_content`
-    /// walks down, or the block sits off-centre by whatever the two disagree
-    /// by. Listed here in the same order the layout uses them.
     #[test]
-    fn the_block_height_is_the_sum_of_the_rows() {
-        let rows = [
-            56.0, 18.0, // glyph, gap
-            14.0, 6.0, // eyebrow, gap
-            30.0, 8.0, // title, gap
-            34.0, 20.0, // body, gap
-            40.0, 10.0, // record button, gap
-            24.0, 14.0, // cancel button, gap
-            14.0, // hint
-        ];
-        assert_eq!(rows.iter().sum::<f64>(), BLOCK_HEIGHT);
+    fn the_document_preserves_both_cards_in_short_windows() {
+        let result_bottom = MARGIN + HEADER_HEIGHT + GAP * 2.0 + RECORDER_HEIGHT + RESULT_HEIGHT;
+        assert_eq!(document_height() - result_bottom, MARGIN);
+        assert!(
+            document_height() > 410.0,
+            "short windows must scroll, not compress controls"
+        );
+        for width in [440.0, 704.0] {
+            let available = width - MARGIN * 2.0 - PADDING * 2.0;
+            assert!(
+                available >= 244.0,
+                "record target fits at the narrow snapshot size"
+            );
+        }
+    }
+
+    #[test]
+    fn unset_shortcuts_are_not_described_as_working() {
+        let hint = shortcut_hint("Not set", "Not set", InsertMethod::Paste);
+        assert!(hint.contains("Add a global recording shortcut"));
+        assert!(!hint.contains("Not set"));
+        assert!(!hint.contains("again"));
+        assert!(
+            shortcut_hint("Right Option", "Command V", InsertMethod::Type).contains("types again")
+        );
+    }
+
+    #[test]
+    fn processing_route_discloses_audio_text_and_conflicting_privacy_settings() {
+        let hosted = Provider::OpenRouter;
+        let loopback = Provider::from_str("custom:http://localhost:8080/v1");
+        let lan = Provider::from_str("custom:http://192.168.1.5:8080/v1");
+        for (provider, destination, blocked) in [
+            (&hosted, ProcessingDestination::Hosted, true),
+            (&loopback, ProcessingDestination::Loopback, false),
+            (&lan, ProcessingDestination::CustomServer, true),
+        ] {
+            assert_eq!(ProcessingDestination::provider(provider), destination);
+            let guarded_audio = processing_route(false, provider, None, true);
+            assert_eq!(guarded_audio.contains("Setup needed"), blocked);
+            let guarded_cleanup = processing_route(true, &hosted, Some(provider), true);
+            assert_eq!(guarded_cleanup.contains("Setup needed"), blocked);
+            let unguarded = processing_route(false, provider, Some(provider), false);
+            assert!(unguarded.contains(destination.label()));
+            assert!(!unguarded.contains("blocks"));
+            assert!(!unguarded.contains("Ready"));
+        }
+        assert_eq!(
+            processing_route(true, &hosted, Some(&loopback), true),
+            "Audio: on-device · Text cleanup: server on this Mac"
+        );
+        assert_eq!(
+            processing_route(false, &loopback, None, true),
+            "Audio: server on this Mac · Text cleanup: off"
+        );
+        assert!(processing_route(false, &lan, None, false).contains("custom server"));
+        assert!(!processing_route(false, &lan, None, false).contains("cloud"));
+    }
+
+    #[test]
+    fn effective_cleanup_follows_same_provider_over_dormant_stored_endpoint() {
+        use openflow_core::{db::Database, secrets::SecretStore, settings::Settings};
+        let dir =
+            std::env::temp_dir().join(format!("openflow-dictate-route-{}", uuid::Uuid::new_v4()));
+        let settings = Settings::new(
+            Database::new(dir.clone()).unwrap(),
+            SecretStore::new(dir.clone()),
+        );
+        settings.set("provider", "groq").unwrap();
+        settings
+            .set("formatting_provider", "custom:http://localhost:8080/v1")
+            .unwrap();
+        settings.set("format_enabled", "true").unwrap();
+        for (same, destination, blocked) in [
+            ("true", ProcessingDestination::Hosted, true),
+            ("false", ProcessingDestination::Loopback, false),
+        ] {
+            settings.set("same_provider", same).unwrap();
+            let cleanup = effective_cleanup_provider(&settings).expect("cleanup enabled");
+            assert_eq!(ProcessingDestination::provider(&cleanup), destination);
+            let route = processing_route(true, &settings.provider(), Some(&cleanup), true);
+            assert_eq!(
+                route.contains("Setup needed"),
+                blocked,
+                "same_provider={same}: {route}"
+            );
+        }
+        // The reverse conflict is equally important: a dormant hosted endpoint
+        // cannot imply text leaves this Mac while the shared endpoint is local.
+        settings
+            .set("provider", "custom:http://127.0.0.1:8080/v1")
+            .unwrap();
+        settings.set("formatting_provider", "openrouter").unwrap();
+        settings.set("same_provider", "true").unwrap();
+        assert_eq!(
+            ProcessingDestination::provider(&effective_cleanup_provider(&settings).unwrap()),
+            ProcessingDestination::Loopback
+        );
+        settings.set("same_provider", "false").unwrap();
+        assert_eq!(
+            ProcessingDestination::provider(&effective_cleanup_provider(&settings).unwrap()),
+            ProcessingDestination::Hosted
+        );
+        settings.set("format_enabled", "false").unwrap();
+        assert!(effective_cleanup_provider(&settings).is_none());
+        drop(settings);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn custom_record_action_retains_native_focus_ring_and_accessibility() {
+        for selector in [
+            sel!(drawRect:),
+            sel!(drawFocusRingMask),
+            sel!(focusRingMaskBounds),
+            sel!(accessibilityPerformPress),
+            sel!(acceptsFirstResponder),
+        ] {
+            assert!(overrides(selector), "{selector:?} must remain implemented");
+        }
     }
 
     /// Exactly at the limit nothing is cut, so no ellipsis is added.

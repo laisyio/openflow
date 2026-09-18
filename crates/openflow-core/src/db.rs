@@ -3,6 +3,12 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
+const HISTORY_QUERY: &str = "SELECT id, raw_text, formatted_text, provider, duration_ms, context_type, window_title, language, created_at
+             FROM transcriptions ORDER BY created_at DESC, id DESC LIMIT ?1";
+const HISTORY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS transcriptions_recency
+    ON transcriptions(created_at DESC, id DESC);
+    DROP INDEX IF EXISTS transcriptions_created_at_desc";
+
 #[derive(Serialize, Clone)]
 pub struct Transcription {
     pub id: String,
@@ -71,8 +77,6 @@ impl Database {
                 language TEXT,
                 created_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS transcriptions_recency
-                ON transcriptions(created_at DESC, id DESC);
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -81,6 +85,13 @@ impl Database {
         .map_err(|e| format!("Migration failed: {}", e))?;
 
         Self::scrub_what_earlier_builds_left(&conn);
+
+        // One recency index serves latest-history reads and stable keyset
+        // pagination without duplicating transcript text. Replace the older
+        // timestamp-only index rather than maintaining two overlapping indexes.
+        // Run after the privacy scrub so migration does not build it twice.
+        conn.execute_batch(HISTORY_INDEX_SQL)
+            .map_err(|e| format!("History index migration failed: {}", e))?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -154,8 +165,7 @@ impl Database {
              FROM transcriptions WHERE (created_at, id) < (?2, ?3)
              ORDER BY created_at DESC, id DESC LIMIT ?1"
         } else {
-            "SELECT id, raw_text, formatted_text, provider, duration_ms, context_type, window_title, language, created_at
-             FROM transcriptions ORDER BY created_at DESC, id DESC LIMIT ?1"
+            HISTORY_QUERY
         };
         let mut stmt = conn
             .prepare(sql)
@@ -326,6 +336,224 @@ impl Database {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// This fixture owns a fresh UUID-named temporary directory. Tests never
+    /// open personal history, and large benchmark databases are removed on exit.
+    struct HistoryFixture(PathBuf);
+
+    impl HistoryFixture {
+        fn new() -> Self {
+            let path = scratch_dir();
+            std::fs::create_dir(&path).expect("create owned history fixture");
+            Self(path)
+        }
+    }
+
+    impl Drop for HistoryFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn query_plan(db: &Database) -> Vec<String> {
+        let conn = db.connection().unwrap();
+        let mut statement = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {HISTORY_QUERY}"))
+            .unwrap();
+        statement
+            .query_map([50], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn latest_history_uses_recency_index_without_a_temporary_sort() {
+        let fixture = HistoryFixture::new();
+        let db = Database::new(fixture.0.clone()).unwrap();
+        let plan = query_plan(&db).join("; ");
+        assert!(plan.contains("transcriptions_recency"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    #[test]
+    fn an_older_history_schema_is_indexed_once_without_changing_rows_or_privacy() {
+        let fixture = HistoryFixture::new();
+        let path = fixture.0.join("openflow.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transcriptions (
+                id TEXT PRIMARY KEY, raw_text TEXT NOT NULL, formatted_text TEXT,
+                provider TEXT NOT NULL, duration_ms INTEGER, context_type TEXT,
+                window_title TEXT, language TEXT, created_at TEXT NOT NULL
+            );
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE INDEX transcriptions_created_at_desc ON transcriptions(created_at DESC);
+            INSERT INTO settings VALUES ('save_history', 'false');
+            INSERT INTO transcriptions (id,raw_text,formatted_text,provider,created_at) VALUES
+                ('older','alpha raw',NULL,'fixture','2026-01-01T00:00:00Z'),
+                ('tie-first','second raw','alpha clean','fixture','2026-01-02T00:00:00Z'),
+                ('tie-second','third raw',NULL,'fixture','2026-01-02T00:00:00Z');",
+        )
+        .unwrap();
+        let before: Vec<String> = conn
+            .prepare(HISTORY_QUERY)
+            .unwrap()
+            .query_map([50], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        drop(conn);
+
+        for _ in 0..2 {
+            let db = Database::new(fixture.0.clone()).unwrap();
+            let after: Vec<String> = db
+                .get_history(50)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            assert_eq!(
+                after, before,
+                "index migration preserves timestamp and tie ordering"
+            );
+            assert_eq!(
+                db.get_setting("save_history").unwrap().as_deref(),
+                Some("false")
+            );
+            let conn = db.connection().unwrap();
+            let indexes: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='transcriptions_recency'",
+                [], |row| row.get(0)).unwrap();
+            assert_eq!(indexes, 1);
+            let obsolete: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='transcriptions_created_at_desc'",
+                [], |row| row.get(0)).unwrap();
+            assert_eq!(
+                obsolete, 0,
+                "do not retain a redundant timestamp-only index"
+            );
+            let secure_delete: i64 = conn
+                .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(secure_delete, 1);
+        }
+        let db = Database::new(fixture.0.clone()).unwrap();
+        let matches: Vec<String> = db
+            .search_history("alpha", 50)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(matches, ["tie-first", "older"]);
+        assert!(db.get_history(0).unwrap().is_empty());
+        db.delete_transcription("tie-first").unwrap();
+        assert_eq!(db.search_history("alpha", 50).unwrap()[0].id, "older");
+        assert_eq!(db.clear_history().unwrap(), 2);
+        assert!(db.get_history(500).unwrap().is_empty());
+    }
+
+    fn seed_benchmark_history(db: &Database, count: usize) {
+        let mut conn = db.connection().unwrap();
+        let transaction = conn.transaction().unwrap();
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO transcriptions (id,raw_text,formatted_text,provider,duration_ms,language,created_at)
+                 VALUES (?1,?2,?3,'fixture',10000,'en',?4)",
+            ).unwrap();
+            let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+            for index in 0..count {
+                let timestamp = (start + chrono::Duration::seconds(index as i64)).to_rfc3339();
+                insert
+                    .execute(params![
+                        format!("synthetic-{index:06}"),
+                        "Synthetic reference speech for a database timing fixture. ".repeat(4),
+                        "Synthetic formatted reference text. ".repeat(5),
+                        timestamp,
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+    }
+
+    fn timed_history(db: &Database, limit: usize, repetitions: usize) -> f64 {
+        use std::hint::black_box;
+        for _ in 0..3 {
+            black_box(db.get_history(black_box(limit)).unwrap());
+        }
+        let mut times = Vec::with_capacity(repetitions);
+        for _ in 0..repetitions {
+            let start = std::time::Instant::now();
+            let rows = db.get_history(black_box(limit)).unwrap();
+            black_box(&rows);
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(rows.len(), limit.min(500));
+        }
+        times.sort_by(f64::total_cmp);
+        times[times.len() / 2]
+    }
+
+    /// Run only this ignored test explicitly, never all ignored tests (one
+    /// unrelated audio test opens a microphone). Actual file-backed Database
+    /// reads, including locking, preparation and row conversion, in both cases.
+    #[test]
+    #[ignore = "opt-in synthetic 50k-row release benchmark; no microphone or network"]
+    fn benchmark_history_index_compare() {
+        let fixture = HistoryFixture::new();
+        let db = Database::new(fixture.0.clone()).unwrap();
+        // Only this freshly created, owned fixture loses its active recency
+        // index. Production migration removes only the obsolete overlapping one.
+        db.connection()
+            .unwrap()
+            .execute_batch("DROP INDEX IF EXISTS transcriptions_recency")
+            .unwrap();
+        seed_benchmark_history(&db, 50_000);
+        let expected: Vec<String> = db
+            .get_history(500)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        let limits = [1, 50, 500];
+        let before = limits.map(|limit| timed_history(&db, limit, 31));
+        let plan_before = query_plan(&db).join("; ");
+        let file_before = std::fs::metadata(fixture.0.join("openflow.db"))
+            .unwrap()
+            .len();
+        let migration_start = std::time::Instant::now();
+        db.connection()
+            .unwrap()
+            .execute_batch(HISTORY_INDEX_SQL)
+            .unwrap();
+        let migration_ms = migration_start.elapsed().as_secs_f64() * 1000.0;
+        let file_after = std::fs::metadata(fixture.0.join("openflow.db"))
+            .unwrap()
+            .len();
+        let after = limits.map(|limit| timed_history(&db, limit, 31));
+        let actual: Vec<String> = db
+            .get_history(500)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "paired queries return the identical ordered rows"
+        );
+        assert_eq!(db.get_history(501).unwrap().len(), 500);
+        println!(
+            "history-index rows=50000 repetitions=31 warmups=3 sqlite={} release={}",
+            rusqlite::version(),
+            !cfg!(debug_assertions)
+        );
+        println!("before-plan={plan_before}");
+        println!("after-plan={}", query_plan(&db).join("; "));
+        for ((limit, before), after) in limits.into_iter().zip(before).zip(after) {
+            println!("latest={limit} before_median_ms={before:.6} after_median_ms={after:.6} speedup={:.2}x", before / after);
+        }
+        println!("migration_ms={migration_ms:.3} file_before_bytes={file_before} file_after_bytes={file_after} index_growth_bytes={}", file_after.saturating_sub(file_before));
+    }
 
     pub(crate) fn scratch_database() -> Database {
         let dir = std::env::temp_dir().join(format!("openflow-db-{}", uuid::Uuid::new_v4()));

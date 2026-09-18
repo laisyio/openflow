@@ -75,15 +75,15 @@ use crate::ui::settings::SettingsPage;
 
 /// The window's content size on first launch. Wide enough that the sidebar
 /// leaves the History table its five columns.
-const WINDOW_WIDTH: f64 = 880.0;
-const WINDOW_HEIGHT: f64 = 580.0;
+const WINDOW_WIDTH: f64 = 980.0;
+const WINDOW_HEIGHT: f64 = 680.0;
 /// The sidebar's resting width, and the range the user may drag it to.
-pub(crate) const SIDEBAR_WIDTH: f64 = 196.0;
+pub(crate) const SIDEBAR_WIDTH: f64 = 208.0;
 const SIDEBAR_MIN: f64 = 168.0;
 const SIDEBAR_MAX: f64 = 260.0;
 /// Never smaller than the narrowest page can stand. The pages spring, but the
 /// History table's columns do not, and below this they start eating each other.
-pub(crate) const MIN_WIDTH: f64 = 720.0;
+pub(crate) const MIN_WIDTH: f64 = 780.0;
 const MIN_HEIGHT: f64 = 440.0;
 
 const SIDEBAR_COLUMN: &str = "page";
@@ -104,13 +104,14 @@ const SETTINGS: usize = 3;
 /// gap after it, so the titles line up whatever glyph sits beside them -- a
 /// sidebar whose text starts at a different x on each row is the thing that
 /// reads as hand-made.
-const ROW_HEIGHT: f64 = 30.0;
+const ROW_HEIGHT: f64 = 36.0;
 const ICON_SIZE: f64 = 16.0;
 const ICON_LEFT: f64 = 6.0;
 const TITLE_LEFT: f64 = 30.0;
 /// The footer under the rows: a caption and the endpoint under it.
 const FOOTER_HEIGHT: f64 = 48.0;
 const FOOTER_INSET: f64 = 14.0;
+const BRAND_HEIGHT: f64 = 92.0;
 
 pub struct MainIvars {
     /// Held for the footer, which re-reads the endpoint on every present.
@@ -487,8 +488,8 @@ impl MainWindow {
     /// it happens here rather than once at build time: Settings can change it
     /// while the window is open, and this is the line that would go on lying.
     fn refresh_endpoint(&self) {
-        let name = self.ivars().engine.settings().provider_name();
-        let shown = crate::ui::history::provider_label(&name);
+        let settings = self.ivars().engine.settings();
+        let shown = audio_destination(settings.is_local_backend(), &settings.provider_name());
         self.ivars()
             .endpoint
             .setStringValue(&NSString::from_str(&shown));
@@ -520,6 +521,7 @@ impl MainWindow {
     /// Re-read everything a page shows. Called when the window is presented,
     /// because Settings may have changed a binding while it was hidden.
     pub fn reload(&self) {
+        self.refresh_endpoint();
         let ivars = self.ivars();
         match ivars.current.get() {
             0 => ivars.dictate.on_shown(),
@@ -574,6 +576,20 @@ fn page_index(name: &str) -> Option<usize> {
         .position(|(title, _, _)| title.eq_ignore_ascii_case(name))
 }
 
+fn audio_destination(local: bool, provider: &str) -> String {
+    if local {
+        "This Mac · on-device".to_string()
+    } else {
+        match provider {
+            "groq" => "Groq".to_string(),
+            "openrouter" => "OpenRouter".to_string(),
+            "openai" => "OpenAI".to_string(),
+            "deepgram" => "Deepgram".to_string(),
+            other => crate::ui::history::provider_label(other),
+        }
+    }
+}
+
 /// The source list. View-based, unlike the two tables that came before it: a
 /// row here is a symbol beside a title rather than one string, and an
 /// `NSTableCellView` is what the source-list style knows how to dress -- it
@@ -603,7 +619,7 @@ fn build_sidebar(
         NSPoint::new(0.0, FOOTER_HEIGHT),
         NSSize::new(
             frame.size.width,
-            (frame.size.height - FOOTER_HEIGHT).max(0.0),
+            (frame.size.height - FOOTER_HEIGHT - BRAND_HEIGHT).max(0.0),
         ),
     );
     let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), list_frame);
@@ -662,6 +678,30 @@ fn build_sidebar(
 
     container.addSubview(&scroll);
 
+    let brand = NSTextField::labelWithString(&NSString::from_str("OpenFlow"), mtm);
+    brand.setFont(Some(&crate::ui::editorial_font(22.0)));
+    brand.setFrame(NSRect::new(
+        NSPoint::new(20.0, frame.size.height - 65.0),
+        NSSize::new(frame.size.width - 40.0, 30.0),
+    ));
+    brand.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
+    container.addSubview(&brand);
+    let tagline = note(
+        mtm,
+        "A little less typing.",
+        NSRect::new(
+            NSPoint::new(21.0, frame.size.height - 83.0),
+            NSSize::new(frame.size.width - 42.0, 16.0),
+        ),
+    );
+    tagline.setFont(Some(&crate::ui::body_font(11.0)));
+    tagline.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
+    container.addSubview(&tagline);
+
     // ── The footer ──
     //
     // Four rows leave most of a sidebar empty, and the one piece of state the
@@ -672,7 +712,7 @@ fn build_sidebar(
     // reading the keychain at launch.
     let caption = note(
         mtm,
-        "Transcribing with",
+        "Audio goes to",
         NSRect::new(
             NSPoint::new(FOOTER_INSET, FOOTER_HEIGHT - 15.0),
             NSSize::new((frame.size.width - FOOTER_INSET * 2.0).max(0.0), 13.0),
@@ -707,6 +747,12 @@ fn build_sidebar(
 mod tests {
     use super::*;
     use openflow_core::engine::Remedy;
+
+    #[test]
+    fn local_destination_never_displays_a_previous_cloud_provider() {
+        assert_eq!(audio_destination(true, "groq"), "This Mac · on-device");
+        assert_eq!(audio_destination(false, "groq"), "Groq");
+    }
 
     /// Every name the tray and `Navigate` send has a page behind it. These are
     /// the literals in `tray.rs` and in `App::handle_event`, so a page renamed

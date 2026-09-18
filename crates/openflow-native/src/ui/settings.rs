@@ -22,8 +22,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSComboBox, NSControl, NSControlStateValueOff,
-    NSControlStateValueOn, NSControlTextEditingDelegate, NSFont, NSPopUpButton, NSScrollView,
+    NSAccessibility, NSAutoresizingMaskOptions, NSComboBox, NSControl, NSControlStateValueOff,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSPopUpButton, NSScrollView,
     NSSecureTextField, NSSwitch, NSTextDelegate, NSTextField, NSTextView, NSTextViewDelegate,
     NSView,
 };
@@ -54,7 +54,7 @@ use crate::ui::{
 /// on-this-Mac rows are alternatives, not a list, and stacking both would push
 /// the cleanup rows below either into a scroll view or off the tab. Sized for
 /// the taller of the two so nothing reflows when the choice changes.
-const BOX_HEIGHT: f64 = 300.0;
+const PANEL_LAYOUT_HEIGHT: f64 = 1200.0;
 
 /// How many lines every status line in this page reserves.
 ///
@@ -1155,8 +1155,7 @@ impl SettingsPage {
     fn apply_backend_choice(&self) {
         let controls = &self.ivars().controls;
         let local = selected_value(&controls.backend, BACKENDS) == "local";
-        controls.remote_box.setHidden(local);
-        controls.local_box.setHidden(!local);
+        show_backend_panel(controls, local);
         let index = { controls.local_model.indexOfSelectedItem() }.max(0) as usize;
         let model = openflow_core::runner::LOCAL_MODELS
             .get(index)
@@ -1729,6 +1728,7 @@ fn build_sections(
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Keep my clipboard", l));
     let preserve_clipboard = switch_control(mtm, switch_rect(c), TAG_PRESERVE_CLIPBOARD);
+    preserve_clipboard.setAccessibilityLabel(Some(&NSString::from_str("Preserve clipboard")));
     form.add(&preserve_clipboard);
     form.note_row(
         mtm,
@@ -1738,6 +1738,7 @@ fn build_sections(
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Hide overlay when idle", l));
     let overlay_only = switch_control(mtm, switch_rect(c), TAG_OVERLAY_ONLY);
+    overlay_only.setAccessibilityLabel(Some(&NSString::from_str("Overlay only")));
     form.add(&overlay_only);
 
     let (l, c) = form.row(ROW);
@@ -1761,6 +1762,7 @@ fn build_sections(
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Live preview", l));
     let live_preview = switch_control(mtm, switch_rect(c), TAG_LIVE_PREVIEW);
+    live_preview.setAccessibilityLabel(Some(&NSString::from_str("Live preview")));
     form.add(&live_preview);
     form.note_row(
         mtm,
@@ -1770,6 +1772,7 @@ fn build_sections(
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Open at login", l));
     let open_at_login = switch_control(mtm, switch_rect(c), TAG_OPEN_AT_LOGIN);
+    open_at_login.setAccessibilityLabel(Some(&NSString::from_str("Open at login")));
     form.add(&open_at_login);
     form.note_row(
         mtm,
@@ -1803,12 +1806,8 @@ fn build_sections(
     form.add(&backend);
 
     // The two alternatives, in one frame. Only one is ever visible.
-    let box_frame = form.full(BOX_HEIGHT);
-
     let (remote_box, provider, provider_url, api_key, stt_model, fetch, models_status) =
         build_remote_panel(mtm, width);
-    remote_box.setFrame(box_frame);
-    form.add(&remote_box);
 
     let (
         local_box,
@@ -1821,12 +1820,31 @@ fn build_sections(
         local_download,
         local_stop,
     ) = build_local_panel(mtm, width);
-    local_box.setFrame(box_frame);
+    // Reserve the actual measured height of the taller alternative. Privacy
+    // guidance must wrap without colliding with the following cleanup rows.
+    let box_frame = form.full(
+        remote_box
+            .frame()
+            .size
+            .height
+            .max(local_box.frame().size.height),
+    );
+    for panel in [&remote_box, &local_box] {
+        let height = panel.frame().size.height;
+        panel.setFrameOrigin(NSPoint::new(
+            box_frame.origin.x,
+            box_frame.origin.y + box_frame.size.height - height,
+        ));
+    }
+    form.add(&remote_box);
     form.add(&local_box);
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Same for cleanup", l));
     let same_provider = switch_control(mtm, switch_rect(c), TAG_SAME_PROVIDER);
+    same_provider.setAccessibilityLabel(Some(&NSString::from_str(
+        "Use the transcription provider for cleanup",
+    )));
     form.add(&same_provider);
 
     let (l, c) = form.row(ROW);
@@ -1852,6 +1870,7 @@ fn build_sections(
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Smart cleanup", l));
     let format_enabled = switch_control(mtm, switch_rect(c), TAG_FORMAT_ENABLED);
+    format_enabled.setAccessibilityLabel(Some(&NSString::from_str("Smart cleanup")));
     form.add(&format_enabled);
 
     let (l, c) = form.row(ROW);
@@ -1878,6 +1897,7 @@ fn build_sections(
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Voice features", l));
     let tts_enabled = switch_control(mtm, switch_rect(c), TAG_TTS_ENABLED);
+    tts_enabled.setAccessibilityLabel(Some(&NSString::from_str("Text to speech")));
     form.add(&tts_enabled);
 
     let (l, c) = form.row(ROW);
@@ -1955,6 +1975,7 @@ fn build_sections(
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Save history", l));
     let save_history = switch_control(mtm, switch_rect(c), TAG_SAVE_HISTORY);
+    save_history.setAccessibilityLabel(Some(&NSString::from_str("Save dictation history")));
     form.add(&save_history);
 
     let (l, c) = form.row(ROW);
@@ -2064,7 +2085,7 @@ pub fn section_index(name: &str) -> Option<usize> {
 }
 
 /// Height of a section heading, and the gap under it.
-const HEADING: f64 = 17.0;
+const HEADING: f64 = 44.0;
 const HEADING_GAP: f64 = 7.0;
 /// The room the forms are laid out into before `Form::fit` takes the slack
 /// back. Larger than any group needs; see `build_sections`.
@@ -2158,12 +2179,23 @@ fn build_page(
         let heading = NSTextField::labelWithString(&NSString::from_str(title), mtm);
         heading.setFrame(NSRect::new(
             NSPoint::new(card_x, y),
-            NSSize::new(card_width, HEADING),
+            NSSize::new(card_width, 25.0),
         ));
-        heading.setFont(Some(&NSFont::systemFontOfSize_weight(13.0, 0.3)));
+        heading.setFont(Some(&crate::ui::display_font(18.0)));
         heading.setToolTip(Some(&NSString::from_str(blurb)));
         heading.setAutoresizingMask(CENTRED_COLUMN);
         document.addSubview(&heading);
+        let description = note(
+            mtm,
+            blurb,
+            NSRect::new(
+                NSPoint::new(card_x, y + 26.0),
+                NSSize::new(card_width, 17.0),
+            ),
+        );
+        description.setFont(Some(&crate::ui::body_font(12.0)));
+        description.setAutoresizingMask(CENTRED_COLUMN);
+        document.addSubview(&description);
         y += HEADING + HEADING_GAP;
 
         let card = Card::new(
@@ -2206,6 +2238,45 @@ fn build_page(
     (view, scroll, sections, controls)
 }
 
+/// Actual settings controls for native visual checks; no SettingsPage/Engine,
+/// credentials, device enumeration, or service requests are constructed here.
+pub(super) fn preview_views(mtm: MainThreadMarker) -> Vec<(String, Retained<NSView>)> {
+    let mut views: Vec<_> = SECTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, (title, _))| {
+            let (view, scroll, sections, controls) = build_page(mtm, NSSize::new(704.0, 620.0));
+            show_backend_panel(&controls, false);
+            scroll
+                .contentView()
+                .scrollToPoint(NSPoint::new(0.0, sections[index].origin.y));
+            scroll.reflectScrolledClipView(&scroll.contentView());
+            (format!("settings-{}", title.to_ascii_lowercase()), view)
+        })
+        .collect();
+    let (view, scroll, sections, controls) = build_page(mtm, NSSize::new(704.0, 620.0));
+    select_value(&controls.backend, BACKENDS, "local");
+    show_backend_panel(&controls, true);
+    set_switch(&controls.local_only, true);
+    controls.local_status.setStringValue(&NSString::from_str(
+        "Install the engine, then download your speech model.",
+    ));
+    controls.local_cost.setStringValue(&NSString::from_str(
+        openflow_core::runner::LOCAL_MODELS[0].cost,
+    ));
+    scroll
+        .contentView()
+        .scrollToPoint(NSPoint::new(0.0, sections[1].origin.y));
+    scroll.reflectScrolledClipView(&scroll.contentView());
+    views.push(("settings-providers-local".to_string(), view));
+    views
+}
+
+fn show_backend_panel(controls: &Controls, local: bool) {
+    controls.remote_box.setHidden(local);
+    controls.local_box.setHidden(!local);
+}
+
 /// The online-provider half of the Providers tab: which service, its endpoint,
 /// its key, its model, and the button that lists models from it.
 #[allow(clippy::type_complexity)]
@@ -2221,7 +2292,7 @@ fn build_remote_panel(
     Retained<objc2_app_kit::NSButton>,
     Retained<NSTextField>,
 ) {
-    let mut form = Form::new(mtm, width, BOX_HEIGHT);
+    let mut form = Form::new(mtm, width, PANEL_LAYOUT_HEIGHT);
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Provider", l));
     let provider = popup(mtm, c, TAG_PROVIDER, &titles(PROVIDERS));
@@ -2238,12 +2309,7 @@ fn build_remote_panel(
     form.add(&label(mtm, "API key", l));
     let api_key = secure_field(mtm, c, TAG_API_KEY);
     form.add(&api_key);
-    let n = form.control_only(14.0);
-    form.add(&note(
-        mtm,
-        "Stored in the macOS keychain, never in the database.",
-        n,
-    ));
+    form.note_row(mtm, "Stored in the macOS keychain, never in the database.");
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Speech-to-text model", l));
@@ -2261,7 +2327,7 @@ fn build_remote_panel(
     let models_status = form.status_row(mtm, STATUS_LINES);
 
     (
-        form.view.clone(),
+        form.fit(),
         provider,
         provider_url,
         api_key,
@@ -2289,11 +2355,8 @@ fn build_local_panel(
     Retained<objc2_app_kit::NSButton>,
     Retained<objc2_app_kit::NSButton>,
 ) {
-    let mut form = Form::new(mtm, width, BOX_HEIGHT);
-    // Two lines, not three: this panel already fills `BOX_HEIGHT` exactly, so
-    // there is nowhere to grow. What it was missing was not room but the cap --
-    // without one a runner message four times this wide drew as a single line
-    // and lost most of itself off the right edge.
+    let mut form = Form::new(mtm, width, PANEL_LAYOUT_HEIGHT);
+    // Dynamic runner messages reserve two lines and visibly truncate overflow.
     let local_status = form.status_full(mtm, 2);
 
     let (l, c) = form.row(ROW);
@@ -2304,6 +2367,9 @@ fn build_local_panel(
     form.add(&local_model);
     let n = form.control_only(26.0);
     let local_cost = note(mtm, "", n);
+    allow_wrapping(&local_cost, n.size.width);
+    local_cost.setMaximumNumberOfLines(2);
+    local_cost.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
     form.add(&local_cost);
 
     let c = form.control_only(ROW);
@@ -2334,12 +2400,10 @@ fn build_local_panel(
         0,
     );
     form.add(&local_stop);
-    let n = form.control_only(26.0);
-    form.add(&note(
+    form.note_row(
         mtm,
         "Install and Download reach PyPI and Hugging Face. Local only does not cover them: they are one-time steps you ask for.",
-        n,
-    ));
+    );
 
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Unload after", l));
@@ -2349,16 +2413,15 @@ fn build_local_panel(
     let (l, c) = form.row(ROW);
     form.add(&label(mtm, "Local only", l));
     let local_only = switch_control(mtm, switch_rect(c), TAG_LOCAL_ONLY);
+    local_only.setAccessibilityLabel(Some(&NSString::from_str("Local-only protection")));
     form.add(&local_only);
-    let n = form.control_only(26.0);
-    form.add(&note(
+    form.note_row(
         mtm,
-        "Refuses any request that would leave this Mac, which turns off cleanup and voice unless they point at a service running here.",
-        n,
-    ));
+        "Blocks remote speech, cleanup and voice requests. Local services are allowed. Downloads and enabled plugins are not restricted.",
+    );
 
     (
-        form.view.clone(),
+        form.fit(),
         local_status,
         local_model,
         local_cost,

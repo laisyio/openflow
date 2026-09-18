@@ -23,14 +23,14 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 
 /// Gap between the content pane's edge and the cards inside it. The "left and
 /// right both leave room" rule, in one number.
-pub const MARGIN: f64 = 20.0;
+pub const MARGIN: f64 = 24.0;
 /// Vertical gap between two stacked cards.
 pub const GAP: f64 = 16.0;
 /// Gap between a card's own edge and the controls inside it.
-pub const PADDING: f64 = 16.0;
-/// Corner radius. 10pt is what AppKit's own grouped controls use at this size;
-/// smaller reads as a bevel and larger as a pill.
-pub const RADIUS: f64 = 10.0;
+pub const PADDING: f64 = 20.0;
+/// Corner radius for the larger content groups; native controls retain their
+/// own smaller radii.
+pub const RADIUS: f64 = 12.0;
 
 define_class!(
     // SAFETY: `NSView` is designed for subclassing, this class adds no ivars

@@ -4,6 +4,15 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Desktop: guided setup, link-first home, and measured performance improvements
+By: Codex
+Impact: `crates/openflow-native`, `crates/openflow-core/{src/agreement.rs,src/audio.rs,src/db.rs}`, `DESIGN.md`, `docs/*performance*.md`
+
+- A native, editorial-style home puts setup, history, providers and privacy one click away. Guided onboarding makes local versus cloud processing explicit, checks provider access, explains installation and permissions, and preserves the user's choice about history. Local-only connection checks allow loopback services without allowing hosted or LAN endpoints.
+- Refined Settings, History and Plugins layouts retain native controls, keyboard behavior, accessible labels and light/dark appearances. A synthetic AppKit snapshot harness exercises layouts without opening a microphone, reading personal history or contacting a provider.
+- History uses the composite recency index from the parallel performance work and cached row text, while the home preview reads a bounded portion of a transcript and retains the full copy payload. Migration removes the superseded timestamp-only index without changing history or privacy settings.
+- Agreement scoring skips shared token edges; audio preparation shares the loudness calculation and writes gain directly into WAV output; incremental resampling skips redundant interior bounds checks without changing filter arithmetic. Synthetic equivalence tests preserve scores and audio output. Original batch-pipeline benchmarks, independent review rounds, upstream integration notes and testing limits are recorded in the validation documents; historical component timings are not measurements of the merged streaming pipeline or cloud response time.
+
 ### Performance, cancellation and a multi-speaker evaluation
 By: Codex, with parallel implementation and independent review
 Impact: shared Rust core, native AppKit UI, Tauri playback, iOS lifecycle, CI and `evals/`
