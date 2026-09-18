@@ -157,6 +157,21 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         TARGETED_DEVICE_FAMILY: "1"
 
+  OpenFlowAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: OpenFlowAppTests
+    dependencies:
+      - target: OpenFlow
+      - package: OpenFlowMobileCore
+        product: OpenFlowMobileCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.laisy.openflow.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "1"
+
 schemes:
   OpenFlow:
     build:
@@ -164,5 +179,9 @@ schemes:
         OpenFlow: all
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - OpenFlowAppTests
     archive:
       config: Release

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
+import { SpeechPlayback, type SpeechChunk, type SpeechCompletion } from "./ttsPlayback";
 
 type Screen = "onboarding" | "main" | "history" | "settings" | "plugins";
 type RecordingState = "idle" | "recording" | "transcribing";
@@ -46,31 +47,12 @@ interface AudioDevice {
   is_default: boolean;
 }
 
-interface TtsChunk {
-  request_id: string;
-  sequence: number;
-  data_base64: string;
-}
-
-interface TtsFinished {
-  request_id?: string;
-}
-
 interface TtsStreamResult {
   request_id: string;
   mime_type: string;
   format: string;
   model: string;
   bytes: number;
-}
-
-interface TtsStreamPlayback {
-  mediaSource: MediaSource;
-  sourceBuffer: SourceBuffer | null;
-  pending: Map<number, Uint8Array>;
-  nextSequence: number;
-  finished: boolean;
-  started: boolean;
 }
 
 interface ProviderDefinition {
@@ -177,40 +159,6 @@ function providerValue(name: string, customUrl: string) {
   return name === "custom" ? `custom:${customUrl.trim().replace(/\/+$/, "")}` : name;
 }
 
-function decodeBase64Chunks(chunks: string[]) {
-  return chunks.map((chunk) => {
-    const decoded = atob(chunk);
-    const bytes = new Uint8Array(decoded.length);
-    for (let index = 0; index < decoded.length; index += 1) bytes[index] = decoded.charCodeAt(index);
-    return bytes;
-  });
-}
-
-function pumpTtsPlayback(
-  playback: TtsStreamPlayback,
-  audio: HTMLAudioElement | null,
-  onPlaybackError: () => void,
-) {
-  const sourceBuffer = playback.sourceBuffer;
-  if (!sourceBuffer || sourceBuffer.updating || playback.mediaSource.readyState !== "open") return;
-
-  if (!playback.started && sourceBuffer.buffered.length > 0) {
-    playback.started = true;
-    void audio?.play().catch(onPlaybackError);
-  }
-
-  const next = playback.pending.get(playback.nextSequence);
-  if (next) {
-    playback.pending.delete(playback.nextSequence);
-    playback.nextSequence += 1;
-    const bytes = next.buffer.slice(next.byteOffset, next.byteOffset + next.byteLength) as ArrayBuffer;
-    sourceBuffer.appendBuffer(bytes);
-    return;
-  }
-
-  if (playback.finished) playback.mediaSource.endOfStream();
-}
-
 function Icon({ name, size = 18 }: { name: "arrow" | "check" | "clock" | "gear" | "mic" | "play" | "refresh" | "spark" | "stop" | "volume"; size?: number }) {
   const paths: Record<typeof name, ReactNode> = {
     arrow: <><path d="m15 18-6-6 6-6"/><path d="M9 12h10"/></>,
@@ -296,11 +244,15 @@ function App() {
   const [ttsStatus, setTtsStatus] = useState<"idle" | "streaming" | "ready" | "error">("idle");
   const [ttsError, setTtsError] = useState("");
   const [ttsAudioUrl, setTtsAudioUrl] = useState("");
-  const ttsRequestRef = useRef<string | null>(null);
-  const ttsChunksRef = useRef<Map<string, Map<number, string>>>(new Map());
-  const ttsPlaybackRef = useRef<Map<string, TtsStreamPlayback>>(new Map());
-  const ttsMimeRef = useRef("audio/mpeg");
+  const ttsPlayerRef = useRef<SpeechPlayback | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  if (!ttsPlayerRef.current) {
+    ttsPlayerRef.current = new SpeechPlayback({
+      audio: () => audioRef.current,
+      url: setTtsAudioUrl, state: setTtsStatus, error: setTtsError,
+      cancel: requestId => { void invoke("cancel_speech", { requestId }).catch(() => {}); },
+    });
+  }
   const cancelHotkeyEditRef = useRef(false);
 
   // Copy without the paste keystroke. paste_text is the other verb, used by the
@@ -486,67 +438,31 @@ function App() {
       listen<string>("navigate", (event) => {
         if (event.payload === "history") { void loadHistory(); setScreen("history"); }
       }),
-      listen<TtsChunk>("tts-audio-chunk", (event) => {
-        const { request_id, sequence, data_base64 } = event.payload;
-        const chunks = ttsChunksRef.current.get(request_id) || new Map<number, string>();
-        chunks.set(sequence, data_base64);
-        ttsChunksRef.current.set(request_id, chunks);
-        const playback = ttsPlaybackRef.current.get(request_id);
-        if (playback) {
-          const [bytes] = decodeBase64Chunks([data_base64]);
-          playback.pending.set(sequence, bytes);
-          pumpTtsPlayback(playback, audioRef.current, () => {
-            setTtsError("Live playback was blocked. Use the audio controls to continue.");
-          });
-        }
-      }),
-      listen<TtsFinished>("tts-finished", (event) => {
-        const requestId = event.payload?.request_id || ttsRequestRef.current;
-        if (!requestId || requestId !== ttsRequestRef.current) return;
-        const chunks = ttsChunksRef.current.get(requestId);
-        if (!chunks?.size) {
-          setTtsStatus("error");
-          setTtsError("Voice preview failed. The provider returned no audio.");
-          ttsChunksRef.current.delete(requestId);
-          ttsPlaybackRef.current.delete(requestId);
-          ttsRequestRef.current = null;
-          return;
-        }
-        const playback = ttsPlaybackRef.current.get(requestId);
-        if (playback) {
-          playback.finished = true;
-          pumpTtsPlayback(playback, audioRef.current, () => {
-            setTtsError("Live playback was blocked. Use the audio controls to continue.");
-          });
-          setTtsStatus("ready");
-          ttsChunksRef.current.delete(requestId);
-          ttsRequestRef.current = null;
-          return;
-        }
-        const ordered = [...chunks.entries()].sort(([a], [b]) => a - b).map(([, value]) => value);
-        const blob = new Blob(decodeBase64Chunks(ordered), { type: ttsMimeRef.current });
-        setTtsAudioUrl((previous) => {
-          if (previous) URL.revokeObjectURL(previous);
-          return URL.createObjectURL(blob);
-        });
-        setTtsStatus("ready");
-        ttsChunksRef.current.delete(requestId);
-        ttsRequestRef.current = null;
+      listen<SpeechChunk>("tts-audio-chunk", event => ttsPlayerRef.current?.chunk(event.payload)),
+      listen<SpeechCompletion>("tts-finished", event => ttsPlayerRef.current?.finish(event.payload)),
+      listen<{ request_id: string; error: string }>("tts-error", event => {
+        ttsPlayerRef.current?.fail(event.payload.request_id, event.payload.error);
       }),
     ];
     return () => { for (const unlisten of unlisteners) void unlisten.then((dispose) => dispose()); };
   }, [loadHistory, showNotification]);
 
-  useEffect(() => () => { if (ttsAudioUrl) URL.revokeObjectURL(ttsAudioUrl); }, [ttsAudioUrl]);
-
-  useEffect(() => () => {
-    for (const playback of ttsPlaybackRef.current.values()) {
-      if (playback.mediaSource.readyState === "open") {
-        try { playback.mediaSource.endOfStream(); } catch { /* The stream may already be closing. */ }
-      }
+  useEffect(() => () => ttsPlayerRef.current?.dispose(), []);
+  useEffect(() => {
+    // A completed buffered/WAV preview creates a new URL. Streaming MP3 keeps
+    // its existing URL, so completion never resumes a manually paused stream.
+    if (ttsAudioUrl && ttsStatus === "ready") {
+      const url = ttsAudioUrl;
+      void audioRef.current?.play().catch(() => {
+        if (audioRef.current?.getAttribute("src") === url) {
+          setTtsError("Playback was blocked. Use the audio controls to continue.");
+        }
+      });
     }
-    ttsPlaybackRef.current.clear();
-  }, []);
+  }, [ttsAudioUrl]);
+  // Editing voice settings invalidates the preview and its pending result.
+  useEffect(() => { ttsPlayerRef.current?.dispose(); },
+    [ttsProvider, customTtsUrl, ttsModel, ttsVoice, ttsPreviewText, ttsEnabled]);
 
   const markDirty = () => {
     setSettingsDirty(true);
@@ -745,101 +661,25 @@ function App() {
       } catch { setTtsError("Playback was blocked. Use the audio controls below to play the preview."); }
       return;
     }
-    setTtsError("");
-    setTtsStatus("streaming");
     const requestId = crypto.randomUUID();
     const format = ttsFormat(ttsProvider);
-    ttsRequestRef.current = requestId;
-    ttsChunksRef.current.set(requestId, new Map());
-    ttsMimeRef.current = format === "wav" ? "audio/wav" : "audio/mpeg";
-    if (format === "mp3" && "MediaSource" in window && MediaSource.isTypeSupported("audio/mpeg")) {
-      const mediaSource = new MediaSource();
-      const playback: TtsStreamPlayback = {
-        mediaSource,
-        sourceBuffer: null,
-        pending: new Map(),
-        nextSequence: 0,
-        finished: false,
-        started: false,
-      };
-      ttsPlaybackRef.current.set(requestId, playback);
-      const streamUrl = URL.createObjectURL(mediaSource);
-      setTtsAudioUrl((previous) => {
-        if (previous) URL.revokeObjectURL(previous);
-        return streamUrl;
-      });
-      mediaSource.addEventListener("sourceopen", () => {
-        if (ttsPlaybackRef.current.get(requestId) !== playback) return;
-        try {
-          playback.sourceBuffer = mediaSource.addSourceBuffer("audio/mpeg");
-          playback.sourceBuffer.mode = "sequence";
-          playback.sourceBuffer.addEventListener("updateend", () => {
-            pumpTtsPlayback(playback, audioRef.current, () => {
-              setTtsError("Live playback was blocked. Use the audio controls to continue.");
-            });
-          });
-          pumpTtsPlayback(playback, audioRef.current, () => {
-            setTtsError("Live playback was blocked. Use the audio controls to continue.");
-          });
-        } catch {
-          ttsPlaybackRef.current.delete(requestId);
-        }
-      }, { once: true });
-    }
+    const player = ttsPlayerRef.current!;
+    player.start(requestId, format === "wav" ? "audio/wav" : "audio/mpeg");
     try {
       const result = await invoke<TtsStreamResult>("stream_speech", {
-        text: ttsPreviewText.trim(),
-        model: ttsModel.trim(),
-        voice: ttsVoice.trim(),
-        responseFormat: format,
-        requestId,
+        text: ttsPreviewText.trim(), model: ttsModel.trim(), voice: ttsVoice.trim(),
+        responseFormat: format, requestId,
       });
-      ttsMimeRef.current = result.mime_type || ttsMimeRef.current;
-      const chunks = ttsChunksRef.current.get(requestId);
-      if (chunks?.size && ttsRequestRef.current === requestId) {
-        const ordered = [...chunks.entries()].sort(([a], [b]) => a - b).map(([, value]) => value);
-        const blob = new Blob(decodeBase64Chunks(ordered), { type: ttsMimeRef.current });
-        setTtsAudioUrl((previous) => {
-          if (previous) URL.revokeObjectURL(previous);
-          return URL.createObjectURL(blob);
-        });
-        setTtsStatus("ready");
-        ttsChunksRef.current.delete(requestId);
-        ttsRequestRef.current = null;
-      } else if (ttsRequestRef.current === requestId) {
-        setTtsStatus("error");
-        setTtsError(result.bytes === 0
-          ? "Voice preview failed. The provider returned no audio."
-          : "Voice preview failed. Audio could not be delivered to the player.");
-        ttsChunksRef.current.delete(requestId);
-        ttsPlaybackRef.current.delete(requestId);
-        ttsRequestRef.current = null;
-      }
+      player.finish(result);
     } catch (reason) {
-      if (ttsRequestRef.current === requestId) {
-        setTtsStatus("error");
-        setTtsError(`Voice preview failed. ${friendlyError(reason)}`);
-        ttsChunksRef.current.delete(requestId);
-        ttsPlaybackRef.current.delete(requestId);
-        ttsRequestRef.current = null;
-      }
+      player.fail(requestId, `Voice preview failed. ${friendlyError(reason)}`);
     }
   };
 
   const cancelTtsPreview = async () => {
-    const requestId = ttsRequestRef.current;
-    try { await invoke("cancel_speech", { requestId }); } catch { /* Cancellation is best-effort. */ }
-    if (requestId) ttsChunksRef.current.delete(requestId);
-    if (requestId) {
-      const playback = ttsPlaybackRef.current.get(requestId);
-      if (playback?.mediaSource.readyState === "open") {
-        try { playback.mediaSource.endOfStream(); } catch { /* Cancellation races with provider completion. */ }
-      }
-      ttsPlaybackRef.current.delete(requestId);
-    }
-    ttsRequestRef.current = null;
-    setTtsAudioUrl("");
-    setTtsStatus("idle");
+    // Invalidate synchronously; an old cancellation reply must never clear a
+    // replacement request that was started while the IPC call was in flight.
+    ttsPlayerRef.current?.dispose();
     setTtsError("");
   };
 

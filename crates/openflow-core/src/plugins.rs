@@ -52,22 +52,67 @@ fn own_process_group(_command: &mut Command) {}
 
 /// Stop the plugin and anything it started.
 ///
-/// Checked rather than assumed: `killpg` is only sent when the child really is
-/// the leader of its own group. If `setpgid` failed in the fork the child is
-/// still in *this app's* group, and signalling that group would kill the app.
-/// Reading the group back is one syscall and turns the worst possible outcome
-/// into the old behaviour.
-///
-/// The group is signalled before the child is reaped, because reaping releases
-/// the pid and there is nothing to ask about a pid that has been reused.
+/// `own_process_group` is required before spawn; its failed pre_exec prevents
+/// spawn from returning a Child at all. The leader stays unreaped until this
+/// function runs, so its positive PID cannot have been reused. On macOS
+/// getpgid(zombie) can return ESRCH while live descendants still occupy that
+/// group, so checking the zombie's group here would skip exactly that cleanup.
 #[cfg(unix)]
 fn stop_everything_it_started(child: &mut std::process::Child) {
     let pid = child.id() as i32;
-    if pid > 0 && unsafe { libc::getpgid(pid) } == pid {
+    if pid > 0 {
         unsafe { libc::killpg(pid, libc::SIGKILL) };
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Own the process group on every exit path, including malformed output and
+/// descendants keeping pipes open after their parent exits.
+struct PluginChild(std::process::Child, bool);
+
+impl std::ops::Deref for PluginChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for PluginChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for PluginChild {
+    fn drop(&mut self) {
+        if !self.1 {
+            stop_everything_it_started(&mut self.0);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn child_has_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    // Keep the group leader unreaped while draining pipes, preventing PID/PGID
+    // reuse and allowing the guard to kill its descendants on a drain timeout.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let outcome = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if outcome == 0 {
+        Ok(info.si_signo != 0)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn child_has_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
 }
 
 #[cfg(not(unix))]
@@ -91,6 +136,7 @@ pub struct HookPayload {
     pub language: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct PluginManager {
     plugins_dir: PathBuf,
 }
@@ -221,8 +267,42 @@ impl PluginManager {
     /// Runs enabled plugin hooks serially. Each executable receives one JSON
     /// payload on stdin and must return the updated payload on stdout.
     pub fn run_hook(&self, hook_name: &str, initial: HookPayload) -> Result<HookPayload, String> {
+        self.run_hook_cancellable(
+            hook_name,
+            initial,
+            &self.list_plugins(),
+            &tokio_util::sync::CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+    }
+
+    /// A take snapshots manifests once, keeping both ordered stages consistent
+    /// while avoiding a directory scan and JSON parse between stages.
+    pub fn run_hook_cancellable(
+        &self,
+        hook_name: &str,
+        initial: HookPayload,
+        plugins: &[PluginInfo],
+        cancellation: &tokio_util::sync::CancellationToken,
+        budget: Duration,
+    ) -> Result<HookPayload, String> {
         let mut payload = initial;
-        for plugin in self.get_enabled_hooks(hook_name) {
+        let total_deadline = Instant::now() + budget;
+        for plugin in plugins.iter().filter(|plugin| {
+            plugin.enabled && plugin.manifest.hooks.iter().any(|hook| hook == hook_name)
+        }) {
+            if cancellation.is_cancelled() {
+                return Err("Plugin execution cancelled".to_string());
+            }
+            if Instant::now() >= total_deadline {
+                return Err("Plugin processing exceeded the take's time budget".to_string());
+            }
+            // The snapshot caches manifests, never permission to execute.
+            // Disabling or reinstalling a plugin during the formatting pass
+            // must revoke the second stage too.
+            if !Path::new(&plugin.path).join(".enabled").is_file() {
+                continue;
+            }
             let Some(entrypoint) = plugin.manifest.entrypoint.as_deref() else {
                 continue;
             };
@@ -241,9 +321,12 @@ impl PluginManager {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             own_process_group(&mut command);
-            let mut child = command
-                .spawn()
-                .map_err(|e| format!("Plugin '{}' could not start: {}", plugin.manifest.id, e))?;
+            let mut child = PluginChild(
+                command.spawn().map_err(|e| {
+                    format!("Plugin '{}' could not start: {}", plugin.manifest.id, e)
+                })?,
+                false,
+            );
             let input = serde_json::to_vec(&payload)
                 .map_err(|e| format!("Plugin payload failed: {}", e))?;
             let mut stdin = child
@@ -270,28 +353,32 @@ impl PluginManager {
             let output_thread = std::thread::spawn(move || read_bounded(&mut stdout, 1_048_576));
             let error_thread = std::thread::spawn(move || read_bounded(&mut stderr, 65_536));
 
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break status,
-                    Ok(None) if Instant::now() < deadline => {
+            let deadline = total_deadline.min(Instant::now() + Duration::from_secs(5));
+            loop {
+                if cancellation.is_cancelled() {
+                    return Err("Plugin execution cancelled".to_string());
+                }
+                match child_has_exited(&mut child) {
+                    Ok(true) => break,
+                    Ok(false) if Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(20))
                     }
-                    Ok(None) => {
-                        stop_everything_it_started(&mut child);
+                    Ok(false) => {
                         return Err(format!("Plugin '{}' timed out", plugin.manifest.id));
                     }
                     Err(e) => {
-                        stop_everything_it_started(&mut child);
                         return Err(format!("Plugin '{}' failed: {}", plugin.manifest.id, e));
                     }
                 }
-            };
+            }
             while !(input_thread.is_finished()
                 && output_thread.is_finished()
                 && error_thread.is_finished())
                 && Instant::now() < deadline
             {
+                if cancellation.is_cancelled() {
+                    return Err("Plugin execution cancelled".to_string());
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             if !input_thread.is_finished()
@@ -303,6 +390,13 @@ impl PluginManager {
                     plugin.manifest.id
                 ));
             }
+            // All I/O is drained and the direct child has exited, but keep its
+            // PID reserved until group cleanup has stopped detached helpers.
+            stop_everything_it_started(&mut child.0);
+            child.1 = true;
+            let status = child
+                .wait()
+                .map_err(|e| format!("Plugin wait failed: {e}"))?;
             let input_result = input_thread
                 .join()
                 .map_err(|_| format!("Plugin '{}' input worker failed", plugin.manifest.id))?;
@@ -432,6 +526,111 @@ fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<(Vec<u8
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn hook_fixture(script: &str) -> (PathBuf, PluginManager) {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("openflow-plugin-guard-{}", uuid::Uuid::new_v4()));
+        let manager = PluginManager {
+            plugins_dir: root.clone(),
+        };
+        manager.install_plugin(r#"{"id":"probe","name":"Probe","version":"1","description":"fixture","hooks":["after_transcribe"],"entrypoint":"run.sh"}"#).unwrap();
+        let executable = root.join("probe/run.sh");
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        manager.enable_plugin("probe").unwrap();
+        (root, manager)
+    }
+
+    #[cfg(unix)]
+    fn empty_payload() -> HookPayload {
+        HookPayload {
+            raw_text: Some("fixture".to_string()),
+            formatted_text: None,
+            provider: None,
+            language: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_pipe_timeout_kills_the_group_after_the_parent_exits() {
+        let (root, manager) = hook_fixture(
+            r#"#!/usr/bin/env python3
+import os, time
+pid = os.fork()
+if pid:
+    with open('helper.pid', 'w') as output:
+        output.write(str(pid))
+    os.write(1, b'{"raw_text":"fixture"}')
+    os._exit(0)
+time.sleep(60)
+"#,
+        );
+        let outcome = manager.run_hook_cancellable(
+            "after_transcribe",
+            empty_payload(),
+            &manager.list_plugins(),
+            &tokio_util::sync::CancellationToken::new(),
+            Duration::from_secs(5),
+        );
+        let error = outcome.unwrap_err();
+        assert!(error.contains("pipes"), "{error}");
+        let pid: i32 = std::fs::read_to_string(root.join("probe/helper.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut running = true;
+        while Instant::now() < deadline {
+            let state = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&state.stdout);
+            running = !state.trim().is_empty() && !state.trim().starts_with('Z');
+            if !running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if running {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            !running,
+            "the inherited-pipe timeout left a running descendant"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_cancellation_stops_work_without_waiting_for_the_timeout() {
+        let (root, manager) = hook_fixture("#!/bin/sh\ncat >/dev/null\nsleep 60\n");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let stop = cancellation.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            stop.cancel();
+        });
+        let started = Instant::now();
+        let outcome = manager.run_hook_cancellable(
+            "after_transcribe",
+            empty_payload(),
+            &manager.list_plugins(),
+            &cancellation,
+            Duration::from_secs(5),
+        );
+        canceller.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(outcome.unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn rejects_path_traversal_ids_and_entrypoints() {
         assert!(validate_plugin_id("../escape").is_err());
@@ -548,6 +747,32 @@ mod tests {
         let (kept, truncated) = read_bounded(&mut input, 8).expect("bounded read");
         assert_eq!(kept, vec![7_u8; 8]);
         assert!(truncated);
+    }
+
+    #[test]
+    fn a_snapshot_does_not_keep_a_disabled_plugin_authorized() {
+        let root =
+            std::env::temp_dir().join(format!("openflow-plugin-revoke-{}", uuid::Uuid::new_v4()));
+        let manager = PluginManager {
+            plugins_dir: root.clone(),
+        };
+        manager.install_plugin(r#"{"id":"revoked","name":"Revoked","version":"1.0.0","description":"fixture","hooks":["after_transcribe"],"entrypoint":"missing.sh"}"#).unwrap();
+        manager.enable_plugin("revoked").unwrap();
+        let snapshot = manager.list_plugins();
+        assert!(snapshot[0].enabled);
+        manager.disable_plugin("revoked").unwrap();
+        let result = manager.run_hook_cancellable(
+            "after_transcribe",
+            empty_payload(),
+            &snapshot,
+            &tokio_util::sync::CancellationToken::new(),
+            Duration::from_secs(1),
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.is_ok(),
+            "revoked snapshot must not attempt to open its missing executable: {result:?}"
+        );
     }
 
     /// A plugin that times out leaves nothing of its own running.

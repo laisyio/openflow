@@ -223,6 +223,7 @@ import Testing
 
         try await manager.ensureLoaded()
         let work = Task { try await manager.transcribe(samples16k: [0.1, 0.2]) }
+        await waitUntil("transcription admitted") { await manager.transcriptionsInFlight == 1 }
         await clock.waitForSleepers(1)   // the engine is mid-transcription
         let inFlight = await manager.transcriptionsInFlight
         #expect(inFlight == 1)
@@ -251,6 +252,7 @@ import Testing
     @Test func testBackgroundUnloadFiresWhenNothingIsInFlight() async throws {
         var policy = ModelPolicy()
         policy.backgroundGraceSeconds = 20
+        policy.unloadAfterMinutes = 0
         let (manager, _, _, clock) = makeManager(policy: policy)
         try await manager.ensureLoaded()
 

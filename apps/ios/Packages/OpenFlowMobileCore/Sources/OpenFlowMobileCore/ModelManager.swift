@@ -108,7 +108,7 @@ public struct ModelPolicy: Sendable, Equatable {
 /// page cache. The one thing we never do is lose the user's text: a background
 /// unload waits for an in-flight transcription to finish first.
 public actor ModelManager {
-    private let engine: any SpeechEngine
+    private var engine: any SpeechEngine
     private let conditions: SystemConditions
     private let clock: IdleClock
     private var policy: ModelPolicy
@@ -130,6 +130,10 @@ public actor ModelManager {
     private var idleGeneration = 0
     private var idleTask: Task<Void, Never>?
     private var backgroundTask: Task<Void, Never>?
+    private var backgroundGeneration = 0
+    private var captureLeases: Set<UUID> = []
+    private var isBackground = false
+    private var unloadWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Transcriptions that have started and not yet delivered their text.
     private var inFlight = 0
@@ -162,6 +166,29 @@ public actor ModelManager {
 
     public func update(policy: ModelPolicy) {
         self.policy = policy
+        if captureLeases.isEmpty && inFlight == 0 { startIdleTimer() }
+    }
+
+    /// A capture owns prewarmed weights until it ends, even before inference.
+    public func beginCapture(id: UUID) {
+        captureLeases.insert(id)
+        cancelIdleTimer()
+    }
+
+    public func endCapture(id: UUID) async {
+        guard captureLeases.remove(id) != nil else { return }
+        await settleAfterWork()
+    }
+
+    /// Called only after the controller has settled/cancelled its current take.
+    /// The old engine is fully unloaded before its replacement can allocate.
+    public func replaceEngine(_ replacement: any SpeechEngine) async throws {
+        guard inFlight == 0, captureLeases.isEmpty else {
+            throw SpeechEngineError.loadFailed("Finish the current dictation before changing recognisers.")
+        }
+        await unloadNow()
+        engine = replacement
+        transition(to: .unloaded, trigger: .manual)
     }
 
     // MARK: - Load triggers
@@ -186,11 +213,13 @@ public actor ModelManager {
             refuse(trigger, .thermalPressure)
             return false
         }
+        cancelIdleTimer()
         switch currentState {
-        case .ready, .loading:
+        case .ready, .loading, .unloading:
             refuse(trigger, .alreadyLoadedOrLoading)
+            if currentState == .ready { startIdleTimer() }
             return false
-        case .unloaded, .unloading, .failed:
+        case .unloaded, .failed:
             cancelIdleTimer()
             startLoad(trigger: trigger)
             return true
@@ -204,7 +233,9 @@ public actor ModelManager {
         inFlight += 1
         do {
             try await ensureLoaded(trigger: .transcriptionDemand)
+            try Task.checkCancellation()
             let transcript = try await engine.transcribe(samples16k: samples16k)
+            try Task.checkCancellation()
             inFlight -= 1
             await settleAfterWork()
             return transcript
@@ -222,6 +253,10 @@ public actor ModelManager {
         // failed or was cancelled underneath us, start one of our own. A third
         // failure is a real failure and the caller hears about it.
         for _ in 0..<2 {
+            if currentState == .unloading {
+                await withCheckedContinuation { unloadWaiters.append($0) }
+            }
+            try Task.checkCancellation()
             if currentState == .ready { return }
             if let task = loadTask {
                 await task.value
@@ -263,6 +298,7 @@ public actor ModelManager {
             // load. Only claim ready if nobody unloaded underneath us.
             if currentState == .loading {
                 transition(to: .ready, trigger: trigger)
+                startIdleTimer()
             }
         } catch {
             guard generation == loadGeneration else { return }
@@ -295,6 +331,8 @@ public actor ModelManager {
     /// zero idle work -- and an unload scheduled against `.unloaded` could only
     /// ever fire against a model some later prewarm had just loaded.
     public func handleEnterBackground() {
+        isBackground = true
+        cancelIdleTimer()
         cancelBackgroundTimer()
         switch currentState {
         case .ready, .loading:
@@ -303,16 +341,18 @@ public actor ModelManager {
             return
         }
         let grace = policy.backgroundGraceSeconds
+        backgroundGeneration += 1
+        let generation = backgroundGeneration
         backgroundTask = Task { [weak self, clock] in
             await clock.sleep(seconds: grace)
             if Task.isCancelled { return }
-            await self?.backgroundGraceElapsed()
+            await self?.backgroundGraceElapsed(generation: generation)
         }
     }
 
-    private func backgroundGraceElapsed() async {
-        guard backgroundTask != nil else { return }
-        if inFlight > 0 {
+    private func backgroundGraceElapsed(generation: Int) async {
+        guard generation == backgroundGeneration, backgroundTask != nil else { return }
+        if inFlight > 0 || !captureLeases.isEmpty {
             // The text has not reached the store and the clipboard yet. Finish,
             // deliver, then unload -- section 2 is explicit about the order.
             unloadWhenIdle = .backgroundDelay
@@ -323,8 +363,10 @@ public actor ModelManager {
 
     /// Back in the foreground: cancel any pending background unload.
     public func handleEnterForeground() {
+        isBackground = false
         cancelBackgroundTimer()
         unloadWhenIdle = nil
+        startIdleTimer()
     }
 
     /// Called when the OS posts a thermal-state change. Unloads at `.serious`.
@@ -347,15 +389,24 @@ public actor ModelManager {
 
     private func unload(trigger: ModelTrigger) async {
         switch currentState {
-        case .unloaded, .unloading:
+        case .unloaded:
+            return
+        case .unloading:
+            await withCheckedContinuation { unloadWaiters.append($0) }
             return
         case .failed:
             // Nothing is resident to drop, and the reason is worth keeping on
             // screen until someone retries.
             return
         case .loading:
-            loadTask?.cancel()
+            let pendingLoad = loadTask
+            pendingLoad?.cancel()
+            loadGeneration += 1
             loadTask = nil
+            transition(to: .unloading, trigger: trigger)
+            // A cooperative load may still finish after cancellation. Join it
+            // before unloading, so it cannot resurrect weights after cleanup.
+            await pendingLoad?.value
         case .ready:
             break
         }
@@ -365,12 +416,15 @@ public actor ModelManager {
         // stamp `.unloaded` over a load that has already started.
         guard currentState == .unloading else { return }
         transition(to: .unloaded, trigger: trigger)
+        let waiters = unloadWaiters
+        unloadWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
     }
 
     // MARK: - Idle timer
 
     private func settleAfterWork() async {
-        guard inFlight == 0 else { return }
+        guard inFlight == 0, captureLeases.isEmpty else { return }
         if let pending = unloadWhenIdle {
             unloadWhenIdle = nil
             await unload(trigger: pending)
@@ -380,13 +434,18 @@ public actor ModelManager {
             await unload(trigger: .thermal)
             return
         }
+        if isBackground {
+            await unload(trigger: .backgroundDelay)
+            return
+        }
         startIdleTimer()
     }
 
     private func startIdleTimer() {
         cancelIdleTimer()
         // Zero means "keep loaded while the app is open" (PLAN.md section 2).
-        guard policy.unloadAfterMinutes > 0, currentState == .ready else { return }
+        guard policy.unloadAfterMinutes > 0, currentState == .ready,
+              inFlight == 0, captureLeases.isEmpty else { return }
         let seconds = Double(policy.unloadAfterMinutes) * 60
         idleGeneration += 1
         let generation = idleGeneration
@@ -401,7 +460,8 @@ public actor ModelManager {
     /// hand; the race it guards against cannot be scheduled reliably from
     /// outside the actor.
     func idleElapsed(generation: Int) async {
-        guard generation == idleGeneration, idleTask != nil, inFlight == 0 else { return }
+        guard generation == idleGeneration, idleTask != nil, inFlight == 0,
+              captureLeases.isEmpty else { return }
         await unload(trigger: .idleTimeout)
     }
 
@@ -418,6 +478,7 @@ public actor ModelManager {
     private func cancelBackgroundTimer() {
         backgroundTask?.cancel()
         backgroundTask = nil
+        backgroundGeneration += 1
     }
 
     // MARK: - Logging

@@ -148,6 +148,9 @@ define_class!(
         /// goes away through the same pair.
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
+            self.ivars().settings.on_hidden();
+            self.ivars().history.on_hidden();
+            self.ivars().dictate.on_hidden();
             crate::ui::dismiss_window(&self.ivars().window, "main");
             false
         }
@@ -267,7 +270,9 @@ define_class!(
         fn selection_did_change(&self, _notification: &NSNotification) {
             let row = self.ivars().sidebar.selectedRow();
             if let Ok(index) = usize::try_from(row) {
-                self.show_page(index);
+                if self.show_page(index) {
+                    self.reload();
+                }
             }
         }
     }
@@ -386,13 +391,13 @@ impl MainWindow {
     /// Swapping the subview rather than hiding all three keeps exactly one page
     /// in the view hierarchy, so a table that is not on screen is not being
     /// asked to draw.
-    pub fn show_page(&self, index: usize) {
+    pub fn show_page(&self, index: usize) -> bool {
         let ivars = self.ivars();
         if ivars.current.get() == index {
-            return;
+            return false;
         }
         let Some((_, title, _)) = PAGES.get(index) else {
-            return;
+            return false;
         };
         // Leaving Settings is what closing its window used to be: it commits
         // a key or a URL the user typed and never tabbed out of, and it takes
@@ -401,6 +406,8 @@ impl MainWindow {
         if ivars.current.get() == SETTINGS {
             ivars.settings.on_hidden();
         }
+        ivars.history.on_hidden();
+        ivars.dictate.on_hidden();
         let view = match index {
             0 => ivars.dictate.view(),
             1 => ivars.history.view(),
@@ -432,22 +439,9 @@ impl MainWindow {
             .sidebar
             .selectRowIndexes_byExtendingSelection(&indexes, false);
 
-        // Pages that read the world when they come forward do it here rather
-        // than on a timer.
-        match index {
-            0 => {
-                ivars.dictate.load();
-                // After the view is in the hierarchy: a view with no window
-                // has no first responder to become.
-                ivars.dictate.focus_record();
-            }
-            1 => ivars.history.load(),
-            2 => ivars.plugins.load(),
-            // Every time, not just on first build: another surface can change
-            // a value while this page is hidden -- the pill's own drag writes
-            // the overlay position, and the wizard rewrites the lot.
-            _ => ivars.settings.reload(),
-        }
+        // Layout only. The caller activates once after selecting the page;
+        // doing I/O here made tray navigation reload the selected page twice.
+        true
     }
 
     /// Select a page by the name the tray and `Navigate` use.
@@ -527,13 +521,19 @@ impl MainWindow {
     /// because Settings may have changed a binding while it was hidden.
     pub fn reload(&self) {
         let ivars = self.ivars();
-        ivars.dictate.load();
         match ivars.current.get() {
-            1 => ivars.history.load(),
+            0 => ivars.dictate.on_shown(),
+            1 => ivars.history.on_shown(),
             2 => ivars.plugins.load(),
-            SETTINGS => ivars.settings.reload(),
+            SETTINGS => ivars.settings.on_shown(),
             _ => {}
         }
+    }
+
+    /// Keep hidden pages invalidated without querying or rebuilding them.
+    pub fn history_changed(&self) {
+        self.ivars().history.invalidate();
+        self.ivars().dictate.invalidate();
     }
 
     /// The recording state, for the page that draws it.

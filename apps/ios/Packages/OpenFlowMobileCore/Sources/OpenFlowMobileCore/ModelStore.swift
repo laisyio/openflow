@@ -148,4 +148,20 @@ public struct ModelStore: Sendable {
         }
         try FileManager.default.moveItem(at: temporary, to: destination)
     }
+
+    /// Install a verified set, restoring the old directory if moving the new
+    /// set fails. Admission is serialized by ModelDownloader for this path.
+    public func replaceDirectory(from staging: URL) throws {
+        let files = FileManager.default
+        let backup = directory.appendingPathExtension("backup." + UUID().uuidString)
+        let hadPrevious = files.fileExists(atPath: directory.path)
+        if hadPrevious { try files.moveItem(at: directory, to: backup) }
+        do {
+            try files.moveItem(at: staging, to: directory)
+        } catch {
+            if hadPrevious { try files.moveItem(at: backup, to: directory) }
+            throw error
+        }
+        if hadPrevious { try? files.removeItem(at: backup) }
+    }
 }

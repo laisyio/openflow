@@ -4,6 +4,28 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Performance, cancellation and a multi-speaker evaluation
+By: Codex, with parallel implementation and independent review
+Impact: shared Rust core, native AppKit UI, Tauri playback, iOS lifecycle, CI and `evals/`
+
+- Background/coalesced Settings and history work, ordered capture/insertion,
+  deterministic indexed history with a keyset API, cached overlay layout.
+- Bounded local inference/upload admission with final priority and cancellation,
+  low-copy multipart parsing, incremental pooled capture DSP, cancellable plugin
+  execution with a total budget and Unix descendant cleanup.
+- Hashed runtime generations and exact model snapshots; one bounded Tauri speech
+  session; raw-byte native speech ingress and anonymous seekable storage.
+- Independent iOS recording ceiling, owned sessions/model leases, safe model
+  switching, actual download cancellation/resume and serialized history work.
+  Added real-controller host tests and Release/Simulator CI gates.
+- Checked-in licensed human speech from 12 readers plus generated stress,
+  long-form, multilingual and non-speech cases: 48 clips, four models and 576
+  warm recognition calls in the first full run. Raw results and real Rust
+  dictionary post-pass results are separate; no reference hints reach models.
+- See [implementation and limits](docs/performance-fixes-2026-09-10.md) and
+  [evaluation methodology/results](evals/README.md). Hardware/OS validation is
+  explicit; package tests are not claimed as an iPhone release verification.
+
 ### Benchmark: Cohere Transcribe measured
 By: Titan (with Claude)
 Impact: `docs/native-port/local-runner-benchmark.md`

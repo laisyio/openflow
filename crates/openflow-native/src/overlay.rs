@@ -367,6 +367,7 @@ pub struct PillIvars {
     partial: RefCell<String>,
     /// True once the readings have stopped but the line is still worth showing.
     partial_held: Cell<bool>,
+    partial_layout: RefCell<PartialLayout>,
     /// What the bars are drawing, fed from the microphone on every tick.
     waveform: RefCell<Waveform>,
     engine: RefCell<Option<Arc<Engine>>>,
@@ -428,6 +429,7 @@ impl PillView {
             outcome: Cell::new(None),
             partial: RefCell::new(String::new()),
             partial_held: Cell::new(false),
+            partial_layout: RefCell::new(PartialLayout::default()),
             waveform: RefCell::new(Waveform::default()),
             engine: RefCell::new(None),
         });
@@ -583,6 +585,7 @@ impl PillView {
                     ),
                 ),
                 self.ivars().partial_held.get(),
+                &mut self.ivars().partial_layout.borrow_mut(),
             );
         }
     }
@@ -645,7 +648,41 @@ impl PillView {
 /// mask. There is no mask here: the longest suffix that fits is measured and
 /// drawn, and a short gradient over its left edge says the same thing -- there
 /// is more text than there is pill.
-fn draw_partial(text: &str, rect: NSRect, held: bool) {
+#[derive(Default)]
+struct PartialLayout {
+    text: String,
+    width: u64,
+    start: usize,
+}
+
+impl PartialLayout {
+    fn suffix<'a>(
+        &mut self,
+        text: &'a str,
+        width: f64,
+        mut measure: impl FnMut(&str) -> f64,
+    ) -> (&'a str, bool) {
+        if self.text != text || self.width != width.to_bits() {
+            let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+            let (mut low, mut high) = (0usize, starts.len());
+            while low < high {
+                let middle = (low + high) / 2;
+                if measure(&text[starts[middle]..]) <= width {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            self.start = starts.get(low).copied().unwrap_or(text.len());
+            self.text.clear();
+            self.text.push_str(text);
+            self.width = width.to_bits();
+        }
+        (&text[self.start..], self.start > 0)
+    }
+}
+
+fn draw_partial(text: &str, rect: NSRect, held: bool, layout: &mut PartialLayout) {
     if text.is_empty() || rect.size.width <= 1.0 {
         return;
     }
@@ -668,17 +705,7 @@ fn draw_partial(text: &str, rect: NSRect, held: bool) {
     // Longest suffix that fits, by binary search over character boundaries. The
     // starts are searched rather than the ends: it is the tail that must
     // survive.
-    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
-    let (mut low, mut high) = (0usize, starts.len());
-    while low < high {
-        let middle = (low + high) / 2;
-        if width_of(&text[starts[middle]..]) <= rect.size.width {
-            high = middle;
-        } else {
-            low = middle + 1;
-        }
-    }
-    let shown = &text[starts.get(low).copied().unwrap_or(text.len())..];
+    let (shown, clipped) = layout.suffix(text, rect.size.width, width_of);
     if shown.is_empty() {
         return;
     }
@@ -694,7 +721,7 @@ fn draw_partial(text: &str, rect: NSRect, held: bool) {
     // Something was dropped, so fade the edge it was dropped from. Painted as
     // columns of the body colour rather than an `NSGradient`, which would need
     // its own object per draw for a band this narrow.
-    if low > 0 {
+    if clipped {
         let band = FADE_WIDTH.min(rect.size.width);
         let columns = band.ceil() as usize;
         for column in 0..columns {
@@ -1185,6 +1212,32 @@ impl Overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_preview_frames_do_not_reshape_the_text() {
+        let mut cache = PartialLayout::default();
+        let mut calls = 0;
+        let measure = |s: &str| {
+            calls += 1;
+            s.chars().count() as f64
+        };
+        assert_eq!(cache.suffix("aébcdef", 4.0, measure), ("cdef", true));
+        assert!(calls > 0);
+        for _ in 0..600 {
+            assert_eq!(
+                cache.suffix("aébcdef", 4.0, |_| panic!("cached frame reshaped")),
+                ("cdef", true)
+            );
+        }
+        assert_eq!(
+            cache.suffix("aébcdef", 6.0, |s| s.chars().count() as f64),
+            ("ébcdef", true)
+        );
+        assert_eq!(
+            cache.suffix("new", 6.0, |s| s.chars().count() as f64),
+            ("new", false)
+        );
+    }
 
     const SCREEN: Rect = Rect {
         x: 0.0,

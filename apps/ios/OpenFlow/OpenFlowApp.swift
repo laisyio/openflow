@@ -17,7 +17,9 @@ struct OpenFlowApp: App {
                 .task {
                     await controller.refresh()
                 }
-                .sheet(isPresented: $controller.isCaptureSheetPresented) {
+                .sheet(isPresented: $controller.isCaptureSheetPresented, onDismiss: {
+                    Task { await controller.cancelRecording() }
+                }) {
                     CaptureSheet()
                         .environment(controller)
                         .presentationDetents([.medium])

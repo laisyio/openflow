@@ -336,7 +336,7 @@ import Testing
 }
 
 @Suite struct ClipboardWriterTests {
-    @Test func testNoopWriterSatisfiesTheProtocol() {
+    @MainActor @Test func testNoopWriterSatisfiesTheProtocol() {
         let writer: any ClipboardWriter = NoopClipboardWriter()
         writer.write("nothing happens", localOnly: true, expiresAfter: 60)
     }

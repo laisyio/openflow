@@ -15,6 +15,7 @@ pub mod main_window;
 pub mod onboarding;
 pub mod plugins;
 pub mod recorder;
+pub mod refresh;
 pub mod settings;
 
 use objc2::rc::Retained;

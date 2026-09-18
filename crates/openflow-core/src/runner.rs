@@ -19,9 +19,8 @@
 //!   requirements are exactly pinned; see [`pip_requirements`].
 //! - **Download** (`huggingface_hub.snapshot_download` inside the venv, default
 //!   cache), on demand, with progress. Weights already in the standard cache are
-//!   found rather than fetched again. The revision each model was measured at is
-//!   recorded in [`LocalModel::revision`] and reported after a download, but it
-//!   is not yet what the sidecar loads; see the note on that field.
+//!   found rather than fetched again. Presence checks, downloads, and the
+//!   sidecar all use the exact commit recorded in [`LocalModel::revision`].
 //! - **Spawn** on a free loopback port, readiness by polling `/health`, restart
 //!   on crash with backoff, `failed` after three restarts inside a minute, and a
 //!   kill on drop and on quit.
@@ -43,6 +42,7 @@
 
 use crate::engine::{EngineEvent, EngineEvents};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -170,18 +170,9 @@ pub struct LocalModel {
     /// The commit on that repo this build was measured against, as the full
     /// 40-character hash the Hub reports for `main`.
     ///
-    /// Recorded, and checked after a download, but deliberately *not* passed to
-    /// `snapshot_download` as `revision=`. Two things in this app resolve these
-    /// weights by the default revision `main`: `is_model_present`, and the
-    /// sidecar itself, which calls `mlx_audio`'s `load_model(repo)` with
-    /// `HF_HUB_OFFLINE=1` and no revision. `huggingface_hub` only writes the
-    /// `refs/main` file that those two read when the revision it was handed was
-    /// a branch or a tag -- downloading by bare commit hash writes
-    /// `snapshots/<hash>` and no ref at all. So fetching at a pinned hash here
-    /// would leave every fresh install with weights on disk that the presence
-    /// check reports as missing and the sidecar cannot open. Enforcing the pin
-    /// needs the sidecar to take the revision too, which is a change to
-    /// `runner/runner.py`, not to this file.
+    /// Enforced by presence checks, downloads and the sidecar's offline
+    /// snapshot resolution. The loader receives the resolved snapshot path,
+    /// so a mutable `refs/main` file cannot silently change the model.
     pub revision: &'static str,
 }
 
@@ -417,11 +408,24 @@ impl LocalRunner {
 
     // ── Paths ─────────────────────────────────────────────
 
-    /// `<app dir>/runner/venv`, beside the database. Not in the bundle: a
-    /// virtualenv hard-codes its own absolute path, so one inside `OpenFlow.app`
-    /// would break the first time the app moved, and it would be discarded on
-    /// every update.
+    /// The verified runtime selected by `<app dir>/runner/active-runtime`, or
+    /// the legacy `runner/venv` before the first staged upgrade. Each runtime
+    /// stays at its original path: virtualenv entry points embed absolute paths.
     pub fn venv_dir(&self) -> PathBuf {
+        let root = self.app_dir.join("runner");
+        if let Ok(active) = std::fs::read_to_string(root.join("active-runtime")) {
+            let name = active.trim();
+            if !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                let runtime = root.join("runtimes").join(name);
+                if runtime.is_dir() {
+                    return runtime;
+                }
+            }
+        }
         self.app_dir.join("runner").join("venv")
     }
 
@@ -429,14 +433,10 @@ impl LocalRunner {
         self.venv_dir().join("bin").join("python3")
     }
 
-    /// Where [`LOCAL_RUNNER_LOCK`] is written before `pip` is handed it.
-    ///
-    /// Beside the venv rather than inside it, so that removing the venv to
-    /// repair a half-built install does not take the record of what that
-    /// install was supposed to contain with it. It is also the answer to "what
-    /// is actually in there", in a file the user can read.
+    /// The full verified lock for the active runtime. Failed upgrades leave
+    /// this generation and its installation record untouched.
     pub fn requirements_path(&self) -> PathBuf {
-        self.app_dir.join("runner").join("requirements.txt")
+        self.venv_dir().join("installed-requirements.txt")
     }
 
     /// Where `runner.py` is, at run time.
@@ -680,10 +680,22 @@ impl LocalRunner {
     }
 
     pub fn is_installed(&self) -> bool {
+        let Ok(_runtime_use) = RuntimeLease::acquire(&self.app_dir) else {
+            return false;
+        };
         let python = self.venv_python();
+        let lock = self.venv_dir().join("installed-requirements.txt");
+        self.runtime_matches(&python, &lock, &_runtime_use)
+    }
+
+    fn runtime_matches(&self, python: &Path, lock: &Path, runtime_use: &RuntimeLease) -> bool {
+        let mut command = Command::new(python);
+        runtime_use.protect_command(&mut command);
         python.is_file()
-            && Command::new(&python)
-                .args(["-c", "import mlx_audio, huggingface_hub"])
+            && std::fs::read_to_string(lock).is_ok_and(|content| content == LOCAL_RUNNER_LOCK)
+            && command
+                .args(["-c", VERIFY_RUNTIME_SCRIPT])
+                .arg(lock)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -706,6 +718,7 @@ impl LocalRunner {
     /// Reached only through [`Self::install`], which is what lands the phase
     /// when one of these steps gives up.
     fn install_steps(&self) -> Result<(), String> {
+        let _runtime_use = RuntimeLease::acquire(&self.app_dir)?;
         // Captured once, before the first child, and checked by every one of
         // them: a stop that lands between the venv and the pip install has to
         // stop the install, not just the child that happened to be running.
@@ -728,40 +741,79 @@ impl LocalRunner {
             RunnerPhase::Installing,
             "Creating the Python environment...",
         );
-        let venv = self.venv_dir();
-        if let Some(parent) = venv.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("Could not create {}: {}", parent.display(), error))?;
+        // A venv is never renamed: its scripts embed its absolute path. Build
+        // in its permanent generation directory and atomically switch a tiny
+        // pointer only after pip and every installed version have been checked.
+        // A failed/cancelled upgrade leaves the active runtime untouched.
+        let name = format!("{}-{}", runtime_lock_digest(), uuid::Uuid::new_v4());
+        let runtimes = _runtime_use.root.join("runtimes");
+        match std::fs::create_dir(&runtimes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("Could not create {}: {error}", runtimes.display())),
         }
-        if !self.venv_python().is_file() {
+        if !real_directory(&runtimes) {
+            return Err("The runtime generations directory cannot be a symlink".to_string());
+        }
+        let venv = runtimes.join(&name);
+        let upgrade = (|| {
             self.run_with_progress(
                 Command::new(&python).arg("-m").arg("venv").arg(&venv),
                 RunnerPhase::Installing,
                 generation,
             )?;
+            self.set_phase(
+                RunnerPhase::Installing,
+                "Installing mlx-audio, about 600 MB...",
+            );
+            // Written every time rather than only when absent: an install over a
+            // venv built by an older version of this app has to be an install of
+            // what *this* version pins, and the file on disk is the only thing pip
+            // reads. `?` rather than a `set_phase` here for the reason install()
+            // exists -- `settle` lands the phase for every way this can give up.
+            let requirements = venv.join("installed-requirements.txt");
+            std::fs::write(&requirements, LOCAL_RUNNER_LOCK).map_err(|error| {
+                format!("Could not write {}: {}", requirements.display(), error)
+            })?;
+            self.run_with_progress(
+                &mut pip_install_command(&venv.join("bin/python3"), &requirements),
+                RunnerPhase::Installing,
+                generation,
+            )?;
+            if !self.runtime_matches(&venv.join("bin/python3"), &requirements, &_runtime_use) {
+                let message = "The new Python environment did not match the required packages. The previous installation has been preserved.".to_string();
+                self.set_phase(RunnerPhase::Failed, &message);
+                return Err(message);
+            }
+            // Only successfully verified generations receive the ownership
+            // marker that permits future retention cleanup.
+            std::fs::write(venv.join(RUNTIME_OWNER_FILE), runtime_owner(&name))
+                .map_err(|error| error.to_string())?;
+            // Stop and activation serialize with setup cancellation. A Stop that
+            // won this lock must prevent promoting a runtime the user cancelled.
+            let inner = self.lock();
+            if inner.setup_generation != generation {
+                return Err(SETUP_STOPPED.to_string());
+            }
+            activate_runtime(&_runtime_use.root, &name).map_err(|error| error.to_string())?;
+            drop(inner);
+            Ok(())
+        })();
+        if let Err(error) = upgrade {
+            // This is the new unique generation this operation created, never
+            // the active or legacy runtime. A failed wait cannot prove that
+            // the setup process stopped using this directory; preserve it.
+            if !error.starts_with("Python did not finish:")
+                && real_directory(&_runtime_use.root)
+                && real_directory(&runtimes)
+                && real_directory(&venv)
+            {
+                let _ = std::fs::remove_dir_all(&venv);
+            }
+            return Err(error);
         }
-        self.set_phase(
-            RunnerPhase::Installing,
-            "Installing mlx-audio, about 600 MB...",
-        );
-        // Written every time rather than only when absent: an install over a
-        // venv built by an older version of this app has to be an install of
-        // what *this* version pins, and the file on disk is the only thing pip
-        // reads. `?` rather than a `set_phase` here for the reason install()
-        // exists -- `settle` lands the phase for every way this can give up.
-        let requirements = self.requirements_path();
-        std::fs::write(&requirements, LOCAL_RUNNER_LOCK)
-            .map_err(|error| format!("Could not write {}: {}", requirements.display(), error))?;
-        self.run_with_progress(
-            &mut pip_install_command(&self.venv_python(), &requirements),
-            RunnerPhase::Installing,
-            generation,
-        )?;
-        if !self.installed_now() {
-            let message = "The Python environment installed but mlx-audio will not import. Remove the runner folder in the app's data directory and try again.".to_string();
-            self.set_phase(RunnerPhase::Failed, &message);
-            return Err(message);
-        }
+        self.stop();
+        self.lock().installed_verified = true;
         self.set_phase(
             RunnerPhase::Stopped,
             "On-device transcription is installed.",
@@ -775,10 +827,15 @@ impl LocalRunner {
     /// standard cache and `local_files_only`, so a model fetched by anything
     /// else on this Mac counts and is never downloaded twice.
     pub fn is_model_present(&self) -> bool {
+        let Ok(_runtime_use) = RuntimeLease::acquire(&self.app_dir) else {
+            return false;
+        };
         let repo = self.model_repo();
+        let mut command = Command::new(self.venv_python());
+        _runtime_use.protect_command(&mut command);
         self.venv_python().is_file()
-            && Command::new(self.venv_python())
-                .args(["-c", CACHED_SNAPSHOT_SCRIPT, &repo])
+            && command
+                .args(["-c", CACHED_SNAPSHOT_SCRIPT, &repo, self.model_revision()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -794,12 +851,15 @@ impl LocalRunner {
     /// machine this cannot interrogate is left alone rather than told its
     /// weights are wrong.
     fn cached_revision(&self, repo: &str) -> Option<String> {
+        let _runtime_use = RuntimeLease::acquire(&self.app_dir).ok()?;
         let python = self.venv_python();
         if !python.is_file() {
             return None;
         }
-        let output = Command::new(python)
-            .args(["-c", CACHED_SNAPSHOT_SCRIPT, repo])
+        let mut command = Command::new(python);
+        _runtime_use.protect_command(&mut command);
+        let output = command
+            .args(["-c", CACHED_SNAPSHOT_SCRIPT, repo, self.model_revision()])
             .stderr(Stdio::null())
             .output()
             .ok()?;
@@ -841,6 +901,7 @@ impl LocalRunner {
     /// Reached only through [`Self::download`], which is what lands the phase
     /// when one of these steps gives up.
     fn download_steps(&self) -> Result<(), String> {
+        let _runtime_use = RuntimeLease::acquire(&self.app_dir)?;
         let generation = self.setup_generation();
         if !self.installed_now() {
             return Err(
@@ -857,8 +918,9 @@ impl LocalRunner {
         self.run_with_progress(
             Command::new(self.venv_python()).args([
                 "-c",
-                "import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1]))",
+                "import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1], revision=sys.argv[2]))",
                 &repo,
+                self.model_revision(),
             ]),
             RunnerPhase::Downloading,
             generation,
@@ -885,6 +947,8 @@ impl LocalRunner {
         phase: RunnerPhase,
         generation: u64,
     ) -> Result<(), String> {
+        let runtime_use = RuntimeLease::acquire(&self.app_dir)?;
+        runtime_use.protect_command(command);
         // The spawn and the pid are recorded under one lock, and the generation
         // is re-checked inside it, for the same reason `launch` does it: `stop`
         // takes the same lock, so it either runs entirely before this (and the
@@ -944,6 +1008,11 @@ impl LocalRunner {
             }
         }
         let wait = child.wait();
+        if wait.is_err() {
+            // No successful wait means no proof of exit. Keep retention locked
+            // until this application exits rather than risk deleting live code.
+            std::mem::forget(runtime_use);
+        }
         let stopped = {
             let mut inner = self.lock();
             // Only if it is still ours: a stop took it before signalling it.
@@ -1108,6 +1177,10 @@ impl LocalRunner {
     /// One spawn. Shared by the first start and every restart, so a restarted
     /// sidecar is configured exactly like the original.
     fn launch(self: &Arc<Self>, generation: u64) -> Result<(), String> {
+        // Acquired before resolving the active interpreter, and transferred to
+        // the monitor. Sending a signal or clearing `inner.pid` never releases
+        // this lease: only a successful Child::wait does.
+        let runtime_use = RuntimeLease::acquire(&self.app_dir)?;
         // Whatever this launch is replacing dies first. On the ordinary restart
         // path there is nothing here, because `child_exited` already cleared
         // the pid of the process that exited; this catches the case where a
@@ -1144,7 +1217,14 @@ impl LocalRunner {
                 program.script.clone(),
                 program.extra_args.clone(),
             ),
-            None => (self.venv_python(), Self::script_path()?, Vec::new()),
+            None => (
+                self.venv_python(),
+                Self::script_path()?,
+                vec![
+                    "--revision".to_string(),
+                    model_for(&model_key).revision.to_string(),
+                ],
+            ),
         };
 
         self.update(|status| {
@@ -1168,7 +1248,9 @@ impl LocalRunner {
             // Stopped, or overtaken by a launch that started after this one.
             return Err("The local runner was stopped while starting".to_string());
         }
-        let mut child = Command::new(&python)
+        let mut command = Command::new(&python);
+        runtime_use.protect_command(&mut command);
+        let mut child = command
             .arg(&script)
             // The *child* picks the port. A parent that picks one has to close
             // its listener before the child binds, and two sidecars starting at
@@ -1227,6 +1309,14 @@ impl LocalRunner {
                 .ok();
         }
         let runner: Weak<Self> = Arc::downgrade(self);
+        let mut child = LeasedRuntimeChild {
+            child,
+            lease: Some(runtime_use),
+        };
+        // If creating the monitor fails, dropping its closure reaps the child.
+        // Keep Stop excluded until the corresponding PID slot is also cleared,
+        // so it cannot observe that just-reaped (and potentially reused) PID.
+        let mut monitor_owner = self.lock();
         std::thread::Builder::new()
             .name("openflow-runner-monitor".into())
             .spawn(move || {
@@ -1242,7 +1332,16 @@ impl LocalRunner {
                     outcome.ok().and_then(|status| status.code()),
                 );
             })
-            .map_err(|error| format!("Could not supervise the local runner: {}", error))?;
+            .map_err(|error| {
+                // The failed closure's LeasedRuntimeChild has killed/reaped it.
+                // Do not leave a stale PID for a later Stop to signal.
+                if monitor_owner.pid == Some(pid) && monitor_owner.launch_id == launch_id {
+                    monitor_owner.pid = None;
+                    monitor_owner.starting = false;
+                }
+                format!("Could not supervise the local runner: {error}")
+            })?;
+        drop(monitor_owner);
         Ok(())
     }
 
@@ -1442,13 +1541,12 @@ impl LocalRunner {
             .name("openflow-runner-prewarm".into())
             .spawn(move || {
                 if let Ok(port) = runner.ensure_ready(READY_TIMEOUT) {
+                    let generation = {
+                        let inner = runner.lock();
+                        (inner.generation, inner.launch_id)
+                    };
                     if let Ok(health) = post(port, "/prewarm", Duration::from_secs(5)) {
-                        runner.update(|status| {
-                            status.resident_bytes = health.memory();
-                            if health.state == "loading" {
-                                status.detail = "Loading the model...".to_string();
-                            }
-                        });
+                        runner.apply_health(generation, port, health);
                     }
                 }
                 runner.lock().working = false;
@@ -1458,17 +1556,36 @@ impl LocalRunner {
 
     /// Refresh the reported memory from `/health`, without starting anything.
     pub fn refresh_health(&self) {
+        let generation = {
+            let inner = self.lock();
+            (inner.generation, inner.launch_id)
+        };
         let Some(port) = self.ready_port() else {
             return;
         };
         if let Ok(health) = health(port, Duration::from_secs(2)) {
-            self.update(|status| {
-                status.resident_bytes = health.memory();
-                if health.state == "unloaded" {
-                    status.detail = "Idle. The model is unloaded.".to_string();
-                }
-            });
+            self.apply_health(generation, port, health);
         }
+    }
+
+    fn apply_health(&self, generation: (u64, u64), port: u16, health: Health) {
+        let changed = {
+            let mut inner = self.lock();
+            if (inner.generation, inner.launch_id) != generation
+                || inner.status.port != Some(port)
+                || inner.status.phase != RunnerPhase::Ready
+            {
+                return;
+            }
+            inner.status.resident_bytes = health.memory();
+            if health.state == "unloaded" {
+                inner.status.detail = "Idle. The model is unloaded.".to_string();
+            } else if health.state == "loading" {
+                inner.status.detail = "Loading the model...".to_string();
+            }
+            inner.status.clone()
+        };
+        let _ = self.events.emit(EngineEvent::RunnerState(changed));
     }
 
     /// Stop the sidecar, and any install or download in flight, and do not
@@ -1536,6 +1653,303 @@ impl Drop for LocalRunner {
 }
 
 // ── Process control ───────────────────────────────────────
+
+const RUNTIME_OWNER_FILE: &str = "openflow-runtime-owner";
+
+/// Shared across app instances and held through every runtime-using subprocess
+/// wait. Cleanup takes the exclusive lock non-blockingly, so a signalled but
+/// not yet reaped sidecar, a probe, or a concurrent setup always defers cleanup.
+struct RuntimeLease {
+    file: Option<std::fs::File>,
+    root: PathBuf,
+}
+
+impl RuntimeLease {
+    fn acquire(app_dir: &Path) -> Result<Self, String> {
+        let root = runtime_root(app_dir).map_err(|error| error.to_string())?;
+        let file = runtime_lock(&root, "runtime-use.lock", false, false)
+            .map_err(|error| format!("Could not protect the Python runtime: {error}"))?;
+        Ok(Self {
+            file: Some(file),
+            root,
+        })
+    }
+
+    fn protect_command(&self, command: &mut Command) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let fd = self.file.as_ref().expect("live runtime lease").as_raw_fd();
+            // The child also keeps the shared lease if this app crashes before
+            // its monitor can wait. Change CLOEXEC only in the forked child;
+            // no allocation or non-async-signal-safe calls occur before exec.
+            unsafe {
+                command.pre_exec(move || {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = command;
+    }
+}
+
+impl Drop for RuntimeLease {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        // The last operation/monitor to release its shared lease retries any
+        // cleanup an upgrade deferred. Errors preserve data and can retry later.
+        let _ = prune_runtime_generations(&self.root);
+    }
+}
+
+/// Also protects the rare failure to start the monitor thread: dropping its
+/// unstarted closure must kill/wait, not leave an untracked child without a lease.
+struct LeasedRuntimeChild {
+    child: std::process::Child,
+    lease: Option<RuntimeLease>,
+}
+
+impl LeasedRuntimeChild {
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let result = self.child.wait();
+        if result.is_ok() {
+            drop(self.lease.take());
+        } else if let Some(lease) = self.lease.take() {
+            std::mem::forget(lease);
+        }
+        result
+    }
+}
+
+impl Drop for LeasedRuntimeChild {
+    fn drop(&mut self) {
+        if self.lease.is_some() {
+            let _ = self.child.kill();
+            let _ = self.wait();
+        }
+    }
+}
+
+fn real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn runtime_root(app_dir: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(app_dir)?;
+    if !real_directory(app_dir) {
+        return Err(std::io::Error::other(
+            "The app data directory is not a real directory",
+        ));
+    }
+    let root = app_dir.canonicalize()?.join("runner");
+    match std::fs::create_dir(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    if !real_directory(&root) {
+        return Err(std::io::Error::other(
+            "The runner directory cannot be a symlink",
+        ));
+    }
+    Ok(root)
+}
+
+fn runtime_lock(
+    root: &Path,
+    name: &str,
+    exclusive: bool,
+    nonblocking: bool,
+) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(root.join(name))?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "The runtime lock is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let operation = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        } | if nonblocking { libc::LOCK_NB } else { 0 };
+        loop {
+            // SAFETY: a live owned file descriptor and valid flock flags.
+            if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (exclusive, nonblocking);
+    Ok(file)
+}
+
+fn runtime_generation_name(name: &str) -> bool {
+    name.len() == 101
+        && name.as_bytes()[..64]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        && name.as_bytes()[64] == b'-'
+        && uuid::Uuid::parse_str(&name[65..])
+            .is_ok_and(|id| id.hyphenated().to_string() == name[65..])
+}
+
+fn runtime_owner(name: &str) -> String {
+    format!("OpenFlow verified runtime v1\n{name}\n")
+}
+
+fn small_regular_file(path: &Path, limit: u64) -> std::io::Result<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(std::io::Error::other(
+            "Runtime metadata is not a regular file",
+        ));
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err(std::io::Error::other(
+            "Runtime metadata is not a bounded regular file",
+        ));
+    }
+    let mut contents = String::new();
+    file.take(limit + 1).read_to_string(&mut contents)?;
+    if contents.len() as u64 > limit {
+        return Err(std::io::Error::other(
+            "Runtime metadata grew beyond its limit",
+        ));
+    }
+    Ok(contents)
+}
+
+fn owned_runtime(root: &Path, name: &str) -> bool {
+    if !runtime_generation_name(name) || !real_directory(&root.join("runtimes")) {
+        return false;
+    }
+    let directory = root.join("runtimes").join(name);
+    if !real_directory(&directory) {
+        return false;
+    }
+    let owner = small_regular_file(&directory.join(RUNTIME_OWNER_FILE), 256);
+    if owner.ok().as_deref() != Some(runtime_owner(name).as_str()) {
+        return false;
+    }
+    small_regular_file(
+        &directory.join("installed-requirements.txt"),
+        4 * 1024 * 1024,
+    )
+    .is_ok_and(|lock| format!("{:x}", Sha256::digest(lock.as_bytes())) == name[..64])
+}
+
+fn write_runtime_pointer(root: &Path, pointer: &str, name: &str) -> std::io::Result<()> {
+    let temporary = root.join(format!("{pointer}.{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temporary, name)?;
+    if let Err(error) = std::fs::rename(&temporary, root.join(pointer)) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Caller holds a shared runtime-use lease. A second lock serializes concurrent
+/// installations' pointer pairs; pruning's exclusive use lock excludes both.
+fn activate_runtime(root: &Path, name: &str) -> std::io::Result<()> {
+    let _activation = runtime_lock(root, "runtime-activation.lock", true, false)?;
+    if !owned_runtime(root, name) {
+        return Err(std::io::Error::other(
+            "The new runtime failed ownership verification",
+        ));
+    }
+    if let Ok(previous) = small_regular_file(&root.join("active-runtime"), 128) {
+        let previous = previous.trim();
+        if previous != name && owned_runtime(root, previous) {
+            write_runtime_pointer(root, "previous-runtime", previous)?;
+        }
+    }
+    write_runtime_pointer(root, "active-runtime", name)
+}
+
+fn prune_runtime_generations(root: &Path) -> std::io::Result<usize> {
+    // Without an inter-process lock implementation, fail closed. Runtime
+    // installation remains supported; Windows retention needs its own lock.
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        Ok(0)
+    }
+    #[cfg(unix)]
+    {
+        if !real_directory(root) || !real_directory(&root.join("runtimes")) {
+            return Ok(0);
+        }
+        let _exclusive = match runtime_lock(root, "runtime-use.lock", true, true) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let active = small_regular_file(&root.join("active-runtime"), 128)?;
+        let active = active.trim();
+        if !owned_runtime(root, active) {
+            return Ok(0);
+        }
+        let previous_path = root.join("previous-runtime");
+        let previous = match small_regular_file(&previous_path, 128) {
+            Ok(previous) if owned_runtime(root, previous.trim()) => {
+                Some(previous.trim().to_string())
+            }
+            Ok(_) => return Ok(0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        // Activation writes previous before active. A crash or failed second
+        // rename leaves these equal; never delete the older rollback while
+        // that pointer pair describes an incomplete activation.
+        if previous.as_deref() == Some(active) {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        for entry in std::fs::read_dir(root.join("runtimes"))? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if name == active || previous.as_deref() == Some(&name) || !owned_runtime(root, &name) {
+                continue;
+            }
+            // Explicit validated immediate child only. remove_dir_all does not
+            // traverse symlinks inside a venv (its Python links are expected).
+            std::fs::remove_dir_all(root.join("runtimes").join(&name))?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+}
 
 /// SIGTERM, then SIGKILL if it is still there. The sidecar's HTTP server
 /// shuts down on SIGTERM; the second signal is for one wedged in a decode.
@@ -1652,7 +2066,26 @@ fn pip_install_command(python: &Path, requirements: &Path) -> Command {
 /// check, and prints the snapshot directory when they are, which is what makes
 /// it a revision read. One script for both so the two answers can never come
 /// from two different questions.
-const CACHED_SNAPSHOT_SCRIPT: &str = "import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1], local_files_only=True))";
+const CACHED_SNAPSHOT_SCRIPT: &str = "import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1], revision=sys.argv[2], local_files_only=True))";
+
+fn runtime_lock_digest() -> String {
+    format!("{:x}", Sha256::digest(LOCAL_RUNNER_LOCK.as_bytes()))
+}
+
+const VERIFY_RUNTIME_SCRIPT: &str = r#"
+import sys
+from importlib.metadata import version
+from packaging.requirements import Requirement
+import mlx_audio, huggingface_hub
+with open(sys.argv[1]) as source:
+    for line in source:
+        if not line.strip() or line.startswith((' ', '#')):
+            continue
+        requirement = Requirement(line.strip().rstrip('\\').strip())
+        if requirement.marker is None or requirement.marker.evaluate():
+            if not requirement.specifier.contains(version(requirement.name), prereleases=True):
+                raise RuntimeError('installed package differs from lock: ' + requirement.name)
+"#;
 
 /// The commit hash a `snapshot_download` path names.
 ///
@@ -2273,6 +2706,14 @@ server.serve_forever()
         .expect("write the stand-in");
         std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
             .expect("make it executable");
+        std::fs::write(
+            venv_bin
+                .parent()
+                .unwrap()
+                .join("installed-requirements.txt"),
+            LOCAL_RUNNER_LOCK,
+        )
+        .unwrap();
         let count = || {
             std::fs::read_to_string(&calls)
                 .map(|text| text.lines().count())
@@ -3099,5 +3540,240 @@ server.serve_forever()
             status.phase,
             status.detail
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_importable_stale_runtime_does_not_satisfy_the_current_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("openflow-lock-test-{}", uuid::Uuid::new_v4()));
+        let runner = LocalRunner::new(directory.clone(), Arc::new(Recorder::default()), "fast");
+        std::fs::create_dir_all(runner.venv_dir().join("bin")).unwrap();
+        std::fs::write(runner.venv_python(), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(runner.venv_python(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert!(
+            !runner.is_installed(),
+            "importability alone must not accept a legacy environment"
+        );
+        let installed = runner.venv_dir().join("installed-requirements.txt");
+        std::fs::write(&installed, "old lock").unwrap();
+        assert!(!runner.is_installed());
+        std::fs::write(&installed, LOCAL_RUNNER_LOCK).unwrap();
+        assert!(runner.is_installed());
+        assert_eq!(runtime_lock_digest().len(), 64);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staging_a_runtime_does_not_replace_the_active_generation() {
+        let directory =
+            std::env::temp_dir().join(format!("openflow-activation-test-{}", uuid::Uuid::new_v4()));
+        let runner = LocalRunner::new(directory.clone(), Arc::new(Recorder::default()), "fast");
+        let generations = directory.join("runner/runtimes");
+        std::fs::create_dir_all(generations.join("working-generation")).unwrap();
+        std::fs::write(
+            directory.join("runner/active-runtime"),
+            "working-generation",
+        )
+        .unwrap();
+        std::fs::create_dir_all(generations.join("unfinished-generation")).unwrap();
+        assert_eq!(runner.venv_dir(), generations.join("working-generation"));
+        std::fs::remove_dir_all(generations.join("unfinished-generation")).unwrap();
+        assert_eq!(runner.venv_dir(), generations.join("working-generation"));
+        // A pointer cannot turn an installation into an arbitrary path read.
+        std::fs::write(directory.join("runner/active-runtime"), "../../escape").unwrap();
+        assert_eq!(runner.venv_dir(), directory.join("runner/venv"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stale_health_cannot_overwrite_a_new_launch_or_a_stopped_runner() {
+        let directory =
+            std::env::temp_dir().join(format!("openflow-health-{}", uuid::Uuid::new_v4()));
+        let events = Arc::new(Recorder::default());
+        let runner = LocalRunner::new(directory, events.clone(), "fast");
+        {
+            let mut inner = runner.lock();
+            inner.generation = 2;
+            inner.launch_id = 3;
+            inner.status.phase = RunnerPhase::Ready;
+            inner.status.port = Some(4321);
+            inner.status.resident_bytes = Some(123);
+        }
+        let reply = || Health {
+            state: "unloaded".into(),
+            resident_bytes: Some(999),
+            active_memory_bytes: None,
+            error: None,
+        };
+        runner.apply_health((1, 3), 4321, reply());
+        runner.apply_health((2, 2), 4321, reply());
+        runner.apply_health((2, 3), 4320, reply());
+        assert_eq!(runner.status().resident_bytes, Some(123));
+        assert!(events.states.lock().unwrap().is_empty());
+        runner.apply_health((2, 3), 4321, reply());
+        assert_eq!(runner.status().resident_bytes, Some(999));
+        runner.stop();
+        runner.apply_health((2, 3), 4321, reply());
+        assert_eq!(runner.status().resident_bytes, None);
+        assert_eq!(runner.status().phase, RunnerPhase::Stopped);
+    }
+
+    #[cfg(unix)]
+    fn runtime_fixture() -> (PathBuf, RuntimeLease, Vec<String>) {
+        let directory =
+            std::env::temp_dir().join(format!("openflow-retention-test-{}", uuid::Uuid::new_v4()));
+        let lease = RuntimeLease::acquire(&directory).unwrap();
+        let names: Vec<_> = (0..4)
+            .map(|_| format!("{}-{}", runtime_lock_digest(), uuid::Uuid::new_v4()))
+            .collect();
+        for name in &names {
+            let path = lease.root.join("runtimes").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("installed-requirements.txt"), LOCAL_RUNNER_LOCK).unwrap();
+            std::fs::write(path.join(RUNTIME_OWNER_FILE), runtime_owner(name)).unwrap();
+            std::fs::write(path.join("synthetic-package"), "fixture").unwrap();
+        }
+        (directory, lease, names)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_retention_keeps_active_and_exactly_one_rollback() {
+        let (directory, lease, names) = runtime_fixture();
+        let root = lease.root.clone();
+        activate_runtime(&root, &names[0]).unwrap();
+        activate_runtime(&root, &names[1]).unwrap();
+        activate_runtime(&root, &names[2]).unwrap();
+        assert_eq!(
+            prune_runtime_generations(&root).unwrap(),
+            0,
+            "a setup lease excludes cleanup"
+        );
+        drop(lease);
+        let kept: Vec<_> = names
+            .iter()
+            .filter(|name| root.join("runtimes").join(name).exists())
+            .cloned()
+            .collect();
+        assert_eq!(kept, names[1..3]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("active-runtime")).unwrap(),
+            names[2]
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("previous-runtime")).unwrap(),
+            names[1]
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_runtime_activation_preserves_the_previous_rollback() {
+        let (directory, lease, names) = runtime_fixture();
+        let root = lease.root.clone();
+        activate_runtime(&root, &names[0]).unwrap();
+        activate_runtime(&root, &names[1]).unwrap();
+        // Exactly the on-disk state if the second pointer rename fails or the
+        // app exits after recording the next rollback but before activation.
+        write_runtime_pointer(&root, "previous-runtime", &names[1]).unwrap();
+        drop(lease);
+        assert!(root.join("runtimes").join(&names[0]).exists());
+        assert_eq!(prune_runtime_generations(&root).unwrap(), 0);
+        let lease = RuntimeLease::acquire(&directory).unwrap();
+        activate_runtime(&root, &names[2]).unwrap();
+        drop(lease);
+        assert!(!root.join("runtimes").join(&names[0]).exists());
+        assert!(root.join("runtimes").join(&names[1]).exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_retention_never_follows_symlinks_or_prunes_unknown_metadata() {
+        use std::os::unix::fs::symlink;
+        let (directory, lease, names) = runtime_fixture();
+        let root = lease.root.clone();
+        activate_runtime(&root, &names[1]).unwrap();
+        activate_runtime(&root, &names[2]).unwrap();
+        let runtimes = root.join("runtimes");
+        std::fs::remove_file(runtimes.join(&names[0]).join(RUNTIME_OWNER_FILE)).unwrap();
+        std::fs::write(
+            runtimes.join(&names[3]).join("installed-requirements.txt"),
+            "tampered",
+        )
+        .unwrap();
+        std::fs::create_dir(runtimes.join("user-notes")).unwrap();
+        let target = directory.join("outside-runtime-target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), "not a runtime").unwrap();
+        let linked = format!("{}-{}", runtime_lock_digest(), uuid::Uuid::new_v4());
+        symlink(&target, runtimes.join(&linked)).unwrap();
+        drop(lease);
+        for name in names
+            .iter()
+            .chain(["user-notes".to_string(), linked].iter())
+        {
+            assert!(
+                std::fs::symlink_metadata(runtimes.join(name)).is_ok(),
+                "must preserve {name}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+            "not a runtime"
+        );
+        // A symlink in either metadata or the parent path fails closed.
+        std::fs::remove_file(root.join("previous-runtime")).unwrap();
+        symlink(target.join("keep.txt"), root.join("previous-runtime")).unwrap();
+        assert!(prune_runtime_generations(&root).is_err());
+        let alias_app = directory.join("alias-app");
+        std::fs::create_dir(&alias_app).unwrap();
+        symlink(&root, alias_app.join("runner")).unwrap();
+        assert!(RuntimeLease::acquire(&alias_app).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_retention_waits_for_reap_and_inherited_cross_process_leases() {
+        let (directory, lease, names) = runtime_fixture();
+        let root = lease.root.clone();
+        activate_runtime(&root, &names[1]).unwrap();
+        activate_runtime(&root, &names[2]).unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("60");
+        lease.protect_command(&mut command);
+        let child = command.spawn().unwrap();
+        let mut child = LeasedRuntimeChild {
+            child,
+            lease: Some(lease),
+        };
+        child.child.kill().unwrap();
+        let before_wait = prune_runtime_generations(&root).unwrap();
+        child.wait().unwrap();
+        assert_eq!(before_wait, 0, "signals do not release the monitor's lease");
+        assert!(!root.join("runtimes").join(&names[0]).exists());
+        assert!(root.join("runtimes").join(&names[1]).exists());
+        // Even losing the entire parent's lease leaves the live child holding
+        // its inherited descriptor, as after an app crash before parent-watch.
+        let lease = RuntimeLease::acquire(&directory).unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("60");
+        lease.protect_command(&mut command);
+        let mut orphan_guard = command.spawn().unwrap();
+        drop(lease);
+        let excluded = runtime_lock(&root, "runtime-use.lock", true, true).is_err();
+        let _ = orphan_guard.kill();
+        orphan_guard.wait().unwrap();
+        assert!(
+            excluded,
+            "a child's inherited lease must protect across parent release"
+        );
+        assert!(runtime_lock(&root, "runtime-use.lock", true, true).is_ok());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -6,7 +6,7 @@
 //! - **mp3 and friends**: a channel-backed reader is handed to the decoder the
 //!   moment the stream starts, so the first audio plays while the rest is still
 //!   downloading. Reads past what has arrived block until the next chunk does.
-//! - **WAV** (Groq's Orpheus answers only in WAV): collected in memory and
+//! - **WAV** (Groq's Orpheus answers only in WAV): spooled to an anonymous file and
 //!   played when the stream finishes. A WAV header describes a length, and a
 //!   half-written one is not a clip.
 //!
@@ -18,58 +18,76 @@
 //! when a chunk cannot be delivered.
 
 use std::cell::RefCell;
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::Receiver;
 
-use base64::Engine as _;
-use openflow_core::speech::{SpeechChunk, SpeechError, SpeechResult, SpeechStarted};
+use openflow_core::speech::{SpeechError, SpeechResult, SpeechStarted};
 
 use crate::events::PreviewGate;
 
 /// A `Read + Seek` view over bytes that are still arriving.
 ///
 /// Symphonia probes the container before it decodes, and probing seeks. So this
-/// keeps everything received rather than discarding consumed bytes: seeking
+/// spools received bytes to an anonymous file rather than retaining the clip
+/// on the heap. No pathname survives creation. Seeking
 /// backwards is free, seeking forwards pulls more, and reading past the end
 /// blocks until the next chunk lands or the stream ends.
 struct StreamBuffer {
     /// Behind a mutex only to satisfy the decoder's `Sync` bound: exactly one
     /// thread ever reads it.
     chunks: Mutex<Receiver<Vec<u8>>>,
-    data: Vec<u8>,
+    data: File,
+    length: u64,
     position: u64,
     finished: bool,
     cancelled: Arc<AtomicBool>,
 }
 
 impl StreamBuffer {
-    fn new(chunks: Receiver<Vec<u8>>, cancelled: Arc<AtomicBool>) -> Self {
-        Self {
+    fn new(chunks: Receiver<Vec<u8>>, cancelled: Arc<AtomicBool>) -> io::Result<Self> {
+        // Unlink before putting audio in it: no named speech file can survive
+        // a crash, and the kernel releases the storage when the reader drops.
+        let path = std::env::temp_dir().join(format!("openflow-speech-{}", uuid::Uuid::new_v4()));
+        let data = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        std::fs::remove_file(&path)?;
+        Ok(Self {
             chunks: Mutex::new(chunks),
-            data: Vec::new(),
+            data,
+            length: 0,
             position: 0,
             finished: false,
             cancelled,
-        }
+        })
     }
 
     /// Pull until `wanted` bytes exist, the stream ends, or playback is
     /// cancelled. Returns whether the target was reached.
-    fn fill_to(&mut self, wanted: usize) -> bool {
-        while self.data.len() < wanted && !self.finished {
+    fn fill_to(&mut self, wanted: u64) -> io::Result<bool> {
+        while self.length < wanted && !self.finished {
             if self.cancelled.load(Ordering::SeqCst) {
                 self.finished = true;
-                return false;
+                return Ok(false);
             }
-            let next = self.chunks.lock().map(|chunks| chunks.recv());
+            let next = self.chunks.lock().map(|mut chunks| chunks.blocking_recv());
             match next {
-                Ok(Ok(chunk)) => self.data.extend_from_slice(&chunk),
+                Ok(Some(chunk)) => {
+                    self.data.seek(SeekFrom::Start(self.length))?;
+                    self.data.write_all(&chunk)?;
+                    self.length += chunk.len() as u64;
+                }
                 _ => self.finished = true,
             }
         }
-        self.data.len() >= wanted
+        Ok(self.length >= wanted)
     }
 }
 
@@ -78,14 +96,14 @@ impl Read for StreamBuffer {
         if out.is_empty() {
             return Ok(0);
         }
-        let start = self.position as usize;
-        self.fill_to(start + 1);
-        if start >= self.data.len() {
+        let start = self.position;
+        self.fill_to(start.saturating_add(1))?;
+        if start >= self.length {
             return Ok(0);
         }
-        let available = self.data.len() - start;
-        let take = available.min(out.len());
-        out[..take].copy_from_slice(&self.data[start..start + take]);
+        let take = (self.length - start).min(out.len() as u64) as usize;
+        self.data.seek(SeekFrom::Start(start))?;
+        self.data.read_exact(&mut out[..take])?;
         self.position += take as u64;
         Ok(take)
     }
@@ -98,8 +116,8 @@ impl Seek for StreamBuffer {
             SeekFrom::Current(delta) => self.position as i64 + delta,
             SeekFrom::End(delta) => {
                 // The only way to know the end is to have all of it.
-                self.fill_to(usize::MAX);
-                self.data.len() as i64 + delta
+                self.fill_to(u64::MAX)?;
+                self.length as i64 + delta
             }
         };
         if target < 0 {
@@ -156,7 +174,7 @@ impl<R: Seek> Seek for StopsWhenCancelled<R> {
 
 /// Exactly what [`spawn_player`] hands the decoder, named so the tests can
 /// decode the same thing the speaker would. Both shapes of preview go through
-/// here: the channel-backed reader and the finished WAV in a `Cursor`.
+/// here: the incrementally filled reader and the finished WAV spool.
 fn player_source<R>(source: R, cancelled: Arc<AtomicBool>) -> impl Read + Seek + Send + Sync
 where
     R: Read + Seek + Send + Sync + 'static,
@@ -167,35 +185,20 @@ where
 /// One preview in flight.
 struct Playback {
     request_id: String,
-    /// `None` once the stream has ended: dropping the sender is the reader's
-    /// end-of-file.
-    ///
-    /// Unbounded on purpose. `chunk` runs on the main thread and the receiver
-    /// is drained by the decoder at playback speed, so a bounded channel would
-    /// block the whole UI -- no redraw, no menu, no hotkey -- for as long as
-    /// the download outran the speaker. `StreamBuffer` keeps every byte it is
-    /// sent anyway, so a queue depth bought no memory either; the ceiling is
-    /// `MAX_SPEECH_BYTES` in core, which is what actually bounds a clip.
-    ///
-    /// Measured, because "the download outran the speaker" sounds like a risk
-    /// rather than the everyday case it is: the longest preview the settings
-    /// screen can ask for (`PREVIEW_LIMIT`, 500 characters) came back from the
-    /// LAN endpoint as 567_980 bytes of mp3, delivered in 9 chunks in 34 ms
-    /// against 35.5 s of playback. So the whole clip is always queued before a
-    /// note is played. Peak live heap for that: 2.05 MiB, about 3.8x the clip,
-    /// the multiple being the channel's copy plus a `Vec` that doubles. At the
-    /// `MAX_SPEECH_BYTES` ceiling the same shape peaks at 146 MiB.
-    chunks: Option<Sender<Vec<u8>>>,
-    /// Set for a WAV preview, which plays only when the download completes.
-    buffered: Option<Vec<u8>>,
     cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct PlaybackErrors {
+    request_id: String,
+    error: Option<String>,
 }
 
 pub struct TtsPlayer {
     preview: Arc<PreviewGate>,
     playback: RefCell<Option<Playback>>,
     /// The last error a player thread hit, for the settings window to show.
-    last_error: Arc<Mutex<Option<String>>>,
+    last_error: Arc<Mutex<PlaybackErrors>>,
 }
 
 impl TtsPlayer {
@@ -203,13 +206,16 @@ impl TtsPlayer {
         Self {
             preview,
             playback: RefCell::new(None),
-            last_error: Arc::new(Mutex::new(None)),
+            last_error: Arc::new(Mutex::new(PlaybackErrors::default())),
         }
     }
 
     /// The last failure a player thread reported, for the settings window.
     pub fn last_error(&self) -> Option<String> {
-        self.last_error.lock().ok().and_then(|slot| slot.clone())
+        self.last_error
+            .lock()
+            .ok()
+            .and_then(|slot| slot.error.clone())
     }
 
     /// Arm the gate for a preview that is about to be requested.
@@ -223,6 +229,12 @@ impl TtsPlayer {
     /// "Could not deliver speech audio".
     pub fn arm(&self, request_id: &str) {
         self.stop_playback();
+        if let Ok(mut errors) = self.last_error.lock() {
+            *errors = PlaybackErrors {
+                request_id: request_id.to_string(),
+                error: None,
+            };
+        }
         self.preview.open(request_id);
     }
 
@@ -236,75 +248,32 @@ impl TtsPlayer {
     /// Preview armed a newer request. Acting on either would restart a preview
     /// the user already dismissed, or hijack the newer one's playback.
     pub fn started(&self, started: &SpeechStarted) {
-        if !self.preview.is_listening(&started.request_id) {
+        if !self.preview.is_current(&started.request_id) {
             return;
         }
-        if let Ok(mut slot) = self.last_error.lock() {
-            *slot = None;
-        }
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let buffered_only = started.format.eq_ignore_ascii_case("wav");
-        let chunks = if buffered_only {
-            None
-        } else {
-            let (sender, receiver) = channel::<Vec<u8>>();
-            let reader = StreamBuffer::new(receiver, Arc::clone(&cancelled));
-            spawn_player(reader, Arc::clone(&cancelled), Arc::clone(&self.last_error));
-            Some(sender)
+        let Some((receiver, cancelled)) = self.preview.take_receiver(&started.request_id) else {
+            return;
         };
+        let buffered_only = started.format.eq_ignore_ascii_case("wav");
+        spawn_player(
+            receiver,
+            buffered_only,
+            Arc::clone(&cancelled),
+            Arc::clone(&self.last_error),
+            started.request_id.clone(),
+        );
 
         *self.playback.borrow_mut() = Some(Playback {
             request_id: started.request_id.clone(),
-            chunks,
-            buffered: buffered_only.then(Vec::new),
             cancelled,
         });
-    }
-
-    pub fn chunk(&self, chunk: &SpeechChunk) {
-        let mut slot = self.playback.borrow_mut();
-        let Some(playback) = slot.as_mut() else {
-            return;
-        };
-        if playback.request_id != chunk.request_id {
-            return;
-        }
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&chunk.data_base64) else {
-            return;
-        };
-        if let Some(buffer) = playback.buffered.as_mut() {
-            buffer.extend_from_slice(&bytes);
-        } else if let Some(sender) = playback.chunks.as_ref() {
-            // The receiver is gone when playback ended early; close the gate so
-            // the engine stops downloading rather than filling a dead channel.
-            if sender.send(bytes).is_err() {
-                self.preview.close();
-            }
-        }
     }
 
     /// The stream ended cleanly. A streaming preview just gets its end-of-file;
     /// a buffered one starts playing now.
     pub fn finished(&self, result: &SpeechResult) {
-        let mut slot = self.playback.borrow_mut();
-        let Some(playback) = slot.as_mut() else {
-            return;
-        };
-        if playback.request_id != result.request_id {
-            return;
-        }
-        playback.chunks = None;
-        if let Some(buffer) = playback.buffered.take() {
-            if !buffer.is_empty() {
-                spawn_player(
-                    Cursor::new(buffer),
-                    Arc::clone(&playback.cancelled),
-                    Arc::clone(&self.last_error),
-                );
-            }
-        }
-        self.preview.close();
+        self.preview.finish(&result.request_id);
     }
 
     /// A stream failed or was cancelled.
@@ -318,7 +287,7 @@ impl TtsPlayer {
             return;
         }
         if let Ok(mut slot) = self.last_error.lock() {
-            *slot = Some(error.error.clone());
+            slot.error = Some(error.error.clone());
         }
         self.stop();
     }
@@ -329,7 +298,7 @@ impl TtsPlayer {
     pub fn is_current(&self, request_id: &str) -> bool {
         match self.playback.borrow().as_ref() {
             Some(playback) => playback.request_id == request_id,
-            None => self.preview.is_listening(request_id),
+            None => self.preview.is_current(request_id),
         }
     }
 
@@ -344,23 +313,51 @@ impl TtsPlayer {
     fn stop_playback(&self) {
         if let Some(playback) = self.playback.borrow_mut().take() {
             playback.cancelled.store(true, Ordering::SeqCst);
-            drop(playback.chunks);
         }
     }
 }
 
 /// Decode and play `source` on its own thread. The audio device is opened
 /// there, not on the main thread, so a slow device never stalls the UI.
-fn spawn_player<R>(source: R, cancelled: Arc<AtomicBool>, errors: Arc<Mutex<Option<String>>>)
-where
-    R: Read + Seek + Send + Sync + 'static,
-{
+fn spawn_player(
+    receiver: Receiver<Vec<u8>>,
+    buffered_only: bool,
+    cancelled: Arc<AtomicBool>,
+    errors: Arc<Mutex<PlaybackErrors>>,
+    request_id: String,
+) {
     std::thread::spawn(move || {
         let report = |message: String| {
-            if let Ok(mut slot) = errors.lock() {
-                *slot = Some(message);
+            if cancelled.load(Ordering::SeqCst) {
+                return;
             }
+            if let Ok(mut slot) = errors.lock() {
+                if slot.request_id != request_id {
+                    return;
+                }
+                slot.error = Some(message.clone());
+            }
+            let request_id = request_id.clone();
+            crate::events::on_main(move || {
+                crate::app::with_app(|app| {
+                    app.with_settings(|page| {
+                        page.set_voice_status_for(&request_id, &message);
+                    })
+                });
+            });
         };
+        let mut source = match StreamBuffer::new(receiver, Arc::clone(&cancelled)) {
+            Ok(source) => source,
+            Err(error) => return report(format!("Could not buffer speech: {error}")),
+        };
+        if buffered_only {
+            if let Err(error) = source.fill_to(u64::MAX) {
+                return report(format!("Could not buffer speech: {error}"));
+            }
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return;
+        }
         let device = match rodio::DeviceSinkBuilder::open_default_sink() {
             Ok(device) => device,
             Err(error) => return report(format!("No audio output is available: {}", error)),
@@ -386,18 +383,83 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use tokio::sync::mpsc::channel;
+
+    #[test]
+    fn long_speech_uses_an_unlinked_seekable_spool() {
+        use std::os::unix::fs::MetadataExt;
+        let (sender, receiver) = channel(4);
+        let feeder = std::thread::spawn(move || {
+            for _ in 0..160 {
+                sender
+                    .blocking_send(vec![7; 65_536])
+                    .expect("bounded queue");
+            }
+        });
+        let mut source = StreamBuffer::new(receiver, Arc::new(AtomicBool::new(false))).unwrap();
+        source.fill_to(u64::MAX).unwrap();
+        let metadata = source.data.metadata().unwrap();
+        assert_eq!(metadata.len(), 10 * 1024 * 1024);
+        assert_eq!(
+            metadata.nlink(),
+            0,
+            "speech must have no recoverable pathname"
+        );
+        source.seek(SeekFrom::Start(0)).unwrap();
+        let mut first = [0; 4];
+        source.read_exact(&mut first).unwrap();
+        assert_eq!(first, [7; 4]);
+        feeder.join().unwrap();
+    }
 
     fn buffer_from(chunks: Vec<&'static [u8]>) -> (StreamBuffer, std::thread::JoinHandle<()>) {
-        let (sender, receiver) = channel::<Vec<u8>>();
+        let (sender, receiver) = channel::<Vec<u8>>(4);
         let cancelled = Arc::new(AtomicBool::new(false));
         let feeder = std::thread::spawn(move || {
             for chunk in chunks {
-                if sender.send(chunk.to_vec()).is_err() {
+                if sender.blocking_send(chunk.to_vec()).is_err() {
                     return;
                 }
             }
         });
-        (StreamBuffer::new(receiver, cancelled), feeder)
+        (
+            StreamBuffer::new(receiver, cancelled).expect("anonymous spool"),
+            feeder,
+        )
+    }
+
+    #[test]
+    fn mp3_decoding_starts_before_the_download_finishes() {
+        // MPEG-1 Layer III, 128 kbps, 44.1 kHz mono. Zero side information
+        // encodes silence without a bit reservoir; no audio asset or device.
+        let mut frame = vec![0; 417];
+        frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0xc4]);
+        let audio = frame.repeat(100);
+        let (sender, receiver) = channel(4);
+        sender.blocking_send(audio).unwrap();
+        let (played, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let source = player_source(
+                StreamBuffer::new(receiver, Arc::clone(&cancelled)).unwrap(),
+                cancelled,
+            );
+            let decoded = rodio::Decoder::new(source)
+                .map(|decoder| decoder.take(1000).count())
+                .map_err(|error| error.to_string());
+            let _ = played.send(decoded);
+        });
+        // Keep the producer alive: probing must not seek to EOF and turn MP3
+        // playback into a fully buffered download. Close before assertions so
+        // a regression can still let the decoder thread exit cleanly.
+        let early = result.recv_timeout(std::time::Duration::from_secs(1));
+        drop(sender);
+        worker.join().unwrap();
+        assert_eq!(
+            early.expect("MP3 decoder waited for download EOF"),
+            Ok(1000)
+        );
     }
 
     /// The decoder reads and seeks over bytes that have not arrived yet. Both
@@ -437,10 +499,11 @@ mod tests {
     /// come, or the player thread would live for the life of the process.
     #[test]
     fn cancelling_ends_the_stream_for_the_reader() {
-        let (sender, receiver) = channel::<Vec<u8>>();
+        let (sender, receiver) = channel::<Vec<u8>>(4);
         let cancelled = Arc::new(AtomicBool::new(false));
-        let mut buffer = StreamBuffer::new(receiver, Arc::clone(&cancelled));
-        sender.send(b"abc".to_vec()).expect("first chunk");
+        let mut buffer =
+            StreamBuffer::new(receiver, Arc::clone(&cancelled)).expect("anonymous spool");
+        sender.blocking_send(b"abc".to_vec()).expect("first chunk");
 
         let mut head = [0u8; 3];
         buffer.read_exact(&mut head).expect("the first chunk reads");
@@ -520,19 +583,23 @@ mod tests {
         // one ran on for 31_746 samples -- one read-ahead buffer, which for a
         // 128 kbps mp3 is about four seconds.
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (sender, receiver) = channel::<Vec<u8>>();
-        for piece in wav.chunks(65_536) {
-            sender.send(piece.to_vec()).expect("the queue takes it");
-        }
-        drop(sender);
+        let (sender, receiver) = channel::<Vec<u8>>(4);
+        let feeder = std::thread::spawn(move || {
+            for piece in wav.chunks(65_536) {
+                if sender.blocking_send(piece.to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
         let source = player_source(
-            StreamBuffer::new(receiver, Arc::clone(&cancelled)),
+            StreamBuffer::new(receiver, Arc::clone(&cancelled)).expect("anonymous spool"),
             Arc::clone(&cancelled),
         );
         let mut decoder = rodio::Decoder::new(source).expect("the silent wav decodes");
         assert_eq!(decoder.by_ref().take(1_000).count(), 1_000);
         cancelled.store(true, Ordering::SeqCst);
         let after = decoder.count();
+        feeder.join().expect("feeder exits after cancellation");
         assert!(
             after < allowed,
             "a cancelled streaming preview kept playing: {after} samples after \
@@ -547,13 +614,15 @@ mod tests {
     /// `StreamBuffer` looks at the flag.
     #[test]
     fn cancelling_stops_a_source_that_still_holds_buffered_bytes() {
-        let (sender, receiver) = channel::<Vec<u8>>();
-        sender.send(b"0123456789".to_vec()).expect("the whole clip");
+        let (sender, receiver) = channel::<Vec<u8>>(4);
+        sender
+            .blocking_send(b"0123456789".to_vec())
+            .expect("the whole clip");
         drop(sender);
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut source = player_source(
-            StreamBuffer::new(receiver, Arc::clone(&cancelled)),
+            StreamBuffer::new(receiver, Arc::clone(&cancelled)).expect("anonymous spool"),
             Arc::clone(&cancelled),
         );
 

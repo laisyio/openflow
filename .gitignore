@@ -5,6 +5,13 @@ src-tauri/target/
 *.log
 .DS_Store
 .gstack/
+.eval-venv/
+.test-dist/
+evals/cache/
+evals/results/
+evals/corpus/generated/
+evals/models.local.json
+__pycache__/
 
 # iOS app (apps/ios)
 *.xcodeproj

@@ -1,0 +1,10 @@
+open flow -> OpenFlow
+fast pay -> FastPay
+postgres q l -> PostgreSQL
+postgre sql -> PostgreSQL
+Kubernetes
+Notion
+Obsidian
+Acme
+Priya
+Maya Chen

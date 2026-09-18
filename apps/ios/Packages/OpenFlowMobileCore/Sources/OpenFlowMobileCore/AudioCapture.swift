@@ -150,7 +150,7 @@ public struct StreamingDownsampler: Sendable {
     public mutating func process(_ block: UnsafeBufferPointer<Float>, into output: inout [Float]) {
         output.removeAll(keepingCapacity: true)
         guard !block.isEmpty else { return }
-        if passthrough || taps.isEmpty {
+        if passthrough {
             inputCount += block.count
             outputCount += block.count
             output.append(contentsOf: block)
@@ -164,7 +164,7 @@ public struct StreamingDownsampler: Sendable {
     /// Close out the take: emit every remaining output sample, padding past the
     /// end of the input with zeros exactly as the batch converter does.
     public mutating func flush() -> [Float] {
-        guard !passthrough, !taps.isEmpty else { return [] }
+        guard !passthrough else { return [] }
         var tail = [Float]()
         emit(upTo: inputCount, zeroPadTail: true, into: &tail)
         pending.removeAll(keepingCapacity: true)
@@ -174,7 +174,19 @@ public struct StreamingDownsampler: Sendable {
     private mutating func emit(upTo availableInputs: Int, zeroPadTail: Bool, into output: inout [Float]) {
         let totalOutputs = Int(Double(availableInputs) / ratio)
         while outputCount < totalOutputs {
-            let center = Int(Double(outputCount) * ratio)
+            let position = Double(outputCount) * ratio
+            let center = Int(position)
+            if taps.isEmpty {
+                // Keep the last input until the next block supplies its right
+                // neighbour. Only the final flush repeats the final sample.
+                if !zeroPadTail && center + 1 >= availableInputs { break }
+                let right = min(center + 1, availableInputs - 1)
+                let leftValue = pending[center - pendingBase]
+                let rightValue = pending[right - pendingBase]
+                output.append(leftValue + (rightValue - leftValue) * Float(position - Double(center)))
+                outputCount += 1
+                continue
+            }
             let lastNeeded = center + taps.count - 1 - half
             if !zeroPadTail && lastNeeded >= availableInputs { break }
             var acc: Float = 0
@@ -189,13 +201,14 @@ public struct StreamingDownsampler: Sendable {
             }
             output.append(acc)
             outputCount += 1
-            // Drop history the next output can no longer reach.
-            let nextCenter = Int(Double(outputCount) * ratio)
-            let keepFrom = max(0, nextCenter - half)
-            if keepFrom > pendingBase {
-                pending.removeFirst(min(keepFrom - pendingBase, pending.count))
-                pendingBase = keepFrom
-            }
+        }
+        // Compact once per block, not once per output sample. Upsampling keeps
+        // the interpolation's left neighbour; decimation keeps the FIR tail.
+        let nextCenter = Int(Double(outputCount) * ratio)
+        let keepFrom = min(availableInputs, max(0, nextCenter - half))
+        if keepFrom > pendingBase {
+            pending.removeFirst(min(keepFrom - pendingBase, pending.count))
+            pendingBase = keepFrom
         }
     }
 }
@@ -222,15 +235,10 @@ public struct CaptureRingBuffer: Sendable {
     /// that a figure in a sentence is one more thing to forget to update when
     /// `maxSeconds` moves, and a wrong figure is worse than none.
     ///
-    /// It says the *beginning* was lost, which is the opposite of what the
-    /// desktop says, because this is a ring and that is a bounded vector. The
-    /// desktop drops frames as they arrive, so the opening survives; here the
-    /// newest samples overwrite the oldest, so the closing survives. Which half
-    /// is missing is the one thing the user cannot guess, so the two messages
-    /// have to disagree.
+    /// CaptureBuffer stops accepting samples at capacity and requests a stop,
+    /// so the opening always survives even if the UI handles the stop later.
     public static let ceilingNotice =
-        "This take reached OpenFlow's length limit, so the beginning of it was not kept. "
-        + "Everything said after that point is here."
+        "Recording stopped at OpenFlow's length limit. Everything recorded up to that point was kept."
 
     public let capacity: Int
     private var storage: [Float]
@@ -310,6 +318,20 @@ public struct CaptureResult: Sendable {
     public var isSilent: Bool
     /// True when the ten-minute watchdog cut the take short.
     public var hitWatchdog: Bool
+
+    public init(samples16k: [Float], seconds: Double, isSilent: Bool, hitWatchdog: Bool) {
+        self.samples16k = samples16k
+        self.seconds = seconds
+        self.isSilent = isSilent
+        self.hitWatchdog = hitWatchdog
+    }
+}
+
+public protocol AudioCapturing: Sendable {
+    var currentLevel: Float? { get async }
+    func start(measuringLevel: Bool, onLimit: @escaping @Sendable () -> Void) async throws
+    func stop() async throws -> CaptureResult
+    func cancel() async
 }
 
 public enum AudioCaptureError: Error, Equatable, Sendable {
@@ -342,11 +364,16 @@ final class CaptureBuffer: @unchecked Sendable {
     private var mono: [Float] = []
     private var converted: [Float] = []
     private var levelScratch: [Float] = []
+    private var reachedLimit = false
+    private let onLimit: @Sendable () -> Void
 
-    init(inputRate: Double, measuresLevel: Bool = false) {
-        self.ring = CaptureRingBuffer()
+    init(inputRate: Double, measuresLevel: Bool = false,
+         capacity: Int = Int(CaptureRingBuffer.sampleRate * CaptureRingBuffer.maxSeconds),
+         onLimit: @escaping @Sendable () -> Void = {}) {
+        self.ring = CaptureRingBuffer(capacity: capacity)
         self.downsampler = StreamingDownsampler(from: inputRate, to: CaptureRingBuffer.sampleRate)
         self.measuresLevel = measuresLevel
+        self.onLimit = onLimit
     }
 
     func write(mono block: [Float]) {
@@ -389,15 +416,22 @@ final class CaptureBuffer: @unchecked Sendable {
     }
 
     private func write(_ block: UnsafeBufferPointer<Float>) {
+        guard !didOverflow else { return }
         downsampler.process(block, into: &converted)
         guard !converted.isEmpty else { return }
         let level = measuresLevel
             ? SilenceGate.speechLevel(of: converted, scratch: &levelScratch)
             : 0
         lock.lock()
-        ring.append(converted)
+        let remaining = ring.capacity - ring.count
+        converted.withUnsafeBufferPointer {
+            ring.append(UnsafeBufferPointer(rebasing: $0.prefix(remaining)))
+        }
+        let notify = !reachedLimit && ring.count == ring.capacity
+        reachedLimit = reachedLimit || notify
         if measuresLevel { lastLevel = level }
         lock.unlock()
+        if notify { onLimit() }
     }
 
     /// The most recent block's 95th-percentile level, for stop-on-silence.
@@ -416,15 +450,18 @@ final class CaptureBuffer: @unchecked Sendable {
     var didOverflow: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return ring.didOverflow
+        return reachedLimit
     }
 
     func finish() -> (samples: [Float], overflowed: Bool) {
         lock.lock()
         let tail = downsampler.flush()
-        if !tail.isEmpty { ring.append(tail) }
+        tail.withUnsafeBufferPointer {
+            ring.append(UnsafeBufferPointer(rebasing: $0.prefix(ring.capacity - ring.count)))
+        }
+        reachedLimit = reachedLimit || ring.count == ring.capacity
         let samples = ring.snapshot()
-        let overflowed = ring.didOverflow
+        let overflowed = reachedLimit
         lock.unlock()
         return (samples, overflowed)
     }
@@ -435,7 +472,7 @@ final class CaptureBuffer: @unchecked Sendable {
 /// The microphone tap. AVAudioEngine gives us the input node's native format; we
 /// mix to mono and decimate to 16 kHz in the tap so the ring stays at the size
 /// PLAN.md section 5 budgets for.
-public actor AudioCapture {
+public actor AudioCapture: AudioCapturing {
     private var engine: AVAudioEngine?
     private var buffer: CaptureBuffer?
     private var startedAt: Date?
@@ -466,7 +503,7 @@ public actor AudioCapture {
     /// walks the block twice and runs on the audio thread: with the setting off
     /// there is no reader for the number, and the desktop likewise only computes
     /// what it is about to use.
-    public func start(measuringLevel: Bool = false) async throws {
+    public func start(measuringLevel: Bool = false, onLimit: @escaping @Sendable () -> Void = {}) async throws {
         guard engine == nil else { return }
         #if os(iOS)
         // iOS 17 replaced AVAudioSession.requestRecordPermission with this. The
@@ -474,6 +511,8 @@ public actor AudioCapture {
         guard await AVAudioApplication.requestRecordPermission() else {
             throw AudioCaptureError.permissionDenied
         }
+        try Task.checkCancellation()
+        guard engine == nil else { return }
         let session = AVAudioSession.sharedInstance()
         do {
             // `.record` and not `.playAndRecord`: OpenFlow never plays anything,
@@ -485,13 +524,21 @@ public actor AudioCapture {
         }
         #endif
 
+        var captureStarted = false
+        defer {
+            #if os(iOS)
+            if !captureStarted {
+                try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+            }
+            #endif
+        }
         let engine = AVAudioEngine()
         let input = engine.inputNode
         let format = input.inputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw AudioCaptureError.engineUnavailable("The input node reported no usable format")
         }
-        let capture = CaptureBuffer(inputRate: format.sampleRate, measuresLevel: measuringLevel)
+        let capture = CaptureBuffer(inputRate: format.sampleRate, measuresLevel: measuringLevel, onLimit: onLimit)
         input.installTap(onBus: 0, bufferSize: 4_096, format: format) { pcm, _ in
             guard let channels = pcm.floatChannelData else { return }
             let frames = Int(pcm.frameLength)
@@ -514,6 +561,7 @@ public actor AudioCapture {
         self.engine = engine
         self.buffer = capture
         self.startedAt = Date()
+        captureStarted = true
     }
 
     /// Stop and hand back the take, auto-gained and gate-checked.
@@ -531,9 +579,10 @@ public actor AudioCapture {
         let (samples, overflowed) = buffer.finish()
         // The desktop refuses anything under 800 samples (50 ms) as a mis-tap.
         guard samples.count >= 800 else { throw AudioCaptureError.tooShort }
-        let silent = SilenceGate.isSilent(samples)
+        let level = SilenceGate.speechLevel(samples)
+        let silent = level < SilenceGate.silenceLevel
         return CaptureResult(
-            samples16k: SilenceGate.autoGain(samples),
+            samples16k: SilenceGate.autoGain(samples, level: level),
             seconds: Double(samples.count) / CaptureRingBuffer.sampleRate,
             isSilent: silent,
             hitWatchdog: overflowed

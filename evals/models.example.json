@@ -1,0 +1,6 @@
+{"models":[
+  {"id":"moonshine-tiny","backend":"moonshine","arch":"TINY","path":"~/Library/Caches/moonshine_voice/download.moonshine.ai/model/tiny-en/quantized/tiny-en"},
+  {"id":"moonshine-base","backend":"moonshine","arch":"BASE","path":"~/Library/Caches/moonshine_voice/download.moonshine.ai/model/base-en/quantized/base-en"},
+  {"id":"qwen-0.6b","backend":"qwen-mlx","revision":"89e96d92ba34aca20b3e29fb10cc284097d1219f","path":"~/.cache/huggingface/hub/models--mlx-community--Qwen3-ASR-0.6B-8bit/snapshots/89e96d92ba34aca20b3e29fb10cc284097d1219f"},
+  {"id":"qwen-1.7b","backend":"qwen-mlx","revision":"a8379a2e2f9e313c9292cdf1af4055ab56d50d55","path":"~/.cache/huggingface/hub/models--mlx-community--Qwen3-ASR-1.7B-8bit/snapshots/a8379a2e2f9e313c9292cdf1af4055ab56d50d55"}
+]}

@@ -38,6 +38,7 @@ Three things about it are deliberate and load-bearing:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import gc
 import json
 import os
@@ -47,6 +48,8 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
+from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Loopback, and not a parameter: see the module docstring.
@@ -62,8 +65,9 @@ class ModelHolder:
     inference. Both take `lock`, so a request that arrives mid-load waits for
     the load rather than starting a second one."""
 
-    def __init__(self, repo: str, idle_seconds: float) -> None:
+    def __init__(self, repo: str, idle_seconds: float, revision: str | None = None) -> None:
         self.repo = repo
+        self.revision = revision
         self.idle_seconds = idle_seconds
         self.lock = threading.Lock()
         self._model = None
@@ -105,7 +109,12 @@ class ModelHolder:
         try:
             from mlx_audio.stt.utils import load_model
 
-            self._model = load_model(self.repo)
+            source = self.repo
+            if self.revision:
+                from huggingface_hub import snapshot_download
+
+                source = snapshot_download(self.repo, revision=self.revision, local_files_only=True)
+            self._model = load_model(source)
             return self._model
         except BaseException as failure:  # noqa: BLE001 - reported over HTTP
             self._error = f"{type(failure).__name__}: {failure}"
@@ -130,9 +139,14 @@ class ModelHolder:
 
     def unload(self) -> None:
         with self.lock:
-            if self._model is None:
-                return
-            self._model = None
+            self._unload_locked()
+
+    def _unload_locked(self) -> None:
+        # Cache operations share the inference lock too: a new load must not
+        # race a cache clear from the previous idle generation.
+        if self._model is None:
+            return
+        self._model = None
         gc.collect()
         try:
             import mlx.core as mx
@@ -140,6 +154,16 @@ class ModelHolder:
             mx.clear_cache()
         except Exception:  # noqa: BLE001 - freeing the cache is best effort
             pass
+
+    def unload_if_idle(self) -> None:
+        with self.lock:
+            # The idle observation made before acquiring the lock can be stale
+            # after an inference finishes. Recheck ownership/time under it.
+            if time.monotonic() - self.last_used < self.idle_seconds:
+                return
+            if self._model is None:
+                return
+            self._unload_locked()
 
     # ── inference ────────────────────────────────────────
     def transcribe(self, wav_path: str, language: str | None) -> str:
@@ -160,7 +184,116 @@ class ModelHolder:
             if self.state() != "ready":
                 continue
             if time.monotonic() - self.last_used >= self.idle_seconds:
-                self.unload()
+                self.unload_if_idle()
+
+
+class InferenceJob:
+    def __init__(self, identity: str, preview: bool) -> None:
+        self.identity = identity
+        self.preview = preview
+        self.cancelled = threading.Event()
+        self.done = threading.Event()
+        self.path: str | None = None
+        self.language: str | None = None
+        self.text: str | None = None
+        self.error: str | None = None
+
+
+class InferenceScheduler:
+    """One decode, one waiting final, one replaceable preview, including uploads.
+
+    Admission happens before reading audio. Cancellation removes queued work;
+    MLX's blocking generate cannot be interrupted safely, so one already-active
+    decode may finish, but its result is discarded and no backlog follows it.
+    """
+
+    def __init__(self, holder: ModelHolder) -> None:
+        self.holder = holder
+        self.condition = threading.Condition()
+        self.jobs: dict[str, InferenceJob] = {}
+        self.active: InferenceJob | None = None
+        self.cancelled_ids: deque[str] = deque(maxlen=64)
+        self.closed = False
+        self.worker = threading.Thread(target=self._work, name="inference", daemon=True)
+        self.worker.start()
+
+    def reserve(self, identity: str, preview: bool) -> InferenceJob:
+        with self.condition:
+            if self.closed or identity in self.jobs or identity in self.cancelled_ids:
+                raise ValueError("request is duplicate or cancelled")
+            for job in list(self.jobs.values()):
+                if job.preview and job is not self.active:
+                    self._cancel_locked(job)
+            # At most one waiting final, plus active inference and a preview.
+            waiting_finals = sum(not job.preview and job is not self.active for job in self.jobs.values())
+            if (not preview and waiting_finals >= 1) or len(self.jobs) >= 3:
+                raise ValueError("local runner is busy; try again when the current take finishes")
+            if preview and waiting_finals:
+                raise ValueError("a final take is waiting")
+            job = InferenceJob(identity, preview)
+            self.jobs[identity] = job
+            return job
+
+    def submit(self, job: InferenceJob, path: str, language: str | None) -> bool:
+        with self.condition:
+            if job.cancelled.is_set() or self.jobs.get(job.identity) is not job:
+                return False
+            job.path, job.language = path, language
+            self.condition.notify()
+            return True
+
+    def _cancel_locked(self, job: InferenceJob) -> None:
+        job.cancelled.set()
+        if job is not self.active:
+            self.jobs.pop(job.identity, None)
+            if job.path:
+                drop_scratch(job.path)
+                job.path = None
+            job.done.set()
+
+    def cancel(self, identity: str) -> None:
+        with self.condition:
+            self.cancelled_ids.append(identity)
+            if identity in self.jobs:
+                self._cancel_locked(self.jobs[identity])
+            self.condition.notify()
+
+    def close(self) -> None:
+        with self.condition:
+            self.closed = True
+            for job in list(self.jobs.values()):
+                self._cancel_locked(job)
+            self.condition.notify()
+        self.worker.join(timeout=1)
+
+    def _next_locked(self) -> InferenceJob | None:
+        finals = [job for job in self.jobs.values() if not job.preview]
+        if finals:
+            return next((job for job in finals if job.path), None)
+        return next((job for job in self.jobs.values() if job.path), None)
+
+    def _work(self) -> None:
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.closed or self._next_locked() is not None)
+                if self.closed:
+                    return
+                job = self._next_locked()
+                assert job is not None
+                self.active = job
+            try:
+                if not job.cancelled.is_set():
+                    job.text = self.holder.transcribe(job.path, job.language)
+            except Exception as failure:  # noqa: BLE001 - reported to caller
+                job.error = f"{type(failure).__name__}: {failure}"
+            finally:
+                with self.condition:
+                    if job.path:
+                        drop_scratch(job.path)
+                        job.path = None
+                    self.jobs.pop(job.identity, None)
+                    self.active = None
+                    job.done.set()
 
 
 def _generate(model, wav_path: str, language: str | None):
@@ -358,7 +491,7 @@ def install_exit_handlers() -> None:
 # ── multipart ─────────────────────────────────────────────
 
 
-def parse_multipart(body: bytes, content_type: str) -> dict[str, bytes]:
+def parse_multipart(body: bytes, content_type: str) -> dict[str, memoryview]:
     """The subset of `multipart/form-data` this endpoint needs.
 
     Written out rather than taken from a library because `cgi` was removed in
@@ -370,17 +503,32 @@ def parse_multipart(body: bytes, content_type: str) -> dict[str, bytes]:
     if marker not in content_type:
         raise ValueError("multipart body has no boundary")
     boundary = content_type.split(marker, 1)[1].strip().strip('"')
+    if not boundary or len(boundary) > 200 or "\r" in boundary or "\n" in boundary:
+        raise ValueError("invalid multipart boundary")
     separator = b"--" + boundary.encode()
-    fields: dict[str, bytes] = {}
-    for chunk in body.split(separator):
-        if chunk in (b"", b"--", b"--\r\n", b"\r\n"):
-            continue
-        chunk = chunk.lstrip(b"\r\n")
-        if chunk.startswith(b"--"):
-            continue
-        head, _, payload = chunk.partition(b"\r\n\r\n")
-        if not _:
-            continue
+    fields: dict[str, memoryview] = {}
+    view = memoryview(body)
+    position = 0
+    parts = 0
+    while body.startswith(separator, position):
+        position += len(separator)
+        if body.startswith(b"--", position):
+            return fields
+        if not body.startswith(b"\r\n", position):
+            raise ValueError("malformed multipart delimiter")
+        position += 2
+        end_headers = body.find(b"\r\n\r\n", position, position + 16384)
+        if end_headers < 0:
+            raise ValueError("multipart headers are missing or too large")
+        head = body[position:end_headers]
+        payload_start = end_headers + 4
+        payload_end = body.find(b"\r\n" + separator, payload_start)
+        if payload_end < 0:
+            raise ValueError("multipart closing delimiter is missing")
+        position = payload_end + 2
+        parts += 1
+        if parts > 16:
+            raise ValueError("too many multipart fields")
         name = None
         for line in head.split(b"\r\n"):
             lowered = line.lower()
@@ -393,16 +541,51 @@ def parse_multipart(body: bytes, content_type: str) -> dict[str, bytes]:
                 break
         if name is None:
             continue
-        fields[name] = payload[:-2] if payload.endswith(b"\r\n") else payload
-    return fields
+        fields[name] = view[payload_start:payload_end]
+    raise ValueError("malformed multipart body")
 
 
 # ── HTTP ──────────────────────────────────────────────────
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """Cap connection threads as well as upload and inference reservations.
+
+    Excess idle or header-only connections are closed immediately. Sixteen
+    slots leave room for health/cancellation beside the three admitted uploads.
+    """
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self.connection_slots = threading.BoundedSemaphore(16)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self.connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connection_slots.release()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     holder: ModelHolder  # set on the class before the server starts
+    scheduler: InferenceScheduler
+    upload_slots = threading.BoundedSemaphore(3)
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(10)
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002
         """One line per request on stderr, which the app captures. The default
@@ -415,6 +598,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        # A request rejected before its upload is consumed cannot reuse this
+        # socket. Closing also bounds idle HTTP handler threads.
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
         self.wfile.write(body)
 
@@ -459,6 +646,14 @@ class Handler(BaseHTTPRequestHandler):
         if not self._guard():
             return
         route = self.path.split("?", 1)[0]
+        if route == "/cancel":
+            identity = parse_qs(urlsplit(self.path).query).get("id", [""])[0]
+            if not identity or len(identity) > 128:
+                self._reply(400, {"error": "invalid request id"})
+                return
+            self.scheduler.cancel(identity)
+            self._reply(200, {"cancelled": True})
+            return
         if route == "/prewarm":
             self.holder.prewarm_async()
             self._reply(200, self._health())
@@ -469,41 +664,83 @@ class Handler(BaseHTTPRequestHandler):
         self._transcribe()
 
     def _transcribe(self) -> None:
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._reply(400, {"error": "invalid content length"})
+            return
         if length <= 0:
             self._reply(400, {"error": "no audio uploaded"})
             return
         if length > MAX_UPLOAD_BYTES:
             self._reply(413, {"error": "recording is too large"})
             return
-        body = self.rfile.read(length)
+        identity = self.headers.get("X-OpenFlow-Job-Id") or str(uuid.uuid4())
+        if len(identity) > 128 or not all(c.isalnum() or c in "-_" for c in identity):
+            self._reply(400, {"error": "invalid request id"})
+            return
         try:
-            fields = parse_multipart(body, self.headers.get("Content-Type") or "")
+            job = self.scheduler.reserve(identity, self.headers.get("X-OpenFlow-Job-Kind") == "preview")
         except ValueError as failure:
-            self._reply(400, {"error": str(failure)})
+            self._reply(429, {"error": str(failure)})
             return
-        audio = fields.get("file")
-        if not audio:
-            self._reply(400, {"error": "no file part in the request"})
-            return
-        language = (fields.get("language") or b"").decode("utf-8", "replace").strip()
-        if language in ("", "auto"):
-            language = None
-        # `model` and `prompt` are accepted and ignored on purpose: the model is
-        # whichever one this process was started with, and Qwen does not honour
-        # a prompt, which is why the app applies the dictionary itself.
-
         path = None
+        upload_slot = self.upload_slots.acquire(blocking=False)
         try:
+            if not upload_slot:
+                self._reply(429, {"error": "audio upload queue is full"})
+                return
+            body = bytearray(length)
+            target = memoryview(body)
+            offset = 0
+            deadline = time.monotonic() + 10
+            while offset < length:
+                if job.cancelled.is_set() or time.monotonic() >= deadline:
+                    raise ValueError("audio upload cancelled or timed out")
+                received = self.rfile.readinto(target[offset:min(offset + 65536, length)])
+                if not received:
+                    raise ValueError("incomplete audio upload")
+                offset += received
+            del target
+            fields = parse_multipart(body, self.headers.get("Content-Type") or "")
+            audio = fields.get("file")
+            if not audio:
+                raise ValueError("no file part in the request")
+            language_field = fields.get("language") or b""
+            if len(language_field) > 128:
+                raise ValueError("language field is too long")
+            language = bytes(language_field).decode("utf-8", "replace").strip()
+            del language_field
+            if language in ("", "auto"):
+                language = None
+            if job.cancelled.is_set():
+                self._reply(409, {"error": "transcription cancelled"})
+                return
             path = new_scratch(audio)
-            started = time.monotonic()
-            text = self.holder.transcribe(path, language)
-            elapsed_ms = int((time.monotonic() - started) * 1000)
-            self.log_message("transcribed %d bytes in %d ms", len(audio), elapsed_ms)
-            self._reply(200, {"text": text})
-        except BaseException as failure:  # noqa: BLE001 - reported to the app
+            del audio, fields, body
+            self.upload_slots.release()
+            upload_slot = False
+            if not self.scheduler.submit(job, path, language):
+                self._reply(409, {"error": "transcription cancelled"})
+                return
+            path = None  # The worker owns cleanup from this point.
+            if not job.done.wait(90):
+                self.scheduler.cancel(identity)
+                self._reply(504, {"error": "local transcription timed out"})
+            elif job.cancelled.is_set():
+                self._reply(409, {"error": "transcription cancelled"})
+            elif job.error:
+                self._reply(500, {"error": job.error})
+            else:
+                self._reply(200, {"text": job.text})
+        except (ValueError, TimeoutError) as failure:
+            self._reply(400, {"error": str(failure)})
+        except Exception as failure:  # noqa: BLE001 - reported to the app
             self._reply(500, {"error": f"{type(failure).__name__}: {failure}"})
         finally:
+            if upload_slot:
+                self.upload_slots.release()
+            self.scheduler.cancel(identity)
             if path:
                 drop_scratch(path)
 
@@ -530,6 +767,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--revision")
     parser.add_argument("--idle-minutes", type=float, default=10.0)
     arguments = parser.parse_args()
 
@@ -538,15 +776,15 @@ def main() -> int:
     sweep_orphan_scratch()
     install_exit_handlers()
 
-    holder = ModelHolder(arguments.model, max(0.5, arguments.idle_minutes) * 60.0)
+    holder = ModelHolder(arguments.model, max(0.5, arguments.idle_minutes) * 60.0, arguments.revision)
     Handler.holder = holder
+    Handler.scheduler = InferenceScheduler(holder)
     threading.Thread(target=holder.idle_sweep, name="idle", daemon=True).start()
     threading.Thread(
         target=watch_parent, args=(os.getppid(),), name="parent", daemon=True
     ).start()
 
-    server = ThreadingHTTPServer((BIND_HOST, arguments.port), Handler)
-    server.daemon_threads = True
+    server = BoundedHTTPServer((BIND_HOST, arguments.port), Handler)
     # `--port 0` asks the kernel for a free one, which is how the app starts us:
     # a parent that picks the port has to let go of it before we bind, and two
     # sidecars starting at once can be handed the same number in that gap. The
@@ -564,6 +802,7 @@ def main() -> int:
         pass
     finally:
         server.server_close()
+        Handler.scheduler.close()
         drop_all_scratch()
     return 0
 
