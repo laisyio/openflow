@@ -266,7 +266,49 @@ pub async fn transcribe_audio(
     match provider {
         Provider::Deepgram => transcribe_deepgram(wav_bytes, api_key, language, model).await,
         Provider::OpenRouter => transcribe_openrouter(wav_bytes, api_key, language, model).await,
-        _ => transcribe_whisper(wav_bytes, api_key, language, provider, model, dictionary).await,
+        _ => {
+            transcribe_whisper(
+                wav_bytes, api_key, language, provider, model, dictionary, None,
+            )
+            .await
+        }
+    }
+}
+
+/// Metadata belongs only to the supervised loopback runner; hosted providers
+/// never receive internal job IDs or the private cancellation protocol.
+pub struct LocalJob {
+    pub id: String,
+    pub preview: bool,
+    pub cancellation: tokio_util::sync::CancellationToken,
+}
+
+pub async fn transcribe_local_audio(
+    wav_bytes: Vec<u8>,
+    port: u16,
+    language: Option<&str>,
+    model: Option<&str>,
+    job: &LocalJob,
+) -> Result<String, String> {
+    if wav_bytes.len() > 50 * 1024 * 1024 {
+        return Err("Recording is too large to transcribe".to_string());
+    }
+    let provider = Provider::Custom {
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+    };
+    tokio::select! {
+        biased;
+        _ = job.cancellation.cancelled() => {
+            // The server remembers bounded cancellation tombstones, covering
+            // cancellation arriving before its upload handler reserves the ID.
+            let mut url = reqwest::Url::parse(&format!("http://127.0.0.1:{port}/cancel")).map_err(|error| error.to_string())?;
+            url.query_pairs_mut().append_pair("id", &job.id);
+            let _ = request(Method::POST, url.as_str())?
+                .timeout(Duration::from_secs(2))
+                .send().await;
+            Err("Transcription cancelled".to_string())
+        }
+        result = transcribe_whisper(wav_bytes, "", language, &provider, model, None, Some(job)) => result,
     }
 }
 
@@ -306,6 +348,7 @@ async fn transcribe_whisper(
     provider: &Provider,
     model: Option<&str>,
     dictionary: Option<&str>,
+    local_job: Option<&LocalJob>,
 ) -> Result<String, String> {
     let file = multipart::Part::bytes(wav_bytes)
         .file_name("audio.wav")
@@ -326,19 +369,26 @@ async fn transcribe_whisper(
     if let Some(dictionary) = dictionary_prompt(dictionary) {
         form = form.text("prompt", dictionary);
     }
-    let response = with_openrouter_headers(
+    let mut builder = with_openrouter_headers(
         with_auth(
             request(Method::POST, &provider.endpoint("audio/transcriptions")?)?,
             provider,
             api_key,
         ),
         provider,
-    )
-    .multipart(form)
-    .timeout(Duration::from_secs(90))
-    .send()
-    .await
-    .map_err(|error| request_error("transcribe audio", error))?;
+    );
+    if let Some(job) = local_job {
+        builder = builder.header("X-OpenFlow-Job-Id", &job.id).header(
+            "X-OpenFlow-Job-Kind",
+            if job.preview { "preview" } else { "final" },
+        );
+    }
+    let response = builder
+        .multipart(form)
+        .timeout(Duration::from_secs(90))
+        .send()
+        .await
+        .map_err(|error| request_error("transcribe audio", error))?;
     parse_transcription_response(response, "Transcription").await
 }
 

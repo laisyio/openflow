@@ -160,3 +160,25 @@ cycles are recorded in `performance-general-app.md`.
   real controls with synthetic data, but do not execute save/cancel/rollback,
   late async responses, denied-permission recovery or install retry flows.
   Live spoken dictation, VoiceOver navigation and paid providers were not tested.
+
+## Conflict resolution against main `c2593a8` — 2026-09-18
+
+- Reconciled the five conflicted files rather than replacing either branch:
+  both changelog entries and documentation links remain; cached history rows
+  coexist with background/coalesced queries and ID-only paste admission.
+- Kept upstream's deterministic keyset pagination and composite recency index.
+  Migration removes the superseded timestamp-only index; tests verify rows,
+  settings, secure deletion and repeat-open behavior.
+- Kept upstream's pooled incremental capture and inline WAV gain. Ported the FIR
+  complete-window optimization to the live streaming resampler with tail-offset
+  checks. Added exact bit-pattern comparisons across chunk boundaries and final
+  flushes, plus final WAV equality. Historical batch encoders remain test-only;
+  their original timing tables are not claimed for the merged streaming pipeline.
+- Workspace tests: **315 passed, 8 ignored** on the complete rerun. The first
+  parallel run failed one upstream runtime-retention test; that test then passed
+  alone and on the full rerun. Its source is unchanged from main.
+- Full workspace/all-target/all-feature Clippy with warnings denied, formatting,
+  release build and isolated `--self-check`: passed.
+- The merged release executable rendered **52 synthetic native layout fixtures**
+  to `target/conflict-resolution-layouts-20260918`. This is a rendering smoke test,
+  not a new live microphone, VoiceOver or end-to-end controller verification.

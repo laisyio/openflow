@@ -18,6 +18,7 @@ decode never covered the app's own quit path.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import signal
 import subprocess
@@ -26,6 +27,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -231,6 +233,166 @@ class ScratchRecordingTests(unittest.TestCase):
             handle.write(b"speech")
         module.sweep_orphan_scratch()
         self.assertEqual([os.path.basename(mine)], recordings_in(self.dir))
+
+
+class SchedulingTests(unittest.TestCase):
+    def test_final_replaces_previews_and_admission_is_bounded(self) -> None:
+        module = load_runner()
+        started, release = threading.Event(), threading.Event()
+        calls, removed = [], []
+
+        class FakeHolder:
+            def transcribe(self, path, language):
+                calls.append(path)
+                if path == "active":
+                    started.set()
+                    if not release.wait(5):
+                        raise RuntimeError("fixture timed out")
+                return path
+
+        module.drop_scratch = removed.append
+        scheduler = module.InferenceScheduler(FakeHolder())
+        self.addCleanup(scheduler.close)
+        self.addCleanup(release.set)
+        active = scheduler.reserve("active", True)
+        scheduler.submit(active, "active", None)
+        self.assertTrue(started.wait(1))
+        preview = scheduler.reserve("preview", True)
+        scheduler.submit(preview, "preview", None)
+        replacement = scheduler.reserve("replacement", True)
+        scheduler.submit(replacement, "replacement", None)
+        self.assertTrue(preview.cancelled.is_set())
+        final = scheduler.reserve("final", False)
+        scheduler.submit(final, "final", None)
+        self.assertTrue(replacement.cancelled.is_set())
+        with self.assertRaises(ValueError):
+            scheduler.reserve("extra-final", False)
+        with self.assertRaises(ValueError):
+            scheduler.reserve("late-preview", True)
+        release.set()
+        self.assertTrue(final.done.wait(2))
+        self.assertEqual(calls, ["active", "final"])
+        self.assertEqual(set(removed), {"active", "preview", "replacement", "final"})
+
+    def test_cancel_before_upload_and_queued_cancel_never_decode(self) -> None:
+        module = load_runner()
+        calls = []
+        holder = type("Fake", (), {"transcribe": lambda self, path, lang: calls.append(path)})()
+        scheduler = module.InferenceScheduler(holder)
+        self.addCleanup(scheduler.close)
+        scheduler.cancel("before")
+        with self.assertRaises(ValueError):
+            scheduler.reserve("before", False)
+        job = scheduler.reserve("queued", False)
+        scheduler.cancel("queued")
+        self.assertTrue(job.done.is_set())
+        self.assertFalse(scheduler.submit(job, "never-created", None))
+        self.assertEqual(calls, [])
+        for i in range(1000):
+            scheduler.cancel(str(i))
+        self.assertEqual(len(scheduler.cancelled_ids), 64)
+
+    def test_idle_check_is_rechecked_after_work(self) -> None:
+        module = load_runner()
+        holder = module.ModelHolder("fake", 10)
+        holder._model = object()
+        holder.last_used = time.monotonic()
+        holder.unload_if_idle()
+        self.assertIsNotNone(holder._model)
+
+
+class MultipartTests(unittest.TestCase):
+    def test_large_audio_is_a_view_of_the_original_body(self) -> None:
+        module = load_runner()
+        body = (b'--test\r\nContent-Disposition: form-data; name="file"\r\n\r\n'
+                + b"a" * (1024 * 1024) + b"\r\n--test--\r\n")
+        fields = module.parse_multipart(body, "multipart/form-data; boundary=test")
+        self.assertIsInstance(fields["file"], memoryview)
+        self.assertIs(fields["file"].obj, body)
+        self.assertEqual(len(fields["file"]), 1024 * 1024)
+
+    def test_headers_and_boundaries_are_bounded(self) -> None:
+        module = load_runner()
+        for body, content_type in [
+            (b"", "multipart/form-data"),
+            (b"", "multipart/form-data; boundary="),
+            (b"", "multipart/form-data; boundary=" + "a" * 201),
+            (b"--test\r\n" + b"a" * 20000, "multipart/form-data; boundary=test"),
+        ]:
+            with self.assertRaises(ValueError):
+                module.parse_multipart(body, content_type)
+
+
+class TransportTests(unittest.TestCase):
+    def test_success_and_preupload_cancel_over_the_actual_http_routes(self) -> None:
+        module = load_runner()
+        audio = b"synthetic audio for a stub, not model input"
+        received = []
+
+        class FakeHolder:
+            def transcribe(self, path, language):
+                with open(path, "rb") as handle:
+                    received.append((handle.read(), language, path))
+                return "decoded"
+
+        class QuietHandler(module.Handler):
+            def log_message(self, *args):
+                pass
+
+        scheduler = module.InferenceScheduler(FakeHolder())
+        QuietHandler.scheduler = scheduler
+        server = module.BoundedHTTPServer(("127.0.0.1", 0), QuietHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        body = (b'--test\r\nContent-Disposition: form-data; name="file"\r\n\r\n'
+                + audio + b'\r\n--test\r\nContent-Disposition: form-data; name="language"\r\n\r\nen'
+                + b"\r\n--test--\r\n")
+
+        def request(identity):
+            return urllib.request.Request(base + "/v1/audio/transcriptions", data=body, headers={
+                "Content-Type": "multipart/form-data; boundary=test",
+                "X-OpenFlow-Job-Id": identity,
+                "X-OpenFlow-Job-Kind": "final",
+            })
+
+        try:
+            with urllib.request.urlopen(request("success"), timeout=5) as response:
+                self.assertEqual(json.load(response), {"text": "decoded"})
+            self.assertEqual(received[0][:2], (audio, "en"))
+            self.assertFalse(os.path.exists(received[0][2]))
+            cancel = urllib.request.Request(base + "/cancel?id=cancelled", data=b"")
+            with urllib.request.urlopen(cancel, timeout=5) as response:
+                self.assertEqual(json.load(response), {"cancelled": True})
+            with self.assertRaises(urllib.error.HTTPError) as rejected:
+                urllib.request.urlopen(request("cancelled"), timeout=5)
+            self.assertEqual(rejected.exception.code, 429)
+            rejected.exception.close()
+            self.assertEqual(len(received), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+            scheduler.close()
+
+    def test_connection_admission_does_not_create_unbounded_threads(self) -> None:
+        module = load_runner()
+        server = module.BoundedHTTPServer(("127.0.0.1", 0), module.Handler, bind_and_activate=False)
+        self.addCleanup(server.server_close)
+        slots = server.connection_slots
+        for _ in range(16):
+            self.assertTrue(slots.acquire(blocking=False))
+        with mock.patch.object(server, "shutdown_request") as close, mock.patch.object(
+            module.ThreadingHTTPServer, "process_request"
+        ) as spawn:
+            server.process_request("socket", ("127.0.0.1", 1))
+            close.assert_called_once_with("socket")
+            spawn.assert_not_called()
+        slots.release()
+        with mock.patch.object(module.ThreadingHTTPServer, "process_request", side_effect=RuntimeError):
+            with self.assertRaises(RuntimeError):
+                server.process_request("socket", ("127.0.0.1", 1))
+        self.assertTrue(slots.acquire(blocking=False), "failed spawning must release the slot")
 
 
 if __name__ == "__main__":

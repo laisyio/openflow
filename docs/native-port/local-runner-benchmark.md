@@ -1,5 +1,10 @@
 # Local runner benchmark: Qwen3-ASR on Apple silicon (MLX)
 
+> Historical single-clip measurements. For current model comparisons use the
+> [48-clip, 12-reader evaluation](../../evals/README.md), including raw versus
+> dictionary-corrected scores, uncertainty, failure coverage and separate memory
+> metrics. The results below are preserved as history, not a general ranking.
+
 Measured 2026-09-02 on a MacBook Air M4, 16 GB, macOS 26.5, mlx 0.32.2, mlx-audio 0.5.1, Python 3.12. Clip: `take.wav`, 8.7 s of speech, the same clip used for the Groq and LAN timings in PR #7. Method: `bench_qwen.py` (load, one cold run, median of five warm runs, `mx.get_peak_memory`), then `bench_load.py` in a fresh process with the weights already on disk.
 
 ## Results

@@ -16,7 +16,7 @@ public protocol ClipboardWriter: Sendable {
     ///   - localOnly: keeps the item off Universal Clipboard, so a dictation
     ///     never appears on the user's other devices. Always true for us.
     ///   - expiresAfter: seconds until the item is dropped, or nil for never.
-    func write(_ text: String, localOnly: Bool, expiresAfter: TimeInterval?)
+    @MainActor func write(_ text: String, localOnly: Bool, expiresAfter: TimeInterval?)
 }
 
 #if canImport(UIKit)

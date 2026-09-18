@@ -144,6 +144,11 @@ public enum SilenceGate {
     public static func autoGain(_ samples: [Float]) -> [Float] {
         guard !samples.isEmpty else { return [] }
         let level = speechLevel(samples)
+        return autoGain(samples, level: level)
+    }
+
+    /// Reuse the whole-take measurement already made by the silence gate.
+    public static func autoGain(_ samples: [Float], level: Float) -> [Float] {
         if level < gainFloor { return samples }
         let gain = min(max(targetPeak / level, 1.0), maxGain)
         return samples.map { min(max($0 * gain, -1.0), 1.0) }

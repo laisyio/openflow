@@ -4,6 +4,7 @@
 //! `Pressed` starts the capture and `Released` ends it, and the engine's
 //! watchdog covers the case where a release is swallowed by another app.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, OnceLock};
 
@@ -175,6 +176,7 @@ pub trait HotkeyTarget: Clone + Send + 'static {
     fn pressed(&self);
     fn released(&self);
     fn recopy(&self);
+    fn insertion_rejected(&self, _message: &str) {}
 }
 
 impl HotkeyTarget for Arc<Engine> {
@@ -188,6 +190,12 @@ impl HotkeyTarget for Arc<Engine> {
 
     fn recopy(&self) {
         Engine::recopy(self);
+    }
+
+    fn insertion_rejected(&self, message: &str) {
+        // Routing runs on AppKit already; do not enqueue another callback for
+        // each rejected key-repeat in a burst.
+        crate::app::with_app(|app| app.notify("OpenFlow", message));
     }
 }
 
@@ -207,11 +215,13 @@ impl HotkeyTarget for Arc<Engine> {
 /// opening a `cpal` stream on the same thread, and the recopy for a 200 ms
 /// settle plus an `osascript`.
 ///
-/// **Why one worker and not a thread per event.** Press and release have to
+/// **Why ordered workers and not a thread per event.** Press and release have to
 /// reach the engine in the order the user made them. A thread each would let a
 /// press that lands while the previous release is still encoding overtake it,
 /// and the states the overlay shows would arrive out of order. One serial
-/// worker keeps the ordering the main thread used to give for free.
+/// capture worker keeps the ordering the main thread used to give for free.
+/// Clipboard requests use a separate serial worker so a slow paste cannot
+/// delay either edge of a capture.
 ///
 /// Nothing here touches AppKit. Every UI update the engine makes leaves as an
 /// event and `NativeEvents::emit` hops to the main queue itself, and the
@@ -223,14 +233,86 @@ pub(crate) fn route<T: HotkeyTarget>(
     event: GlobalHotKeyEvent,
 ) {
     if record_id == Some(event.id) {
-        let target = target.clone();
-        match event.state {
-            HotKeyState::Pressed => run_off_main(Box::new(move || target.pressed())),
-            HotKeyState::Released => run_off_main(Box::new(move || target.released())),
-        }
+        capture_edge(target, event.state == HotKeyState::Pressed);
     } else if recopy_id == Some(event.id) && matches!(event.state, HotKeyState::Pressed) {
-        let target = target.clone();
-        run_off_main(Box::new(move || target.recopy()));
+        let worker_target = target.clone();
+        if let Err(error) = insert_off_main(move || worker_target.recopy()) {
+            target.insertion_rejected(error);
+        }
+    }
+}
+
+/// The button and global shortcut share one ordered capture queue. No capture
+/// operation may wait for slow clipboard automation ahead of it.
+pub fn capture_edge<T: HotkeyTarget>(target: &T, pressed: bool) {
+    let target = target.clone();
+    run_off_main(Box::new(move || {
+        if pressed {
+            target.pressed()
+        } else {
+            target.released()
+        }
+    }));
+}
+
+/// Manual insertions admit exactly one action, including work not started yet.
+/// A repeated request is rejected now rather than pasted into a later focus.
+pub fn insert_off_main(work: impl FnOnce() + Send + 'static) -> Result<(), &'static str> {
+    static INSERTIONS: OnceLock<InsertionWorker> = OnceLock::new();
+    INSERTIONS.get_or_init(InsertionWorker::new).submit(work)
+}
+
+const INSERTION_BUSY: &str =
+    "A paste is already in progress. This repeated request was not queued.";
+const INSERTION_UNAVAILABLE: &str = "The paste worker is unavailable. Please restart OpenFlow.";
+
+struct InsertionWorker {
+    sender: Option<mpsc::SyncSender<HotkeyWork>>,
+    occupied: Arc<AtomicBool>,
+}
+
+struct InsertionPermit(Arc<AtomicBool>);
+
+impl Drop for InsertionPermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl InsertionWorker {
+    fn new() -> Self {
+        // The admission flag covers running AND queued work. Channel capacity
+        // alone would permit an extra stale action behind the active paste.
+        let (sender, receiver) = mpsc::sync_channel::<HotkeyWork>(1);
+        let sender = std::thread::Builder::new()
+            .name("openflow-insertions".to_string())
+            .spawn(move || {
+                for work in receiver {
+                    work();
+                }
+            })
+            .ok()
+            .map(|_| sender);
+        Self {
+            sender,
+            occupied: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn submit(&self, work: impl FnOnce() + Send + 'static) -> Result<(), &'static str> {
+        let sender = self.sender.as_ref().ok_or(INSERTION_UNAVAILABLE)?;
+        self.occupied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| INSERTION_BUSY)?;
+        let permit = InsertionPermit(Arc::clone(&self.occupied));
+        // RAII releases admission on normal completion, panic, or failed send.
+        // Never fall back to running clipboard automation on the caller.
+        sender
+            .try_send(Box::new(move || {
+                let _permit = permit;
+                work();
+            }))
+            .map_err(|_| INSERTION_UNAVAILABLE)
     }
 }
 
@@ -241,19 +323,21 @@ type HotkeyWork = Box<dyn FnOnce() + Send + 'static>;
 fn worker() -> Option<&'static Sender<HotkeyWork>> {
     static WORKER: OnceLock<Option<Sender<HotkeyWork>>> = OnceLock::new();
     WORKER
-        .get_or_init(|| {
-            let (sender, receiver) = mpsc::channel::<HotkeyWork>();
-            std::thread::Builder::new()
-                .name("openflow-hotkeys".to_string())
-                .spawn(move || {
-                    for work in receiver {
-                        work();
-                    }
-                })
-                .ok()
-                .map(|_| sender)
-        })
+        .get_or_init(|| make_worker("openflow-hotkeys"))
         .as_ref()
+}
+
+fn make_worker(name: &str) -> Option<Sender<HotkeyWork>> {
+    let (sender, receiver) = mpsc::channel::<HotkeyWork>();
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            for work in receiver {
+                work();
+            }
+        })
+        .ok()
+        .map(|_| sender)
 }
 
 /// Run `work` on the hotkey worker, or here when there is no worker to run it
@@ -264,7 +348,11 @@ fn worker() -> Option<&'static Sender<HotkeyWork>> {
 /// a blocked caller, which is worse than a free one and far better than
 /// silence.
 fn run_off_main(work: HotkeyWork) {
-    match worker() {
+    dispatch_work(worker(), work);
+}
+
+fn dispatch_work(queue: Option<&Sender<HotkeyWork>>, work: HotkeyWork) {
+    match queue {
         Some(sender) => {
             if let Err(returned) = sender.send(work) {
                 (returned.0)();
@@ -590,26 +678,23 @@ mod tests {
             &target,
             event(RECORD, HotKeyState::Pressed),
         );
-        route(
-            Some(RECORD),
-            Some(RECOPY),
-            &target,
-            event(RECOPY, HotKeyState::Pressed),
-        );
+        // The on-screen button takes this same path, interleaved with the
+        // global shortcut above. Both kinds of edge must keep their order.
+        capture_edge(&target, false);
         // Everything above queued behind a release that has not finished yet.
         // A caller that ran the release inline has already given up waiting by
         // now; let that be the thread assertion's failure to report, not this
         // line's.
         let _ = unblock.send(());
 
-        for expected in ["released", "pressed", "recopy"] {
+        for expected in ["released", "pressed", "released"] {
             assert_eq!(
                 seen.recv_timeout(STANDIN_BLOCK * 2),
                 Ok(expected),
                 "expected {expected} next"
             );
         }
-        assert_eq!(target.names(), vec!["released", "pressed", "recopy"]);
+        assert_eq!(target.names(), vec!["released", "pressed", "released"]);
         let threads = target.threads();
         assert_ne!(
             threads[0],
@@ -619,6 +704,94 @@ mod tests {
         assert!(
             threads.windows(2).all(|pair| pair[0] == pair[1]),
             "the hotkey calls were spread over several threads, so nothing keeps them in order"
+        );
+    }
+
+    #[test]
+    fn blocked_insertion_rejects_bursts_without_retention_or_capture_delay() {
+        let queue = InsertionWorker::new();
+        let (entered, running) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let payload = Arc::new(vec![0u8; 65_536]);
+        let accepted_payload = Arc::clone(&payload);
+        queue
+            .submit(move || {
+                entered.send(()).unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(2));
+                drop(accepted_payload);
+                done.send(()).unwrap();
+            })
+            .unwrap();
+        running.recv_timeout(Duration::from_secs(1)).unwrap();
+        let rejected_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Instant::now();
+        for _ in 0..1000 {
+            let rejected_payload = Arc::clone(&payload);
+            let runs = Arc::clone(&rejected_runs);
+            assert_eq!(
+                queue.submit(move || {
+                    drop(rejected_payload);
+                    runs.fetch_add(1, Ordering::Relaxed);
+                }),
+                Err(INSERTION_BUSY)
+            );
+            assert_eq!(Arc::strong_count(&payload), 2, "rejected text was retained");
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "burst callbacks blocked on the running paste"
+        );
+        let (target, seen) = Recorder::new();
+        capture_edge(&target, true);
+        let captured = seen.recv_timeout(Duration::from_millis(250));
+        release.send(()).unwrap();
+        assert_eq!(captured, Ok("pressed"), "capture queued behind insertion");
+        assert_eq!(finished.recv_timeout(Duration::from_secs(1)), Ok(()));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while queue.occupied.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!queue.occupied.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&payload), 1);
+        let (next_done, next_finished) = mpsc::channel();
+        queue
+            .submit(move || {
+                next_done.send(()).unwrap();
+            })
+            .unwrap();
+        next_finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            rejected_runs.load(Ordering::Relaxed),
+            0,
+            "a rejected paste ran later"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_insertion_worker_never_runs_on_the_calling_thread() {
+        let queue = InsertionWorker {
+            sender: None,
+            occupied: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(
+            queue.submit(|| panic!("clipboard fallback blocked the caller")),
+            Err(INSERTION_UNAVAILABLE)
+        );
+        assert!(!queue.occupied.load(Ordering::Acquire));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let disconnected = InsertionWorker {
+            sender: Some(sender),
+            occupied: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(
+            disconnected.submit(|| panic!("disconnected clipboard fallback ran")),
+            Err(INSERTION_UNAVAILABLE)
+        );
+        assert!(
+            !disconnected.occupied.load(Ordering::Acquire),
+            "failed dispatch must release admission"
         );
     }
 

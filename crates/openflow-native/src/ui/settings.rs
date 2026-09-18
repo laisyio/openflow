@@ -15,7 +15,7 @@
 //! Closing hides the window rather than releasing it, so reopening from the
 //! menu bar is instant and no state is rebuilt.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use objc2::rc::Retained;
@@ -42,6 +42,7 @@ use crate::overlay;
 use crate::ui::card::{Card, Flipped, GAP, MARGIN, PADDING};
 use crate::ui::onboarding::microphone_items;
 use crate::ui::recorder::ChordRecorder;
+use crate::ui::refresh::{DeferredField, RefreshGate};
 use crate::ui::{
     allow_wrapping, button, combo, label, note, popup, secure_field, switch_control, text_field,
     text_view, wire, Form, ROW,
@@ -350,6 +351,24 @@ pub struct SettingsIvars {
     recording_action: RefCell<Option<String>>,
     /// The speech request currently previewing, for the Stop button.
     preview_request: RefCell<Option<String>>,
+    refresh: Arc<RefreshGate>,
+    refreshing: Cell<bool>,
+    refresh_pending: Cell<bool>,
+    key_fields: [DeferredField; 3],
+}
+
+struct ServiceSnapshot {
+    devices: Vec<openflow_core::audio::AudioDevice>,
+    keys: [Option<String>; 3],
+}
+
+fn credential_index(tag: isize) -> Option<usize> {
+    match tag {
+        TAG_API_KEY => Some(0),
+        TAG_FORMATTING_KEY => Some(1),
+        TAG_TTS_KEY => Some(2),
+        _ => None,
+    }
 }
 
 define_class!(
@@ -370,6 +389,9 @@ define_class!(
             let Some(tag) = notified_tag(notification) else {
                 return;
             };
+            if let Some(index) = credential_index(tag) {
+                self.ivars().key_fields[index].edited();
+            }
             if !writes_on_end_editing(tag) {
                 self.write(tag);
             }
@@ -461,11 +483,18 @@ define_class!(
 
         #[unsafe(method(clearHistory:))]
         fn clear_history(&self, _sender: &NSControl) {
-            let message = match self.ivars().engine.clear_history() {
-                Ok(removed) => format!("Deleted {} stored transcriptions.", removed),
-                Err(error) => error,
-            };
-            self.set_text(&self.ivars().history_status_field(), &message);
+            let engine = Arc::clone(&self.ivars().engine);
+            crate::app::spawn(async move {
+                let message = tokio::task::spawn_blocking(move || engine.clear_history())
+                    .await.unwrap_or_else(|error| Err(error.to_string()))
+                    .map(|removed| format!("Deleted {removed} stored transcriptions."))
+                    .unwrap_or_else(|error| error);
+                crate::events::on_main(move || {
+                    crate::app::with_app(|app| app.with_settings(|page| {
+                        page.set_text(&page.ivars().history_status_field(), &message);
+                    }));
+                });
+            });
         }
     }
 );
@@ -496,6 +525,10 @@ impl SettingsPage {
             recorder: ChordRecorder::default(),
             recording_action: RefCell::new(None),
             preview_request: RefCell::new(None),
+            refresh: Arc::new(RefreshGate::default()),
+            refreshing: Cell::new(false),
+            refresh_pending: Cell::new(false),
+            key_fields: std::array::from_fn(|_| DeferredField::default()),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -638,8 +671,14 @@ impl SettingsPage {
     /// the page is navigated away from, which is what closing the window used
     /// to mean.
     pub fn on_hidden(&self) {
+        self.ivars().refresh.hide();
         self.stop_recording_hotkey();
         self.commit_pending_edits();
+    }
+
+    pub fn on_shown(&self) {
+        self.ivars().refresh.show();
+        self.reload();
     }
 
     /// Force whatever field is being edited to commit, if this window is the
@@ -689,11 +728,14 @@ impl SettingsPage {
     /// overlay's own drag, say) is never stale on screen.
     pub fn reload(&self) {
         let ivars = self.ivars();
+        if !ivars.refresh.visible() {
+            return;
+        }
         let settings = ivars.engine.settings();
         let controls = &ivars.controls;
 
         // General
-        self.reload_microphones();
+        self.refresh_services();
         // Show the chord that is actually registered, normalized: a binding
         // saved as "ctrl+shift+v" reads back as "Ctrl+Shift+V".
         let record = binding_text(settings, "record");
@@ -762,15 +804,10 @@ impl SettingsPage {
         self.set_runner_state(&ivars.engine.runner().status());
         // The sidecar may have unloaded its model while the window was closed;
         // one read on open, and after that the supervisor pushes changes.
-        ivars.engine.runner().refresh_health();
 
         let (provider, provider_url) = split_provider(&settings.provider_name());
         select_value(&controls.provider, PROVIDERS, &provider);
         self.set_text(&controls.provider_url, &provider_url);
-        self.set_text(
-            &controls.api_key,
-            &settings.api_key().ok().flatten().unwrap_or_default(),
-        );
         set_switch(&controls.same_provider, settings.same_provider());
         let (formatting, formatting_url) = split_provider(
             &settings
@@ -783,14 +820,6 @@ impl SettingsPage {
             &formatting,
         );
         self.set_text(&controls.formatting_url, &formatting_url);
-        self.set_text(
-            &controls.formatting_key,
-            &settings
-                .formatting_api_key()
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
-        );
         set_switch(&controls.format_enabled, settings.format_enabled());
         if let Err(error) = self.apply_cleanup_capability() {
             self.set_text(&controls.models_status, &error);
@@ -809,10 +838,6 @@ impl SettingsPage {
         let (tts, tts_url) = split_provider(&settings.tts_provider_name());
         select_value(&controls.tts_provider, TTS_PROVIDERS, &tts);
         self.set_text(&controls.tts_url, &tts_url);
-        self.set_text(
-            &controls.tts_key,
-            &settings.tts_api_key().ok().flatten().unwrap_or_default(),
-        );
         self.set_combo(
             &controls.tts_model,
             &settings.tts_model().unwrap_or_default(),
@@ -860,7 +885,67 @@ impl SettingsPage {
         self.set_text(&controls.login_status, note);
     }
 
-    fn reload_microphones(&self) {
+    /// At most one batch can touch the devices, keychain or sidecar at once.
+    /// Cached controls remain usable while it runs. A re-open coalesces to
+    /// one follow-up; edits or hiding invalidate the older completion.
+    fn refresh_services(&self) {
+        let ivars = self.ivars();
+        let generation = ivars.refresh.invalidate();
+        if ivars.refreshing.replace(true) {
+            ivars.refresh_pending.set(true);
+            return;
+        }
+        let engine = Arc::clone(&ivars.engine);
+        let key_revisions = ivars.key_fields.each_ref().map(DeferredField::revision);
+        crate::app::spawn(async move {
+            let snapshot = tokio::task::spawn_blocking(move || {
+                let settings = engine.settings();
+                let keys = [
+                    settings.api_key(),
+                    settings.formatting_api_key(),
+                    settings.tts_api_key(),
+                ]
+                .map(|key| key.ok().map(|key| key.unwrap_or_default()));
+                let devices = engine.list_audio_devices().unwrap_or_default();
+                engine.runner().refresh_health();
+                ServiceSnapshot { devices, keys }
+            })
+            .await;
+            crate::events::on_main(move || {
+                crate::app::with_app(|app| {
+                    app.with_settings(|page| {
+                        let ivars = page.ivars();
+                        ivars.refreshing.set(false);
+                        if ivars.refresh.accepts(generation) {
+                            if let Ok(snapshot) = snapshot {
+                                page.apply_microphones(&snapshot.devices);
+                                for (index, (field, key)) in [
+                                    &*ivars.controls.api_key,
+                                    &*ivars.controls.formatting_key,
+                                    &*ivars.controls.tts_key,
+                                ]
+                                .into_iter()
+                                .zip(snapshot.keys)
+                                .enumerate()
+                                {
+                                    if let Some(key) = key {
+                                        if ivars.key_fields[index].loaded(key_revisions[index]) {
+                                            page.set_text(field, &key);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if ivars.refresh_pending.replace(false) && ivars.refresh.visible() {
+                            page.refresh_services();
+                        }
+                    });
+                });
+            });
+        });
+    }
+
+    fn apply_microphones(&self, devices: &[openflow_core::audio::AudioDevice]) {
         let ivars = self.ivars();
         let controls = &ivars.controls;
         // Same conflation the wizard had: `list_audio_devices` fails one way
@@ -869,13 +954,12 @@ impl SettingsPage {
         // unlike the wizard's step, this row has no second line to tell the
         // two apart on, and the popup itself can only say that there is
         // nothing to pick. What it must not do is name something anyway.
-        let devices = ivars.engine.list_audio_devices().unwrap_or_default();
         // Keyed to the popup by position, first entry empty either way: an
         // empty `microphone` row means "let the recorder pick".
         let mut ids = vec![String::new()];
         {
             controls.microphone.removeAllItems();
-            for title in microphone_items(&devices) {
+            for title in microphone_items(devices) {
                 controls
                     .microphone
                     .addItemWithTitle(&NSString::from_str(&title));
@@ -891,6 +975,9 @@ impl SettingsPage {
     // ── Writing one control back ──────────────────────────
 
     fn write(&self, tag: isize) {
+        if credential_index(tag).is_some_and(|index| !self.ivars().key_fields[index].writable()) {
+            return;
+        }
         let ivars = self.ivars();
         let settings = ivars.engine.settings();
         let controls = &ivars.controls;
@@ -1053,6 +1140,8 @@ impl SettingsPage {
         };
         if let Err(error) = result {
             self.set_text(self.status_field(tag), &error);
+        } else if let Some(index) = credential_index(tag) {
+            ivars.key_fields[index].committed();
         }
         // Cheap, and it depends on three different rows (the toggle and the two
         // provider endpoints), so it is re-evaluated after any of them.

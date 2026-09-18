@@ -2954,6 +2954,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-util",
  "uuid",
@@ -2963,7 +2964,6 @@ dependencies = [
 name = "openflow-native"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "block2",
  "chrono",
  "dispatch2",

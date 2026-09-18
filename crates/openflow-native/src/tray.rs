@@ -74,11 +74,13 @@ pub struct Tray {
     /// rebuilding the menu, which costs a history query and ~25 items on the
     /// main thread three times per dictation.
     status_item: RefCell<MenuItem>,
+    recents: RefCell<Vec<openflow_core::db::Transcription>>,
+    refresh: Arc<crate::ui::refresh::RefreshGate>,
 }
 
 impl Tray {
-    pub fn new(engine: &Arc<Engine>) -> Result<Self, String> {
-        let (menu, status_item) = build_menu(engine, RecordingState::Idle, None)?;
+    pub fn new(_engine: &Arc<Engine>) -> Result<Self, String> {
+        let (menu, status_item) = build_menu(&[], RecordingState::Idle, None)?;
         let icon = TrayIconBuilder::new()
             .with_id("main_tray")
             .with_menu(Box::new(menu))
@@ -89,11 +91,15 @@ impl Tray {
             .build()
             .map_err(|error| format!("Could not create the menu bar item: {}", error))?;
         draw_the_icon_as_a_vector(&icon);
+        let refresh = Arc::new(crate::ui::refresh::RefreshGate::default());
+        refresh.show();
         Ok(Self {
             icon,
             status: RefCell::new(RecordingState::Idle),
             problem: RefCell::new(None),
             status_item: RefCell::new(status_item),
+            recents: RefCell::new(Vec::new()),
+            refresh,
         })
     }
 
@@ -153,13 +159,39 @@ impl Tray {
 
     /// Rebuild the whole menu. The recents and the remedy item are the two
     /// things that can change its shape.
-    pub fn rebuild(&self, engine: &Arc<Engine>) {
+    pub fn rebuild(&self, _engine: &Arc<Engine>) {
         let state = *self.status.borrow();
-        if let Ok((menu, status_item)) = build_menu(engine, state, self.remedy()) {
+        if let Ok((menu, status_item)) = build_menu(&self.recents.borrow(), state, self.remedy()) {
             self.icon.set_menu(Some(Box::new(menu)));
             *self.status_item.borrow_mut() = status_item;
             self.render();
         }
+    }
+
+    pub fn refresh_history(&self, engine: &Arc<Engine>) {
+        let generation = self.refresh.invalidate();
+        let gate = Arc::clone(&self.refresh);
+        let engine = Arc::clone(engine);
+        crate::app::spawn(async move {
+            let rows = tokio::task::spawn_blocking(move || {
+                if !gate.accepts(generation) {
+                    return Ok(Vec::new());
+                }
+                engine.history(RECENTS)
+            })
+            .await;
+            crate::events::on_main(move || {
+                crate::app::with_app(|app| {
+                    let tray = app.tray();
+                    if tray.refresh.accepts(generation) {
+                        if let Ok(Ok(rows)) = rows {
+                            *tray.recents.borrow_mut() = rows;
+                            tray.rebuild(app.engine());
+                        }
+                    }
+                });
+            });
+        });
     }
 }
 
@@ -197,7 +229,7 @@ pub fn remedy_label(target: &str) -> &'static str {
 /// Build the menu, handing back the status line so the caller can retitle it
 /// without rebuilding.
 fn build_menu(
-    engine: &Arc<Engine>,
+    recents: &[openflow_core::db::Transcription],
     state: RecordingState,
     remedy: Option<&str>,
 ) -> Result<(Menu, MenuItem), String> {
@@ -220,7 +252,6 @@ fn build_menu(
         ))?;
     }
 
-    let recents = engine.history(RECENTS).unwrap_or_default();
     if !recents.is_empty() {
         append(&PredefinedMenuItem::separator())?;
         append(&MenuItem::with_id(
@@ -229,7 +260,7 @@ fn build_menu(
             false,
             None,
         ))?;
-        for item in &recents {
+        for item in recents {
             let text = item.formatted_text.as_deref().unwrap_or(&item.raw_text);
             append(&MenuItem::with_id(
                 MenuId::new(format!("{}{}", RECENT_PREFIX, item.id)),
@@ -363,7 +394,13 @@ pub fn install_handler() {
                 }
                 other => {
                     if let Some(row) = other.strip_prefix(RECENT_PREFIX) {
-                        app.engine().paste_transcription(row);
+                        let engine = Arc::clone(app.engine());
+                        let row = row.to_string();
+                        if let Err(error) = crate::hotkeys::insert_off_main(move || {
+                            engine.paste_transcription(&row);
+                        }) {
+                            app.notify("OpenFlow", error);
+                        }
                     }
                 }
             });

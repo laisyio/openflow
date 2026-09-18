@@ -205,8 +205,10 @@ public struct TranscriptStore: Sendable {
     /// Everything: history, the last transcript, the lot. The Settings screen's
     /// "delete all dictations" row.
     public func deleteAll() throws {
-        try? FileManager.default.removeItem(at: historyURL)
-        try? FileManager.default.removeItem(at: lastURL)
+        for url in [historyURL, lastURL] {
+            do { try FileManager.default.removeItem(at: url) }
+            catch CocoaError.fileNoSuchFile { continue }
+        }
     }
 
     static func pruned(_ history: [TranscriptRecord], retentionDays: Int, now: Date) -> [TranscriptRecord] {
@@ -222,6 +224,11 @@ public struct TranscriptStore: Sendable {
     private func writeHistory(_ records: [TranscriptRecord]) throws {
         let data = try Self.encoder.encode(records)
         try data.write(to: historyURL, options: [.atomic])
+    }
+
+    func replaceHistory(_ records: [TranscriptRecord]) throws {
+        try ensureDirectory()
+        try writeHistory(records)
     }
 
     /// Dates go out as epoch milliseconds, not ISO-8601 strings. ISO-8601

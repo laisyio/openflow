@@ -2,6 +2,15 @@
 
 Measured 2026-09-15 in the release build, bundled SQLite 3.45.0.
 
+## Integration note — 2026-09-18
+
+The measurements below record the original timestamp-only index implementation.
+Main `c2593a8` adds deterministic `(created_at DESC, id DESC)` ordering and keyset
+pagination. The merged branch uses that single composite recency index, removes
+the obsolete timestamp-only index, and preserves migration/privacy tests. The
+opt-in benchmark now compares unindexed and composite-indexed queries; the old
+numbers below are not claimed as new composite-index measurements.
+
 ## Change
 
 The native tray, Dictate and History pages synchronously request recent rows.

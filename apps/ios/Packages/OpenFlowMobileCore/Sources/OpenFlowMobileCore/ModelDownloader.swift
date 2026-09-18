@@ -137,6 +137,7 @@ public actor ModelDownloader {
         case checksumMismatch(file: String, expected: String, actual: String)
         case cancelled
         case placeholderPin
+        case alreadyDownloading
     }
 
     public enum Progress: Sendable, Equatable {
@@ -152,6 +153,7 @@ public actor ModelDownloader {
 
     private let store: ModelStore
     private let session: URLSession
+    private var workTask: Task<Void, Never>?
 
     public init(store: ModelStore, session: URLSession = .shared) {
         self.store = store
@@ -169,15 +171,17 @@ public actor ModelDownloader {
     /// file in 1 MB pieces, so nothing large is ever held in memory.
     ///
     /// Verification is not optional and not a warning: a mismatch on any file
-    /// throws and takes the whole set with it, because the alternative is
-    /// running unknown weights on someone's voice.
+    /// throws without installing the set, because the alternative is running
+    /// unknown weights on someone's voice. Previously verified files remain
+    /// resumable; a file with a mismatched digest is never kept.
     ///
-    /// Files land in a sibling `.partial` directory and are moved across only
+    /// Files land in a unique sibling `.partial.UUID` directory and move across only
     /// once all three have passed. That is what makes an interrupted download
     /// safe to walk away from: the model directory either does not exist or is
     /// complete, and `isInstalled` never has to decide what a half a model means.
     ///
-    /// A failure removes the staging directory and **nothing else**. An install
+    /// A failure moves verified files to a resume cache and removes only its own
+    /// staging directory. An install
     /// that is already there is somebody's working recogniser, and a flaky
     /// network on a re-download is not a reason to take it away: they would be
     /// left unable to dictate by an operation they only started because they
@@ -185,80 +189,135 @@ public actor ModelDownloader {
     /// one point, after every file has been verified, when the replacement is
     /// two directory operations from done.
     public func download(pin: ModelPin) -> AsyncThrowingStream<Progress, Error> {
+        guard workTask == nil else {
+            return AsyncThrowingStream { $0.finish(throwing: DownloadError.alreadyDownloading) }
+        }
         let store = self.store
         let session = self.session
-        return AsyncThrowingStream { continuation in
+        return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(16)) { continuation in
             let work = Task {
                 let target = store.subdirectory(pin.subdirectory)
-                let staging = store.subdirectory(pin.subdirectory + ".partial")
+                let staging = store.subdirectory(pin.subdirectory + ".partial." + UUID().uuidString)
+                let resume = store.subdirectory(pin.subdirectory + ".resume")
+                let key = target.directory.standardizedFileURL.path
+                let owner = UUID()
+                var acquired = false
+                let result: Result<URL, Error>
                 do {
-                    guard !pin.files.contains(where: { $0.sha256 == Self.placeholderDigest }) else {
+                    try await Self.admission.acquire(key: key, owner: owner)
+                    acquired = true
+                    try Task.checkCancellation()
+                    guard !pin.files.isEmpty,
+                          !pin.files.contains(where: { $0.sha256 == Self.placeholderDigest }) else {
                         throw DownloadError.placeholderPin
                     }
                     try store.prepare()
-                    try staging.removeAll()
                     try staging.prepare()
-
+                    try resume.prepare()
                     let total = pin.expectedBytes
                     var finishedBytes: Int64 = 0
 
                     for file in pin.files {
+                        try Task.checkCancellation()
+                        if resume.exists(file.fileName),
+                           (try? resume.verify(file.fileName, sha256Hex: file.sha256)) != nil {
+                            try staging.install(from: resume.url(for: file.fileName), as: file.fileName)
+                            finishedBytes += file.expectedBytes
+                            continuation.yield(.downloading(received: finishedBytes, expected: total))
+                            continue
+                        }
                         let alreadyDone = finishedBytes
                         let observer = DownloadProgressObserver { received, _ in
-                            continuation.yield(
-                                .downloading(received: alreadyDone + received, expected: total)
-                            )
+                            continuation.yield(.downloading(received: alreadyDone + received, expected: total))
                         }
-                        let (temporary, response) = try await session.download(
-                            from: file.remote,
-                            delegate: observer
-                        )
+                        let resumeURL = resume.url(for: file.fileName + ".resume-data")
+                        let temporary: URL
+                        let response: URLResponse
+                        do {
+                            if let data = try? Data(contentsOf: resumeURL) {
+                                (temporary, response) = try await session.download(resumeFrom: data, delegate: observer)
+                            } else {
+                                (temporary, response) = try await session.download(from: file.remote, delegate: observer)
+                            }
+                            try? FileManager.default.removeItem(at: resumeURL)
+                        } catch {
+                            if let data = (error as NSError).userInfo["NSURLSessionDownloadTaskResumeData"] as? Data {
+                                try? data.write(to: resumeURL, options: .atomic)
+                            } else {
+                                // An expired/invalid system resume ticket should
+                                // fall back to a fresh transfer on the next try.
+                                try? FileManager.default.removeItem(at: resumeURL)
+                            }
+                            throw error
+                        }
+                        defer { try? FileManager.default.removeItem(at: temporary) }
                         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                            try? FileManager.default.removeItem(at: temporary)
                             throw DownloadError.badStatus(http.statusCode)
                         }
-                        if Task.isCancelled {
-                            try? FileManager.default.removeItem(at: temporary)
-                            throw DownloadError.cancelled
-                        }
-
+                        try Task.checkCancellation()
                         continuation.yield(.verifying(file: file.fileName))
                         let actual = try ModelStore.sha256Hex(ofFileAt: temporary)
                         guard actual.caseInsensitiveCompare(file.sha256) == .orderedSame else {
-                            try? FileManager.default.removeItem(at: temporary)
-                            throw DownloadError.checksumMismatch(
-                                file: file.fileName,
-                                expected: file.sha256.lowercased(),
-                                actual: actual
-                            )
+                            throw DownloadError.checksumMismatch(file: file.fileName,
+                                                                 expected: file.sha256.lowercased(), actual: actual)
                         }
-
+                        try Task.checkCancellation()
                         try staging.install(from: temporary, as: file.fileName)
                         finishedBytes += file.expectedBytes
                         continuation.yield(.downloading(received: finishedBytes, expected: total))
                     }
-
-                    // The only moment the installed set is touched: every file
-                    // is downloaded and verified, and the replacement is two
-                    // directory operations away from done.
+                    try Task.checkCancellation()
                     continuation.yield(.installing)
-                    try target.removeAll()
-                    try FileManager.default.moveItem(at: staging.directory, to: target.directory)
-                    continuation.yield(.finished(target.directory))
-                    continuation.finish()
-                } catch let error as DownloadError {
-                    try? staging.removeAll()
-                    continuation.finish(throwing: error)
-                } catch let error as ModelStore.StoreError {
-                    try? staging.removeAll()
-                    continuation.finish(throwing: error)
+                    try target.replaceDirectory(from: staging.directory)
+                    try? resume.removeAll()
+                    result = .success(target.directory)
                 } catch {
+                    // Only verified complete files ever enter staging. Keep them
+                    // for explicit Resume; each attempt otherwise owns its paths.
+                    if acquired {
+                        _ = try? resume.prepare()
+                        for file in pin.files where staging.exists(file.fileName) {
+                            try? resume.install(from: staging.url(for: file.fileName), as: file.fileName)
+                        }
+                    }
                     try? staging.removeAll()
-                    continuation.finish(throwing: DownloadError.transport(error.localizedDescription))
+                    if Task.isCancelled || error is CancellationError ||
+                        (error as? URLError)?.code == .cancelled {
+                        result = .failure(DownloadError.cancelled)
+                    } else if error is DownloadError || error is ModelStore.StoreError {
+                        result = .failure(error)
+                    } else {
+                        result = .failure(DownloadError.transport(error.localizedDescription))
+                    }
+                }
+                if acquired { await Self.admission.release(key: key, owner: owner) }
+                // Clear ownership before notifying the consumer, so a retry
+                // after completion cannot replace a still-running task handle.
+                self.workTask = nil
+                switch result {
+                case .success(let url):
+                    continuation.yield(.finished(url))
+                    continuation.finish()
+                case .failure(let error):
+                    continuation.finish(throwing: error)
                 }
             }
+            self.workTask = work
             continuation.onTermination = { _ in work.cancel() }
         }
+    }
+
+    private static let admission = ModelDownloadAdmission()
+
+    public func cancelAndWait() async {
+        let task = workTask
+        task?.cancel()
+        await task?.value
+    }
+
+    public func hasResumeData(pin: ModelPin) -> Bool {
+        let resume = store.subdirectory(pin.subdirectory + ".resume")
+        return pin.files.contains { resume.exists($0.fileName) || resume.exists($0.fileName + ".resume-data") }
     }
 
     /// Where the engine opens the model from. Valid whether or not it is
@@ -305,6 +364,20 @@ public actor ModelDownloader {
             guard (try? target.verify(file.fileName, sha256Hex: file.sha256)) != nil else { return false }
         }
         return true
+    }
+}
+
+/// Shared across downloader instances, so two sheets cannot mutate one model.
+private actor ModelDownloadAdmission {
+    private var owners: [String: UUID] = [:]
+
+    func acquire(key: String, owner: UUID) throws {
+        guard owners[key] == nil else { throw ModelDownloader.DownloadError.alreadyDownloading }
+        owners[key] = owner
+    }
+
+    func release(key: String, owner: UUID) {
+        if owners[key] == owner { owners[key] = nil }
     }
 }
 

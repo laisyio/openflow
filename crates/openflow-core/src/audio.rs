@@ -3,7 +3,9 @@ use cpal::{FromSample, SampleFormat, SizedSample};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 enum RecordCommand {
@@ -21,6 +23,7 @@ pub struct AudioDevice {
     pub is_default: bool,
 }
 
+#[derive(Clone)]
 pub struct AudioRecorder {
     cmd_tx: mpsc::Sender<RecordCommand>,
     /// The loudest sample of the most recent buffer, as `f32` bits.
@@ -101,10 +104,8 @@ impl AudioRecorder {
         let stream_truncated = Arc::clone(&truncated);
 
         thread::spawn(move || {
-            let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-            let mut native_sample_rate = 44_100;
             let mut active_stream: Option<cpal::Stream> = None;
-            let mut active_device_name = String::from("the default microphone");
+            let mut active_pipeline: Option<CapturePipeline> = None;
 
             for cmd in cmd_rx {
                 match cmd {
@@ -120,6 +121,7 @@ impl AudioRecorder {
                         if let Some(stream) = active_stream.take() {
                             let _ = stream.pause();
                         }
+                        active_pipeline = None;
                         let host = cpal::default_host();
                         let device = device_id
                             .as_ref()
@@ -147,8 +149,8 @@ impl AudioRecorder {
                                 continue;
                             }
                         };
-                        native_sample_rate = default_config.sample_rate().0;
-                        active_device_name = device
+                        let native_sample_rate = default_config.sample_rate().0;
+                        let active_device_name = device
                             .name()
                             .unwrap_or_else(|_| "the default microphone".to_string());
                         let config = cpal::StreamConfig {
@@ -156,13 +158,8 @@ impl AudioRecorder {
                             sample_rate: default_config.sample_rate(),
                             buffer_size: cpal::BufferSize::Default,
                         };
-                        match samples.lock() {
-                            Ok(mut buffer) => buffer.clear(),
-                            Err(_) => {
-                                let _ = reply.send(Err("Audio buffer is unavailable".to_string()));
-                                continue;
-                            }
-                        }
+                        let (sink, pipeline) =
+                            CapturePipeline::new(native_sample_rate, active_device_name.clone());
                         // A stale peak outlives the stream that wrote it, so
                         // clear it with the buffer rather than leaving the
                         // meter showing the end of the previous take. Same
@@ -174,21 +171,21 @@ impl AudioRecorder {
                             SampleFormat::F32 => build_input_stream::<f32>(
                                 &device,
                                 &config,
-                                samples.clone(),
+                                sink,
                                 Arc::clone(&stream_level),
                                 Arc::clone(&stream_truncated),
                             ),
                             SampleFormat::I16 => build_input_stream::<i16>(
                                 &device,
                                 &config,
-                                samples.clone(),
+                                sink,
                                 Arc::clone(&stream_level),
                                 Arc::clone(&stream_truncated),
                             ),
                             SampleFormat::U16 => build_input_stream::<u16>(
                                 &device,
                                 &config,
-                                samples.clone(),
+                                sink,
                                 Arc::clone(&stream_level),
                                 Arc::clone(&stream_truncated),
                             ),
@@ -201,6 +198,7 @@ impl AudioRecorder {
                             Ok(stream) => match stream.play() {
                                 Ok(()) => {
                                     active_stream = Some(stream);
+                                    active_pipeline = Some(pipeline);
                                     let _ = reply.send(Ok(()));
                                 }
                                 Err(error) => {
@@ -223,39 +221,22 @@ impl AudioRecorder {
                         };
                         let _ = stream.pause();
                         drop(stream);
-                        // Move the capture out and let it drop at the end of this arm.
-                        // `clear()` would keep the capacity, so one long take would pin
-                        // up to 230 MB (MAX_CAPTURE_SAMPLES of f32) for the life of the
-                        // app; taking it returns the memory to the allocator now.
-                        let samples_data = match samples.lock() {
-                            Ok(mut buffer) => std::mem::take(&mut *buffer),
-                            Err(_) => {
-                                let _ = reply.send(Err("Audio buffer is unavailable".to_string()));
-                                continue;
-                            }
-                        };
-                        let _ = reply.send(encode_stopped(
-                            &samples_data,
-                            native_sample_rate,
-                            &active_device_name,
-                        ));
+                        if let Some(pipeline) = active_pipeline.take() {
+                            pipeline.request(true, reply);
+                        } else {
+                            let _ = reply.send(Err("Audio processing is unavailable".to_string()));
+                        }
                     }
                     RecordCommand::Snapshot(reply) => {
                         if active_stream.is_none() {
                             let _ = reply.send(Err("No recording is active".to_string()));
                             continue;
                         }
-                        // Copy under the lock, do the work outside it. The
-                        // capture callback takes this same lock on a realtime
-                        // thread and must never wait on a downsample.
-                        let captured = match samples.lock() {
-                            Ok(buffer) => buffer.clone(),
-                            Err(_) => {
-                                let _ = reply.send(Err("Audio buffer is unavailable".to_string()));
-                                continue;
-                            }
-                        };
-                        let _ = reply.send(encode_partial(&captured, native_sample_rate));
+                        if let Some(pipeline) = &active_pipeline {
+                            pipeline.request(false, reply);
+                        } else {
+                            let _ = reply.send(Err("Audio processing is unavailable".to_string()));
+                        }
                     }
                 }
             }
@@ -398,6 +379,278 @@ fn audio_device_id(name: &str, occurrence: usize) -> String {
 /// recording *slot* after a lost key-up and does not stop this buffer filling.
 const MAX_CAPTURE_SAMPLES: usize = 48_000 * 60 * 20;
 
+const CAPTURE_BLOCK: usize = 4096;
+const CAPTURE_POOL: usize = 64;
+type AudioBlock = Box<[f32; CAPTURE_BLOCK]>;
+
+enum CaptureMessage {
+    Samples(AudioBlock, usize),
+    Read {
+        finish: bool,
+        reply: mpsc::Sender<Result<Vec<u8>, String>>,
+    },
+}
+
+/// The callback owns one preallocated block and never takes the DSP/history
+/// lock. Bounded channels recycle 1 MiB of storage for this capture; expensive
+/// resampling/percentiles/WAV writing run on the single consumer instead.
+struct CaptureSink {
+    ready: mpsc::SyncSender<CaptureMessage>,
+    recycled: mpsc::Receiver<AudioBlock>,
+    current: Option<AudioBlock>,
+    used: usize,
+    count: usize,
+    overrun: Arc<AtomicBool>,
+}
+
+impl CaptureSink {
+    fn flush(&mut self) {
+        if self.used == 0 {
+            return;
+        }
+        let Some(block) = self.current.take() else {
+            return;
+        };
+        if let Err(error) = self
+            .ready
+            .try_send(CaptureMessage::Samples(block, self.used))
+        {
+            let (mpsc::TrySendError::Full(message) | mpsc::TrySendError::Disconnected(message)) =
+                error;
+            if let CaptureMessage::Samples(block, _) = message {
+                self.current = Some(block);
+            }
+            self.overrun.store(true, Ordering::Relaxed);
+        }
+        self.used = 0;
+    }
+
+    fn capture<T>(&mut self, data: &[T], channels: usize, level: &AtomicU32, truncated: &AtomicBool)
+    where
+        T: SizedSample + Copy,
+        f32: FromSample<T>,
+    {
+        let peak = data
+            .iter()
+            .map(|sample| (*sample).to_sample::<f32>().abs())
+            .fold(0.0f32, f32::max);
+        level.store(peak.to_bits(), Ordering::Relaxed);
+        if channels == 0 {
+            return;
+        }
+        for frame in data.chunks(channels) {
+            if self.count >= MAX_CAPTURE_SAMPLES {
+                truncated.store(true, Ordering::Relaxed);
+                break;
+            }
+            if self.current.is_none() {
+                self.current = self.recycled.try_recv().ok();
+            }
+            let Some(block) = &mut self.current else {
+                // Do not silently transcribe a take with a missing middle.
+                self.overrun.store(true, Ordering::Relaxed);
+                break;
+            };
+            block[self.used] = mix_frame_to_mono(frame).unwrap_or(0.0);
+            self.used += 1;
+            self.count += 1;
+            if self.used == CAPTURE_BLOCK {
+                self.flush();
+            }
+        }
+        // No unfinished callback buffer is left behind when CPAL is stopped.
+        self.flush();
+    }
+}
+
+struct CapturePipeline {
+    ready: mpsc::SyncSender<CaptureMessage>,
+}
+
+impl CapturePipeline {
+    fn new(sample_rate: u32, device_name: String) -> (CaptureSink, Self) {
+        let (ready, messages) = mpsc::sync_channel(CAPTURE_POOL + 2);
+        let (recycle, recycled) = mpsc::sync_channel(CAPTURE_POOL);
+        for _ in 0..CAPTURE_POOL {
+            let _ = recycle.send(Box::new([0.0; CAPTURE_BLOCK]));
+        }
+        let overrun = Arc::new(AtomicBool::new(false));
+        let worker_overrun = Arc::clone(&overrun);
+        thread::spawn(move || {
+            let mut resampler = StreamingResampler::new(sample_rate, 16_000);
+            for message in messages {
+                match message {
+                    CaptureMessage::Samples(block, length) => {
+                        resampler.append(&block[..length], false);
+                        let _ = recycle.try_send(block);
+                    }
+                    CaptureMessage::Read { finish, reply } => {
+                        if finish {
+                            resampler.append(&[], true);
+                        }
+                        let result = if worker_overrun.load(Ordering::Relaxed) {
+                            Err("Audio processing could not keep up with the microphone. Please try a shorter take.".to_string())
+                        } else if resampler.output.len() < 800 {
+                            Err(if finish {
+                                "Recording too short."
+                            } else {
+                                "Not enough audio yet"
+                            }
+                            .to_string())
+                        } else {
+                            let level = speech_level(&resampler.output);
+                            if level < SILENCE_LEVEL {
+                                Err(if finish {
+                                    format!("No sound reached OpenFlow from \"{device_name}\". Pick a different microphone in Settings.")
+                                } else {
+                                    "Nothing to preview yet".to_string()
+                                })
+                            } else {
+                                // Gate and gain share one percentile; WAV writing
+                                // applies gain directly without another PCM copy.
+                                encode_wav_with_gain(
+                                    &resampler.output,
+                                    16_000,
+                                    gain_for_level(level),
+                                )
+                            }
+                        };
+                        let _ = reply.send(result);
+                        if finish {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        (
+            CaptureSink {
+                ready: ready.clone(),
+                recycled,
+                current: None,
+                used: 0,
+                count: 0,
+                overrun,
+            },
+            Self { ready },
+        )
+    }
+
+    fn request(&self, finish: bool, reply: mpsc::Sender<Result<Vec<u8>, String>>) {
+        if let Err(error) = self.ready.send(CaptureMessage::Read { finish, reply }) {
+            if let CaptureMessage::Read { reply, .. } = error.0 {
+                let _ = reply.send(Err("Audio processing stopped".to_string()));
+            }
+        }
+    }
+}
+
+/// Incremental form of the existing FIR/interpolator. Only the filter's tail
+/// stays at the native rate; completed 16 kHz output is reused by every preview.
+struct StreamingResampler {
+    from_rate: u32,
+    to_rate: u32,
+    ratio: f64,
+    taps: Vec<f32>,
+    input: Vec<f32>,
+    input_start: usize,
+    total_input: usize,
+    output: Vec<f32>,
+}
+
+impl StreamingResampler {
+    fn new(from_rate: u32, to_rate: u32) -> Self {
+        Self {
+            from_rate,
+            to_rate,
+            ratio: from_rate as f64 / to_rate.max(1) as f64,
+            taps: if from_rate > to_rate {
+                design_lowpass(0.45 * to_rate as f32, from_rate as f32, FIR_TAPS)
+            } else {
+                Vec::new()
+            },
+            input: Vec::with_capacity(CAPTURE_BLOCK + FIR_TAPS * 2),
+            input_start: 0,
+            total_input: 0,
+            output: Vec::new(),
+        }
+    }
+
+    fn sample(&self, index: usize) -> f32 {
+        self.input
+            .get(index.wrapping_sub(self.input_start))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    fn append(&mut self, samples: &[f32], finish: bool) {
+        if self.from_rate == 0 || self.to_rate == 0 {
+            return;
+        }
+        if self.from_rate == self.to_rate {
+            self.output.extend_from_slice(samples);
+            self.total_input += samples.len();
+            return;
+        }
+        self.input.extend_from_slice(samples);
+        self.total_input += samples.len();
+        let target = (self.total_input as f64 / self.ratio) as usize;
+        let half = self.taps.len() / 2;
+        while self.output.len() < target {
+            let position = self.output.len() as f64 * self.ratio;
+            let center = position as usize;
+            let value = if self.from_rate < self.to_rate {
+                if !finish && center + 1 >= self.total_input {
+                    break;
+                }
+                let left = self.sample(center);
+                let right = self.sample((center + 1).min(self.total_input.saturating_sub(1)));
+                left + (right - left) * (position - center as f64) as f32
+            } else {
+                if !finish && center + half >= self.total_input {
+                    break;
+                }
+                // The input tail has an absolute offset. Check the complete
+                // window once, keeping the original left-to-right f32 sum;
+                // only boundary windows need per-tap lookup and zero padding.
+                let window = center
+                    .checked_sub(half)
+                    .and_then(|start| start.checked_sub(self.input_start))
+                    .and_then(|start| self.input.get(start..))
+                    .and_then(|remaining| remaining.get(..self.taps.len()));
+                if let Some(window) = window {
+                    window
+                        .iter()
+                        .zip(&self.taps)
+                        .map(|(sample, tap)| sample * tap)
+                        .sum()
+                } else {
+                    self.taps
+                        .iter()
+                        .enumerate()
+                        .map(|(k, tap)| {
+                            let index = center as isize + k as isize - half as isize;
+                            if index < 0 {
+                                0.0
+                            } else {
+                                self.sample(index as usize) * tap
+                            }
+                        })
+                        .sum()
+                }
+            };
+            self.output.push(value);
+        }
+        let next = (self.output.len() as f64 * self.ratio) as usize;
+        let keep_from = next.saturating_sub(half);
+        let consumed = keep_from
+            .saturating_sub(self.input_start)
+            .min(self.input.len());
+        self.input.drain(..consumed);
+        self.input_start += consumed;
+    }
+}
+
 /// What the user is told when a take ended at [`MAX_CAPTURE_SAMPLES`].
 ///
 /// It names no duration, because the ceiling has none: the same constant is 20
@@ -415,7 +668,7 @@ Everything spoken before that point is still here.";
 fn build_input_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    samples: Arc<Mutex<Vec<f32>>>,
+    mut sink: CaptureSink,
     level: Arc<AtomicU32>,
     truncated: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, String>
@@ -428,14 +681,7 @@ where
         .build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
-                handle_capture_buffer(
-                    data,
-                    channels,
-                    &samples,
-                    &level,
-                    &truncated,
-                    MAX_CAPTURE_SAMPLES,
-                );
+                sink.capture(data, channels, &level, &truncated);
             },
             |error| eprintln!("Audio stream error: {}", error),
             None,
@@ -456,6 +702,7 @@ where
 /// Lifted out of the stream closure so both halves can be measured against a
 /// stand-in `limit`, without a microphone and without allocating the 230 MB
 /// the real ceiling asks for.
+#[cfg(test)]
 fn handle_capture_buffer<T>(
     data: &[T],
     channels: usize,
@@ -486,6 +733,7 @@ fn handle_capture_buffer<T>(
 /// Returns the number of frames that did not fit. Split out of the callback so
 /// what happens at the ceiling can be measured without a microphone and without
 /// allocating the 230 MB the real limit asks for.
+#[cfg(test)]
 fn append_mono_frames<T>(output: &mut Vec<f32>, data: &[T], channels: usize, limit: usize) -> usize
 where
     T: SizedSample + Copy,
@@ -538,6 +786,7 @@ const MAX_GAIN: f32 = 20.0;
 /// Measured across clean speech / speech+transient / speech+2s leading silence,
 /// this holds the gain within ~18% (4.38 / 4.21 / 5.06) where the peak rule
 /// swings 10.31 / 1.00 / 10.31 and plain RMS swings 6.90 / 1.76 / 8.90.
+#[cfg(test)]
 fn apply_gain(samples: &mut [f32], level: f32) {
     if level < 1e-4 {
         return;
@@ -551,6 +800,9 @@ fn apply_gain(samples: &mut [f32], level: f32) {
 /// Gate and boost the already-owned resampled take using one percentile
 /// selection. The magnitude scratch buffer is gone before the in-place gain
 /// and WAV encoding; no second p95 scratch or boosted-sample copy is needed.
+/// Historical batch fixture only: live capture uses CapturePipeline and writes
+/// gain directly into the WAV without mutating its reusable preview samples.
+#[cfg(test)]
 fn gain_if_audible(samples: &mut [f32]) -> bool {
     let level = speech_level(samples);
     if level < SILENCE_LEVEL {
@@ -566,6 +818,14 @@ fn auto_gain(samples: &[f32]) -> Vec<f32> {
     let mut gained = samples.to_vec();
     apply_gain(&mut gained, level);
     gained
+}
+
+fn gain_for_level(level: f32) -> f32 {
+    if level < 1e-4 {
+        1.0
+    } else {
+        (TARGET_PEAK / level).clamp(1.0, MAX_GAIN)
+    }
 }
 
 /// 95th percentile of |sample|: the level of the loud part of a take, which
@@ -634,6 +894,7 @@ fn design_lowpass(cutoff_hz: f32, sample_rate: f32, num_taps: usize) -> Vec<f32>
 /// right on top of the voice. Measured, plain decimation and linear
 /// interpolation both leave the alias at -0.0 dB; filtering first drops it to
 /// -60 dB while the passband below 6 kHz stays within 0.1 dB.
+#[cfg(test)]
 fn downsample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate {
         return samples.to_vec();
@@ -706,6 +967,7 @@ fn downsample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 /// `stop` and `snapshot` share it so a preview of the first N seconds is the
 /// same audio the final pass will see for those seconds -- a preview that
 /// drifted from the take would show text the user never gets.
+#[cfg(test)]
 fn prepare_take(captured: &[f32], native_sample_rate: u32) -> Option<Vec<f32>> {
     let mono_16k = downsample(captured, native_sample_rate, 16_000);
     (mono_16k.len() >= 800).then_some(mono_16k)
@@ -726,6 +988,7 @@ fn prepare_take(captured: &[f32], native_sample_rate: u32) -> Option<Vec<f32>> {
 ///
 /// The caller treats every `Err` here as a reading skipped, so a silent window
 /// costs one update of a preview and nothing else.
+#[cfg(test)]
 fn encode_partial(captured: &[f32], native_sample_rate: u32) -> Result<Vec<u8>, String> {
     let Some(mut mono_16k) = prepare_take(captured, native_sample_rate) else {
         return Err("Not enough audio yet".to_string());
@@ -736,8 +999,9 @@ fn encode_partial(captured: &[f32], native_sample_rate: u32) -> Result<Vec<u8>, 
     encode_wav(&mono_16k, 16_000)
 }
 
-/// The stop encoder is separate from device control so its exact user-facing
-/// errors and audio bytes can be checked without opening a microphone.
+/// Historical batch stop encoder retained for the original equivalence tests
+/// and benchmarks. Live stop requests are handled by CapturePipeline.
+#[cfg(test)]
 fn encode_stopped(
     captured: &[f32],
     native_sample_rate: u32,
@@ -757,20 +1021,25 @@ fn encode_stopped(
     encode_wav(&mono_16k, 16_000)
 }
 
+#[cfg(test)]
 fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, String> {
+    encode_wav_with_gain(samples, sample_rate, 1.0)
+}
+
+fn encode_wav_with_gain(samples: &[f32], sample_rate: u32, gain: f32) -> Result<Vec<u8>, String> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut wav_buffer = Vec::new();
+    let mut wav_buffer = Vec::with_capacity(samples.len().saturating_mul(2).saturating_add(64));
     {
         let cursor = std::io::Cursor::new(&mut wav_buffer);
         let mut writer =
             hound::WavWriter::new(cursor, spec).map_err(|error| format!("WAV error: {}", error))?;
         for sample in samples {
-            let value = (sample * 32_767.0).clamp(-32_768.0, 32_767.0) as i16;
+            let value = (sample * gain * 32_767.0).clamp(-32_768.0, 32_767.0) as i16;
             writer
                 .write_sample(value)
                 .map_err(|error| format!("WAV write failed: {}", error))?;
@@ -802,6 +1071,97 @@ mod resample_perf_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_resampling_matches_batch_at_block_edges_and_rate_changes() {
+        let samples: Vec<f32> = (0..10007).map(|i| (i as f32 * 0.071).sin() * 0.1).collect();
+        for rate in [8000, 11025, 16000, 44100, 48000, 96000] {
+            let expected = downsample(&samples, rate, 16000);
+            for size in [31, 257, 4096] {
+                let mut incremental = StreamingResampler::new(rate, 16000);
+                for block in samples.chunks(size) {
+                    incremental.append(block, false);
+                }
+                incremental.append(&[], true);
+                assert_eq!(
+                    incremental.output.len(),
+                    expected.len(),
+                    "rate {rate}, block {size}"
+                );
+                let error = incremental
+                    .output
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(error < 1e-6, "rate {rate}, block {size}, error {error}");
+                assert!(
+                    incremental.input.len() <= FIR_TAPS * 2,
+                    "native-rate history must stay bounded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn capture_pipeline_snapshots_do_not_consume_the_final_take() {
+        let (mut sink, pipeline) = CapturePipeline::new(16000, "fixture".to_string());
+        let level = AtomicU32::new(0);
+        let truncated = AtomicBool::new(false);
+        sink.capture(&[0.1f32; 1600], 1, &level, &truncated);
+        let (reply, result) = mpsc::channel();
+        pipeline.request(false, reply);
+        let partial = result
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        sink.capture(&[0.1f32; 1600], 1, &level, &truncated);
+        drop(sink);
+        let (reply, result) = mpsc::channel();
+        pipeline.request(true, reply);
+        let final_take = result
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(wav_duration_ms(&partial), Some(100));
+        assert_eq!(wav_duration_ms(&final_take), Some(200));
+        let decode = |wav: &[u8]| {
+            hound::WavReader::new(std::io::Cursor::new(wav))
+                .unwrap()
+                .samples::<i16>()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(decode(&partial), decode(&final_take)[..1600]);
+        assert!(!truncated.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn exhausted_capture_pool_reports_overrun_instead_of_blocking_or_allocating() {
+        let (ready, queued) = mpsc::sync_channel(4);
+        let (recycle, recycled) = mpsc::sync_channel(2);
+        for _ in 0..2 {
+            recycle.send(Box::new([0.0; CAPTURE_BLOCK])).unwrap();
+        }
+        let overrun = Arc::new(AtomicBool::new(false));
+        let mut sink = CaptureSink {
+            ready,
+            recycled,
+            current: None,
+            used: 0,
+            count: 0,
+            overrun: Arc::clone(&overrun),
+        };
+        sink.capture(
+            &vec![0.1f32; CAPTURE_BLOCK * 3],
+            1,
+            &AtomicU32::new(0),
+            &AtomicBool::new(false),
+        );
+        assert!(overrun.load(Ordering::Relaxed));
+        assert_eq!(queued.try_iter().count(), 2);
+        assert_eq!(sink.count, CAPTURE_BLOCK * 2);
+    }
 
     /// The ceiling is a count of mono frames, so the length it buys depends on
     /// what the device hands back. 48 kHz is the only rate it was sized for.

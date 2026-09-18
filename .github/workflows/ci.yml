@@ -26,6 +26,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - run: npm test
       - run: npm run audit:dependencies
 
   macos-tests:
@@ -96,6 +97,16 @@ jobs:
         run: |
           test -f test_runner.py
           python3 -m unittest discover --verbose
+
+  eval-metrics:
+    name: Evaluation scoring regressions
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s evals -p 'test_*.py' --verbose
 
   desktop-build:
     name: Desktop build (${{ matrix.os }})

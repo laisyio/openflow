@@ -10,8 +10,30 @@ Impact: `crates/openflow-native`, `crates/openflow-core/{src/agreement.rs,src/au
 
 - A native, editorial-style home puts setup, history, providers and privacy one click away. Guided onboarding makes local versus cloud processing explicit, checks provider access, explains installation and permissions, and preserves the user's choice about history. Local-only connection checks allow loopback services without allowing hosted or LAN endpoints.
 - Refined Settings, History and Plugins layouts retain native controls, keyboard behavior, accessible labels and light/dark appearances. A synthetic AppKit snapshot harness exercises layouts without opening a microphone, reading personal history or contacting a provider.
-- History uses a timestamp-only index and cached row text, while the home preview reads a bounded portion of a transcript and retains the full copy payload.
-- Agreement scoring skips shared token edges; audio preparation reuses the loudness calculation and owned buffer; resampling skips redundant interior bounds checks without changing filter arithmetic. Synthetic equivalence tests preserve existing scores and audio output. Release benchmarks, independent review rounds and testing limits are recorded in the validation documents; these are component measurements, not claims about cloud response time.
+- History uses the composite recency index from the parallel performance work and cached row text, while the home preview reads a bounded portion of a transcript and retains the full copy payload. Migration removes the superseded timestamp-only index without changing history or privacy settings.
+- Agreement scoring skips shared token edges; audio preparation shares the loudness calculation and writes gain directly into WAV output; incremental resampling skips redundant interior bounds checks without changing filter arithmetic. Synthetic equivalence tests preserve scores and audio output. Original batch-pipeline benchmarks, independent review rounds, upstream integration notes and testing limits are recorded in the validation documents; historical component timings are not measurements of the merged streaming pipeline or cloud response time.
+
+### Performance, cancellation and a multi-speaker evaluation
+By: Codex, with parallel implementation and independent review
+Impact: shared Rust core, native AppKit UI, Tauri playback, iOS lifecycle, CI and `evals/`
+
+- Background/coalesced Settings and history work, ordered capture/insertion,
+  deterministic indexed history with a keyset API, cached overlay layout.
+- Bounded local inference/upload admission with final priority and cancellation,
+  low-copy multipart parsing, incremental pooled capture DSP, cancellable plugin
+  execution with a total budget and Unix descendant cleanup.
+- Hashed runtime generations and exact model snapshots; one bounded Tauri speech
+  session; raw-byte native speech ingress and anonymous seekable storage.
+- Independent iOS recording ceiling, owned sessions/model leases, safe model
+  switching, actual download cancellation/resume and serialized history work.
+  Added real-controller host tests and Release/Simulator CI gates.
+- Checked-in licensed human speech from 12 readers plus generated stress,
+  long-form, multilingual and non-speech cases: 48 clips, four models and 576
+  warm recognition calls in the first full run. Raw results and real Rust
+  dictionary post-pass results are separate; no reference hints reach models.
+- See [implementation and limits](docs/performance-fixes-2026-09-10.md) and
+  [evaluation methodology/results](evals/README.md). Hardware/OS validation is
+  explicit; package tests are not claimed as an iPhone release verification.
 
 ### Benchmark: Cohere Transcribe measured
 By: Titan (with Claude)

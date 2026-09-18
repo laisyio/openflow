@@ -69,6 +69,77 @@ fn fixture(length: usize) -> Vec<f32> {
         .collect()
 }
 
+// The upstream streaming filter's original per-tap lookup, evaluated against
+// the captured prefix. Unlike the batch oracle it sums padded zero terms too.
+fn reference_streamed(input: &[f32], rate: u32, finish: bool) -> Vec<f32> {
+    let taps = design_lowpass(0.45 * 16_000.0, rate as f32, FIR_TAPS);
+    let half = taps.len() / 2;
+    let ratio = rate as f64 / 16_000.0;
+    (0..(input.len() as f64 / ratio) as usize)
+        .map(|i| (i as f64 * ratio) as usize)
+        .take_while(|center| finish || center + half < input.len())
+        .map(|center| {
+            taps.iter()
+                .enumerate()
+                .map(|(k, tap)| {
+                    let index = center as isize + k as isize - half as isize;
+                    if index < 0 {
+                        0.0
+                    } else {
+                        input.get(index as usize).copied().unwrap_or(0.0) * tap
+                    }
+                })
+                .sum()
+        })
+        .collect()
+}
+
+#[test]
+fn streaming_fast_windows_preserve_upstream_bits_after_tail_compaction() {
+    for input in [fixture(4097), vec![-0.0; 129], {
+        let mut impulse = vec![0.0; 129];
+        impulse[0] = 1.0;
+        impulse[64] = -1.0;
+        impulse[128] = 1.0;
+        impulse
+    }] {
+        for rate in [44_100, 48_000, 96_000] {
+            for block in [1, 31, 63, 257, 4096] {
+                let mut streamed = StreamingResampler::new(rate, 16_000);
+                let mut consumed = 0;
+                for chunk in input.chunks(block) {
+                    streamed.append(chunk, false);
+                    consumed += chunk.len();
+                    let expected = reference_streamed(&input[..consumed], rate, false);
+                    assert_eq!(
+                        streamed
+                            .output
+                            .iter()
+                            .map(|s| s.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+                        "rate={rate}, block={block}, consumed={consumed}"
+                    );
+                }
+                streamed.append(&[], true);
+                let expected = reference_streamed(&input, rate, true);
+                assert_eq!(
+                    streamed
+                        .output
+                        .iter()
+                        .map(|s| s.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    encode_wav_with_gain(&streamed.output, 16_000, 2.0),
+                    encode_wav_with_gain(&expected, 16_000, 2.0)
+                );
+            }
+        }
+    }
+}
+
 fn assert_same_bits(input: &[f32], from: u32, to: u32) {
     let actual = downsample(input, from, to);
     let expected = reference_downsample(input, from, to);

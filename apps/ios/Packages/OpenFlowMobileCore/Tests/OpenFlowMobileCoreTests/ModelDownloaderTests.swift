@@ -159,7 +159,7 @@ import Testing
         }
         #expect(await downloader.isInstalled(pin: pin))
         #expect(progress.last == .finished(installed.directory))
-        #expect(await downloader.directory(for: pin) == installed.directory)
+        #expect(downloader.directory(for: pin) == installed.directory)
 
         // Nothing is left in the staging directory the install moved across.
         let partial = store.subdirectory(pin.subdirectory + ".partial")
@@ -496,5 +496,95 @@ import Testing
         #expect(progress.isEmpty, "a placeholder pin must not start a download")
         #expect(error as? ModelDownloader.DownloadError == .placeholderPin)
         #expect(!FileManager.default.fileExists(atPath: store.subdirectory(pin.subdirectory).directory.path))
+    }
+
+    @Test func resumeReusesVerifiedFilesWithoutRequestingThemAgain() async throws {
+        let store = ModelStore(directory: temporaryDirectory().appendingPathComponent("Models"))
+        let (pin, served) = try makeServedSet(subdirectory: "moonshine/resume", contents: [
+            (name: "encoder", body: "verified encoder"), (name: "decoder", body: "decoder")
+        ])
+        try FileManager.default.removeItem(at: served.appendingPathComponent("decoder"))
+        let downloader = ModelDownloader(store: store)
+        #expect(await run(downloader, pin).error != nil)
+        #expect(await downloader.hasResumeData(pin: pin))
+        try FileManager.default.removeItem(at: served.appendingPathComponent("encoder"))
+        try Data("decoder".utf8).write(to: served.appendingPathComponent("decoder"))
+        #expect(await run(downloader, pin).error == nil, "the encoder is now available only in the resume cache")
+        #expect(await downloader.isInstalled(pin: pin))
+        #expect(!(await downloader.hasResumeData(pin: pin)))
+    }
+
+    @Test func concurrentDownloadIsRejectedAndCancellationReleasesAdmission() async throws {
+        let store = ModelStore(directory: temporaryDirectory().appendingPathComponent("Models"))
+        let (pin, _) = try makeServedSet(subdirectory: "moonshine/concurrent", contents: [(name: "weights", body: "weights")])
+        let url = URL(string: "https://download-fixture.invalid/\(UUID().uuidString)")!
+        let suspended = ModelDownloader.ModelPin(subdirectory: pin.subdirectory, files: [
+            ModelDownloader.Pin(fileName: "weights", remote: url, sha256: pin.files[0].sha256, expectedBytes: 7)
+        ])
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SuspendedDownloadProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let first = ModelDownloader(store: store, session: session)
+        let running = Task { await run(first, suspended) }
+        await waitUntil("download requested") { SuspendedDownloadProtocol.count(url, stopped: false) > 0 }
+        #expect(await run(first, pin).error as? ModelDownloader.DownloadError == .alreadyDownloading,
+                "a duplicate attempt must not replace the first attempt's cancellation handle")
+        let second = ModelDownloader(store: store)
+        #expect(await run(second, pin).error as? ModelDownloader.DownloadError == .alreadyDownloading)
+        await first.cancelAndWait()
+        _ = await running.value
+        await waitUntil("transport cancelled") { SuspendedDownloadProtocol.count(url, stopped: true) > 0 }
+        #expect(await run(second, pin).error == nil)
+        #expect(await second.isInstalled(pin: pin))
+        let contents = try FileManager.default.contentsOfDirectory(atPath: store.subdirectory("moonshine").directory.path)
+        #expect(!contents.contains { $0.contains(".partial.") })
+    }
+
+    @MainActor
+    @Test func downloadControllerCancelsTransportAndReopenedScreenDetectsInstall() async throws {
+        let store = ModelStore(directory: temporaryDirectory().appendingPathComponent("Models"))
+        let (pin, _) = try makeServedSet(subdirectory: "moonshine/screen", contents: [(name: "weights", body: "weights")])
+        let url = URL(string: "https://download-fixture.invalid/\(UUID().uuidString)")!
+        let suspended = ModelDownloader.ModelPin(subdirectory: pin.subdirectory, files: [
+            ModelDownloader.Pin(fileName: "weights", remote: url, sha256: pin.files[0].sha256, expectedBytes: 7)
+        ])
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SuspendedDownloadProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = ModelDownloadController(downloader: ModelDownloader(store: store, session: session), pin: suspended)
+        controller.start()
+        controller.start()
+        await waitUntil("screen requested transfer") { SuspendedDownloadProtocol.count(url, stopped: false) > 0 }
+        await controller.cancel()
+        #expect(controller.phase == .idle)
+        #expect(SuspendedDownloadProtocol.count(url, stopped: false) == 1)
+        let installer = ModelDownloader(store: store)
+        #expect(await run(installer, pin).error == nil)
+        let reopened = ModelDownloadController(downloader: installer, pin: pin)
+        await reopened.refresh()
+        #expect(reopened.phase == .installed)
+    }
+}
+
+private final class SuspendedDownloadProtocol: URLProtocol, @unchecked Sendable {
+    private final class Counts: @unchecked Sendable {
+        let lock = NSLock()
+        var values: [String: Int] = [:]
+    }
+    private static let counts = Counts()
+    static func count(_ url: URL, stopped: Bool) -> Int {
+        counts.lock.withLock { counts.values[url.absoluteString + (stopped ? "stop" : "start"), default: 0] }
+    }
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "download-fixture.invalid" }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        guard let url = request.url else { return }
+        Self.counts.lock.withLock { Self.counts.values[url.absoluteString + "start", default: 0] += 1 }
+    }
+    override func stopLoading() {
+        guard let url = request.url else { return }
+        Self.counts.lock.withLock { Self.counts.values[url.absoluteString + "stop", default: 0] += 1 }
     }
 }

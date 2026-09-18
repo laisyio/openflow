@@ -211,7 +211,7 @@ import Testing
     /// channel, all of the same length.
     private func mix(into buffer: CaptureBuffer, channels: [[Float]]) {
         let frames = channels[0].count
-        var storage = channels.map { _ in UnsafeMutablePointer<Float>.allocate(capacity: frames) }
+        let storage = channels.map { _ in UnsafeMutablePointer<Float>.allocate(capacity: frames) }
         defer { for pointer in storage { pointer.deallocate() } }
         for (index, channel) in channels.enumerated() {
             channel.withUnsafeBufferPointer { storage[index].update(from: $0.baseAddress!, count: frames) }
@@ -225,29 +225,12 @@ import Testing
         }
     }
 
-    /// The ceiling message and the ring have to agree about which half of the
-    /// take is gone, and the message is only correct while the ring keeps the
-    /// newest samples, so the behaviour is re-measured here rather than assumed.
-    ///
-    /// The desktop's version of this test asserts the opposite end, and that is
-    /// not a contradiction: it drops arriving frames and keeps the opening,
-    /// while a ring overwrites the opening and keeps the close.
-    @Test func testTheCeilingNoticeSaysWhichHalfWasLost() {
-        var ring = CaptureRingBuffer(capacity: 4)
-        ring.append([1, 2, 3, 4])
-        ring.append([5, 6])
-        #expect(ring.didOverflow, "the ceiling was reached")
-        #expect(ring.snapshot() == [3, 4, 5, 6], "the close survives, so the beginning is what is missing")
-        #expect(
-            CaptureRingBuffer.ceilingNotice.contains("the beginning of it was not kept"),
-            "the notice has to name the half the user cannot infer: \(CaptureRingBuffer.ceilingNotice)"
-        )
+    @Test func testTheCeilingNoticeMatchesTheCaptureLimit() {
+        let buffer = CaptureBuffer(inputRate: 16_000, capacity: 4)
+        buffer.write(mono: [1, 2, 3, 4, 5, 6])
+        #expect(buffer.finish().samples == [1, 2, 3, 4])
+        #expect(CaptureRingBuffer.ceilingNotice.contains("Everything recorded up to that point was kept"))
     }
-
-    /// No figure in the sentence. Ten minutes is `maxSeconds` today and a number
-    /// in the copy is one more place to forget when that moves, so the assertion
-    /// is "no digit" rather than "not the word minutes": "10 min" walks straight
-    /// past the latter.
     @Test func testTheCeilingNoticeNamesNoDuration() {
         #expect(
             CaptureRingBuffer.ceilingNotice.first(where: { $0.isNumber }) == nil,

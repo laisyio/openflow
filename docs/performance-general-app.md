@@ -190,8 +190,25 @@ cargo test -p openflow-core --release --offline audio::resample_perf_tests::benc
   the user to grant macOS microphone/accessibility permission again.
 - The optimization pass ended without commits, pushes or a pull request; publication is a separate follow-up.
 
-## Separate follow-up observation
+## Integration with upstream incremental capture — 2026-09-18
+
+Conflict resolution against main `c2593a8` preserves its pooled incremental
+`CapturePipeline`, bounded resampler tail and gain-during-WAV encoding. The older
+batch encoders remain test-only fixtures, so the gain/FIR timing tables above
+record the original implementation cycles, not new measurements of the merged
+live capture pipeline. Agreement measurements are unaffected.
+
+The complete-window FIR optimization is also applied to the live streaming
+resampler, accounting for the absolute offset of its retained tail. A new exact
+bit-pattern oracle checks every incremental prefix and final flush for 44.1/48/96
+kHz, chunks of 1/31/63/257/4096 samples, signed zeros and impulses; final WAV bytes
+are compared too. No new streaming speedup is claimed without measurement.
+
+## Separate follow-up observation (historical)
 
 Read-only scouting noticed nonstreaming speech responses are size-checked after
 `response.bytes()` has buffered them. A bounded response collector deserves a
 separate robustness fix. It is not counted as a completed optimization here.
+The later upstream merge includes bounded speech-response collection; the
+observation above describes the original performance pass, not an outstanding
+finding against the merged branch.
