@@ -58,26 +58,31 @@ Notes.
 - Licensing: the English models are MIT; the non-English models are under the non-commercial Moonshine Community License, which the downloader warns about. English only is fine for OpenFlow; a multilingual local mode would need Qwen or Cohere.
 - Memory caveat: `ru_maxrss` after one transcription; the first-loaded model in a process also pays the ONNX Runtime and Python overhead (about 28 MB before load).
 
-### Cohere Transcribe 03-2026 (2B, Apache-2.0): not measured
+### Cohere Transcribe 03-2026 (2B, Apache-2.0): measured 2026-09-10
 
-Three attempts through mlx-audio 0.5.1, which ships a `cohere_asr` model class, all produced multilingual token soup at about 3.4 s warm and 4.4 to 6.2 GB peak memory:
+Through the canonical `CohereLabs/cohere-transcribe-03-2026` weights (gated on Hugging Face; Titan accepted the terms), mlx-audio 0.5.3, same M4. The community MLX checkpoints tried on 2026-09-03 were laid out for other runtimes and loaded with a third of the parameters missing; that failure is recorded in the CHANGELOG of PR #27 and is why the canonical weights were needed.
 
-- `mlx-community/cohere-transcribe-03-2026-mlx-8bit`: an artifact for a different runtime (`mlx-speech`), stored as 4.13 GB of bf16 tensors under a config that claims 8-bit affine quantization, so mlx-audio quantized the layers and then loaded nothing into them.
-- The same files with the quantization block removed: still garbage.
-- `beshkenadze/cohere-transcribe-03-2026-mlx-8bit`: converted for mlx-audio-swift with 128 fused qkv tensors and different key names. Loading non-strict left 662 of 2486 parameters at random init (the whole `pre_encode` conv stack among them) and ignored 797 checkpoint tensors.
+Clip: `take-say.wav`, the reference sentence spoken by the macOS Samantha voice (the original human clip was lost to a temp-directory purge), 8.5 s, 16 kHz. Qwen numbers below are re-measured on the same clip in the same run, so the comparison is like for like; Moonshine base-en on this clip is 0.43 s through the Python package.
 
-The loader in mlx-audio expects the canonical Hugging Face layout and converts on the fly, and the canonical repo `CohereLabs/cohere-transcribe-03-2026` is gated (HTTP 401 without an accepted-terms token). Measuring it needs a Hugging Face login that has accepted Cohere's terms; then it is one command:
+| | Cohere Transcribe bf16 (as published) | Cohere Transcribe 8-bit (`mlx.nn.quantize`, group 64, in memory) | Qwen3-ASR-0.6B-8bit | Qwen3-ASR-1.7B-8bit |
+|---|---|---|---|---|
+| Warm inference, 8.5 s clip | 0.48 s (min 0.475) | 0.46 s (min 0.426) | 0.46 s (min 0.444) | 1.10 s (min 1.054) |
+| First inference after load | 12.7 s (Metal compile of 48 encoder layers) | 1.31 s (compile already done in that process) | 0.96 s | 1.14 s |
+| Load, fresh process, files cached | 3.8 s | not measured (needs a saved 8-bit checkpoint) | 2.3 s | 2.4 s |
+| Active memory while resident | 4.18 GB | 2.48 GB | 1.7 GB peak in this run | 3.3 GB peak in this run |
+| Weights on disk | 4.13 GB bf16 | about 2.1 GB once saved | 969 MB | 699 MB |
+| Transcript | "the Entro Lie leaderboard, ah, needs the FastPay Ledger fixed. Scratch that, needs the FastPay Ledger checked before Thursday." | identical to bf16 | "the entro lie leaderboard. Ah, needs the fast pay ledger fixed." | "the entroli leaderboard ah needs the fast pay ledger fixed." |
 
-```
-./mlxenv/bin/python bench_qwen.py take.wav CohereLabs/cohere-transcribe-03-2026
-```
+What that says.
 
-Published figures for context only, not measured here: Cohere reports 5.42% average WER on the Open ASR leaderboard (Qwen3-ASR-1.7B 5.76%, Whisper large-v3 7.44%), and the community 8-bit conversion reports 2.87 GB peak memory on Apple silicon. Expect it in the Qwen 1.7B class for cost, with a 4 GB fp16 or 2.3 GB int8 download, so it competes for the "accurate" slot, not the "fast" one.
+- Cohere at 8-bit costs what Qwen 1.7B costs (2.5 GB resident) and runs at Qwen 0.6B speed, 2.4 times faster than the 1.7B it would replace in the accurate tier.
+- It is the only local engine that produced "FastPay" with its casing, and the only one that heard "entro" rather than "intro". Its punctuation and capitalisation are the closest to the Groq output. The dictionary post-pass still has to turn "Entro Lie" into "entro.ly".
+- The first-inference Metal compile is 12.7 s in a fresh process. The runner's prewarm-on-record hides a 3 s load; it does not hide 12.7 s. Shipping Cohere means either a warm-up inference right after load (the runner does one at prewarm time, so the user pays it once per load, while speaking) or accepting a slow first take. Measure the compile once a saved 8-bit checkpoint exists; it may be shorter with quantized layers.
+- The published weights are bf16 and the repo is gated. For the runner to download them, the user would need a Hugging Face login that has accepted Cohere's terms, which is not a dictation-app onboarding step. The licence is Apache-2.0, so the fix is to publish an 8-bit conversion in mlx-audio's own layout under an ungated repo of ours and pin it, the way the Qwen repos are pinned today. That conversion is the first task of any Cohere tier, and this measurement is the reason to do it.
 
-## Recommendation, revised
+## Recommendation, revised (2026-09-10)
 
-- Keep Qwen3-ASR-1.7B as the accurate tier.
-- Offer Moonshine base-en as the light tier instead of Qwen 0.6B: same speed, better on this clip, half the memory, one seventh of the download, no Metal, MIT. tiny-en is the floor for old or low-memory machines.
-- Because Moonshine is a C library, the light tier can drop the Python sidecar entirely by linking `libmoonshine` from `openflow-core` behind the existing engine abstraction. That removes the largest piece of the local-mode install for users who only dictate in English.
-- For the iPhone app, Moonshine tiny-en or base-en (42 to 142 MB, CPU ONNX) is a far better fit for the "entirely local, lightweight, background" brief than Qwen 0.6B MLX (1 GB resident, Metal toolchain). This changes `docs/mobile/PLAN.md`'s engine choice and is Titan's call.
-- Cohere Transcribe stays a candidate for the accurate tier once it can be measured through the canonical weights.
+- Light tier: Moonshine base-en (0.44 s, 562 MB RSS, 142 MB download, MIT), tiny-en as the floor. Because Moonshine is a C library, this tier can drop the Python sidecar by linking `libmoonshine` from `openflow-core`.
+- Accurate tier: Cohere Transcribe at 8-bit replaces Qwen 1.7B: same resident cost, 2.4 times faster, better proper nouns and casing. Blocked on publishing our own ungated 8-bit conversion and on measuring its first-inference compile; until then Qwen 1.7B stays.
+- Qwen 0.6B drops out: Moonshine base matches its speed at half the memory and beats it on names.
+- For the iPhone app the decision was taken on 2026-09-10: Moonshine (`docs/mobile/M2-MOONSHINE.md`).
