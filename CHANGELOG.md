@@ -4,6 +4,14 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Native Mac: Jev computer use preview
+By: Codex
+Impact: shared command capture/decision client, native Accessibility adapter and computer-use window
+
+- Opt-in voice or typed commands select actions and targets through Jev. A separate TypeSafe key lives in Keychain; Local-only protection blocks hosted decisions.
+- Review and confirm one action at a time. Stale windows, documents, controls and typing selections are rejected; cancellation invalidates outstanding work. Command recording is isolated from ordinary dictation and bypasses cleanup, plugins and history.
+- Includes bounded HTTP/Accessibility handling, synthetic regression coverage and light/dark layout fixtures. Native Mac only; no speculative partial-speech execution or autonomous task loop. See [setup, privacy and verification limits](docs/computer-use.md).
+
 ### Desktop: guided setup, link-first home, and measured performance improvements
 By: Codex
 Impact: `crates/openflow-native`, `crates/openflow-core/{src/agreement.rs,src/audio.rs,src/db.rs}`, `DESIGN.md`, `docs/*performance*.md`

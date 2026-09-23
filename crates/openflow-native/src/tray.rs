@@ -24,6 +24,7 @@ pub const RECENTS: usize = 20;
 pub const PREVIEW_CHARS: usize = 40;
 
 const ID_MAIN: &str = "main";
+const ID_COMPUTER_USE: &str = "computer-use";
 const ID_SETTINGS: &str = "settings";
 const ID_HISTORY: &str = "history";
 const ID_PLUGINS: &str = "plugins";
@@ -288,6 +289,12 @@ fn build_menu(
         None,
     ))?;
     append(&MenuItem::with_id(
+        MenuId::new(ID_COMPUTER_USE),
+        "Computer use…",
+        true,
+        None,
+    ))?;
+    append(&MenuItem::with_id(
         MenuId::new(ID_PLUGINS),
         "Plugins",
         true,
@@ -379,6 +386,7 @@ pub fn install_handler() {
             crate::app::with_app(|app| match id.as_str() {
                 // No page named: the window reopens where the user left it.
                 ID_MAIN => app.handle_event(EngineEvent::Navigate("main".to_string())),
+                ID_COMPUTER_USE => app.show_computer_use(),
                 // No tab: the window reopens where the user left it.
                 ID_SETTINGS => app.handle_event(EngineEvent::Navigate("settings".to_string())),
                 ID_HISTORY => app.handle_event(EngineEvent::Navigate("history".to_string())),

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -331,8 +331,30 @@ struct PartialConfig {
     local: bool,
 }
 
+pub struct CommandCapture {
+    engine: Option<Arc<Engine>>,
+}
+
+impl CommandCapture {
+    pub fn finish(mut self) -> Result<Vec<u8>, String> {
+        self.engine
+            .take()
+            .expect("capture owner")
+            .end_command_capture()
+    }
+}
+
+impl Drop for CommandCapture {
+    fn drop(&mut self) {
+        if let Some(engine) = self.engine.take() {
+            let _ = engine.end_command_capture();
+        }
+    }
+}
+
 pub struct Engine {
     recorder: AudioRecorder,
+    command_capture: AtomicBool,
     settings: Settings,
     plugin_manager: PluginManager,
     /// `Some(started_at)` while capturing. Carrying the start time rather than
@@ -401,6 +423,7 @@ impl Engine {
 
         Ok(Arc::new(Self {
             recorder: AudioRecorder::new(),
+            command_capture: AtomicBool::new(false),
             settings,
             plugin_manager: PluginManager::new(),
             recording: Mutex::new(None),
@@ -514,6 +537,49 @@ impl Engine {
         &self.settings
     }
 
+    /// Exclusive, short computer-command capture. The returned guard stops the
+    /// microphone even when the caller cancels or drops its task. No dictation
+    /// pipeline, previews, formatting, plugins, insertion or history are run.
+    pub fn begin_command_capture(self: &Arc<Self>) -> Result<CommandCapture, String> {
+        let mut recording = self
+            .recording
+            .lock()
+            .map_err(|_| "Recording state unavailable")?;
+        if recording.is_some()
+            || self.command_capture.load(Ordering::SeqCst)
+            || !self
+                .transcription_jobs
+                .lock()
+                .map_err(|_| "Transcription state unavailable")?
+                .is_empty()
+        {
+            return Err("Finish the current dictation before recording a computer command.".into());
+        }
+        self.recorder.start(self.settings.microphone())?;
+        self.command_capture.store(true, Ordering::SeqCst);
+        *recording = Some(Instant::now());
+        self.emit_state(RecordingState::Recording);
+        Ok(CommandCapture {
+            engine: Some(Arc::clone(self)),
+        })
+    }
+
+    fn end_command_capture(&self) -> Result<Vec<u8>, String> {
+        let result = {
+            // Cleanup must still stop the microphone if a previous owner
+            // poisoned the state lock. Starting a new capture remains fail-closed.
+            let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.command_capture.swap(false, Ordering::SeqCst) {
+                return Err("No command recording is active.".into());
+            }
+            let result = self.recorder.stop();
+            *recording = None;
+            result
+        };
+        self.emit_idle_if_quiescent();
+        result
+    }
+
     pub fn plugins(&self) -> &PluginManager {
         &self.plugin_manager
     }
@@ -573,7 +639,7 @@ impl Engine {
                 .recording
                 .lock()
                 .map_err(|_| "Recording state is unavailable".to_string())?;
-            if !recording_slot_free(&recording) {
+            if self.command_capture.load(Ordering::SeqCst) || !recording_slot_free(&recording) {
                 return Err("A recording is already active".to_string());
             }
             let device = self.settings.microphone();
@@ -594,7 +660,7 @@ impl Engine {
             )));
             return;
         };
-        if recording_slot_free(&recording) {
+        if !self.command_capture.load(Ordering::SeqCst) && recording_slot_free(&recording) {
             *recording = Some(Instant::now());
             let device = self.settings.microphone();
             if let Err(e) = self.recorder.start(device) {
@@ -880,6 +946,9 @@ impl Engine {
                 .recording
                 .lock()
                 .map_err(|_| "Recording state is unavailable".to_string())?;
+            if self.command_capture.load(Ordering::SeqCst) {
+                return Err("Finish the computer command recording first".into());
+            }
             if recording.is_none() {
                 return Err("No recording is active".to_string());
             }
@@ -930,7 +999,7 @@ impl Engine {
                 )));
                 return;
             };
-            if recording.is_none() {
+            if self.command_capture.load(Ordering::SeqCst) || recording.is_none() {
                 return;
             }
             let result = self.recorder.stop();
@@ -1533,6 +1602,39 @@ mod tests {
 
     fn scratch_engine() -> Arc<Engine> {
         scratch_engine_and_events().0
+    }
+
+    #[tokio::test]
+    async fn command_capture_owns_the_recorder_without_entering_dictation() {
+        let engine = scratch_engine();
+        // Synthetic ownership only: this test never starts a microphone.
+        engine.command_capture.store(true, Ordering::SeqCst);
+        *engine.recording.lock().unwrap() =
+            Some(Instant::now() - MAX_RECORDING - Duration::from_secs(1));
+        let guard = CommandCapture {
+            engine: Some(Arc::clone(&engine)),
+        };
+        assert!(engine.begin_command_capture().is_err());
+        assert!(engine.start_recording().is_err());
+        engine.hotkey_pressed();
+        engine.hotkey_released();
+        assert!(engine.stop_and_transcribe_now().await.is_err());
+        assert!(engine.recording.lock().unwrap().is_some());
+        assert!(engine.transcription_jobs.lock().unwrap().is_empty());
+        drop(guard);
+        assert!(!engine.command_capture.load(Ordering::SeqCst));
+        assert!(engine.recording.lock().unwrap().is_none());
+        assert!(engine.history(10).unwrap().is_empty());
+        assert!(engine.last_transcription.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn command_capture_refuses_a_normal_take_without_touching_the_microphone() {
+        let engine = scratch_engine();
+        *engine.recording.lock().unwrap() = Some(Instant::now());
+        assert!(engine.begin_command_capture().is_err());
+        assert!(!engine.command_capture.load(Ordering::SeqCst));
+        assert!(engine.recording.lock().unwrap().is_some());
     }
 
     #[test]

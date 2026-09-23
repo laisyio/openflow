@@ -25,6 +25,7 @@ openflow-core = { workspace = true }
 # The host owns the runtime, not the engine: a task holding the last `Arc<Engine>`
 # would otherwise drop the runtime from one of its own worker threads.
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 # AppKit. Already in the tree via tao/wry, so nothing compiles here that did not
 # compile before.
 objc2 = "0.6"

@@ -11,7 +11,12 @@ use crate::secrets::SecretStore;
 use crate::transcribe::Provider;
 
 /// Keys that live in the OS keychain and never in the settings table.
-pub const SECRET_SETTINGS: &[&str] = &["api_key", "formatting_api_key", "tts_api_key"];
+pub const SECRET_SETTINGS: &[&str] = &[
+    "api_key",
+    "formatting_api_key",
+    "tts_api_key",
+    "jev_api_key",
+];
 
 pub fn is_secret_setting(key: &str) -> bool {
     SECRET_SETTINGS.contains(&key)
@@ -450,10 +455,12 @@ mod tests {
     }
 
     #[test]
-    fn secret_keys_are_exactly_the_three_credentials() {
+    fn secret_keys_include_jev_without_matching_unrelated_settings() {
         assert!(is_secret_setting("api_key"));
         assert!(is_secret_setting("formatting_api_key"));
         assert!(is_secret_setting("tts_api_key"));
+        assert!(is_secret_setting("jev_api_key"));
+        assert_eq!(SECRET_SETTINGS.len(), 4);
         assert!(!is_secret_setting("provider"));
         assert!(!is_secret_setting("dictionary"));
         // A near miss must not be routed to the keychain by accident.

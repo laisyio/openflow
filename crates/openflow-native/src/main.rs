@@ -33,6 +33,9 @@ mod ui;
 #[cfg(target_os = "macos")]
 mod app;
 
+#[cfg(target_os = "macos")]
+mod computer_access;
+
 // Not gated: pure string handling, and the stub `main` below answers
 // `--version` too, so the one line three surfaces agree on is compiled and
 // tested on every platform in the matrix rather than only on the one that can

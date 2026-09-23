@@ -640,7 +640,7 @@ pub fn is_loopback_url(url: &str) -> bool {
 /// Called before the request is built, so nothing is connected, no DNS is
 /// resolved and no credential is attached: the refusal happens with the URL and
 /// the setting alone.
-fn guard_local_only(url: &str) -> Result<(), String> {
+pub(crate) fn guard_local_only(url: &str) -> Result<(), String> {
     if !local_only() || is_loopback_url(url) {
         return Ok(());
     }

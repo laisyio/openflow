@@ -61,6 +61,7 @@ pub fn run(output: &Path) -> Result<usize, String> {
         views.extend(super::settings::preview_views(mtm));
         views.extend(super::history::preview_views(mtm));
         views.extend(super::plugins::preview_views(mtm));
+        views.extend(super::computer_use::preview_views(mtm));
         for (state, view) in views {
             if !safe_name(&state) {
                 return Err("A snapshot fixture has an unsafe name".to_string());

@@ -103,16 +103,33 @@ pub struct App {
     // One slot per window, each built on first use and kept: closing hides,
     // so reopening from the menu bar is instant and no state is rebuilt.
     //
-    // Two slots, not five. Dictate, History, Plugins and Settings are pages
-    // of `main` now rather than windows of their own. The wizard keeps its own
-    // window because it is presented as a sheet on `main`, and a sheet is a
-    // window.
+    // Dictate, History, Plugins and Settings are pages of `main`. The wizard
+    // keeps its own sheet; computer use has a separate explicit review window.
     main: RefCell<Option<Retained<MainWindow>>>,
     onboarding: RefCell<Option<Retained<OnboardingWindow>>>,
+    computer_use: RefCell<Option<Retained<crate::ui::computer_use::ComputerUseWindow>>>,
     mtm: MainThreadMarker,
 }
 
 impl App {
+    pub fn with_computer_use<R>(
+        &self,
+        body: impl FnOnce(&crate::ui::computer_use::ComputerUseWindow) -> R,
+    ) -> Option<R> {
+        let window = self.computer_use.borrow().clone();
+        window.as_deref().map(body)
+    }
+
+    pub fn show_computer_use(&self) {
+        let window = {
+            let mut slot = self.computer_use.borrow_mut();
+            slot.get_or_insert_with(|| {
+                crate::ui::computer_use::ComputerUseWindow::new(Arc::clone(&self.engine), self.mtm)
+            })
+            .clone()
+        };
+        window.present();
+    }
     pub fn engine(&self) -> &Arc<Engine> {
         &self.engine
     }
@@ -146,7 +163,7 @@ impl App {
         window.as_deref().map(body)
     }
 
-    /// True while either window is on screen.
+    /// True while any of the application windows is on screen.
     ///
     /// Asks the windows rather than counting opens and closes: they are hidden
     /// rather than closed and can be ordered out by AppKit itself, and a
@@ -158,7 +175,9 @@ impl App {
         ) -> bool {
             slot.borrow().as_deref().is_some_and(is_visible)
         }
-        visible(&self.main, |w| w.is_visible()) || visible(&self.onboarding, |w| w.is_visible())
+        visible(&self.main, |w| w.is_visible())
+            || visible(&self.onboarding, |w| w.is_visible())
+            || visible(&self.computer_use, |w| w.is_visible())
     }
 
     /// Run `body` against the main window if it has been built.
@@ -319,6 +338,7 @@ impl App {
                     app.terminate(None);
                 }
                 "onboarding" => self.show_onboarding(),
+                "computer-use" => self.show_computer_use(),
                 "main" => self.show_main(None),
                 // Everything else is a page or a group inside one, and the
                 // window knows which: "history" and "plugins" are pages,
@@ -524,6 +544,7 @@ fn start(app_dir: PathBuf, mtm: MainThreadMarker) -> Result<(), String> {
         tts,
         main: RefCell::new(None),
         onboarding: RefCell::new(None),
+        computer_use: RefCell::new(None),
         mtm,
     });
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));

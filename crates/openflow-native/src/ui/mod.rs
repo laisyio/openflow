@@ -9,6 +9,7 @@
 //! the two models.
 
 pub mod card;
+pub mod computer_use;
 pub mod dictate;
 pub mod history;
 pub mod main_window;

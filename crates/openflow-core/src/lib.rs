@@ -6,6 +6,7 @@
 
 pub mod agreement;
 pub mod audio;
+pub mod computer_use;
 pub mod db;
 pub mod engine;
 pub mod hotkey;

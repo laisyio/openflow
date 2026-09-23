@@ -2978,6 +2978,7 @@ dependencies = [
  "png 0.17.16",
  "rodio",
  "tokio",
+ "tokio-util",
  "tray-icon",
  "uuid",
 ]
