@@ -4,6 +4,15 @@ Newest first. Each entry names the change, the author, and what it touches.
 
 ## Unreleased
 
+### Jev via OpenRouter
+By: Codex
+Impact: Jev decision client, native computer-use setup and Keychain settings
+
+- Choose direct TypeSafe or OpenRouter’s Decisions API (`typesafe/jev-1.13`). Keys stay in separate Keychain entries with no cross-provider fallback or implicit reuse of speech credentials.
+- Switching providers cancels pending work and resets sharing consent. OpenRouter sharing explicitly names OpenRouter and TypeSafe; Local-only protection and per-action confirmation remain enforced.
+- Applied Claude Opus 5.5 review findings: reject ambiguous targets, escape review text, bound Accessibility reads, validate target-app identity and response models, and distinguish unconfirmed actions from refusals without retrying them.
+- Added provider routing and OpenRouter response-contract fixtures. Live paid inference remains unverified; see [setup and validation](docs/computer-use.md).
+
 ### Native Mac: Jev computer use preview
 By: Codex
 Impact: shared command capture/decision client, native Accessibility adapter and computer-use window

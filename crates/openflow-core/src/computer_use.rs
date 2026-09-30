@@ -7,7 +7,57 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 pub const MODEL: &str = "jev-1.13.0";
-const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
+/// Closed credential destinations. No custom URL and no cross-provider fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JevProvider {
+    TypeSafe,
+    OpenRouter,
+}
+impl JevProvider {
+    pub fn from_setting(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("typesafe") => Ok(Self::TypeSafe),
+            Some("openrouter") => Ok(Self::OpenRouter),
+            _ => Err("Choose a supported Jev provider.".into()),
+        }
+    }
+    pub fn setting(self) -> &'static str {
+        match self {
+            Self::TypeSafe => "typesafe",
+            Self::OpenRouter => "openrouter",
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::TypeSafe => "TypeSafe",
+            Self::OpenRouter => "OpenRouter",
+        }
+    }
+    pub fn secret_setting(self) -> &'static str {
+        match self {
+            Self::TypeSafe => "jev_api_key",
+            Self::OpenRouter => "jev_openrouter_api_key",
+        }
+    }
+    pub fn endpoint(self) -> &'static str {
+        match self {
+            Self::TypeSafe => "https://api.typesafe.ai/v1/systemone",
+            Self::OpenRouter => "https://openrouter.ai/api/alpha/decisions",
+        }
+    }
+    pub fn model(self) -> &'static str {
+        match self {
+            Self::TypeSafe => MODEL,
+            Self::OpenRouter => "typesafe/jev-1.13",
+        }
+    }
+    pub fn recipients(self) -> &'static str {
+        match self {
+            Self::TypeSafe => "TypeSafe",
+            Self::OpenRouter => "OpenRouter and TypeSafe",
+        }
+    }
+}
 pub const MAX_ELEMENTS: usize = 80;
 pub const MAX_COMMAND: usize = 2000;
 
@@ -193,6 +243,9 @@ pub fn proposal(response: &Value, command: &str, screen: &Screen) -> Result<Prop
         &answers["action"],
         &["press", "focus", "type", "scroll_down", "scroll_up", "none"],
     )?;
+    if action == "none" {
+        return Err("No supported action was requested. Please rephrase.".into());
+    }
     let mut targets: Vec<&str> = screen.elements.iter().map(|e| e.id.as_str()).collect();
     targets.push("none");
     let target = selected(&answers["target"], &targets)?;
@@ -203,6 +256,19 @@ pub fn proposal(response: &Value, command: &str, screen: &Screen) -> Result<Prop
         .ok_or("No matching control. Please rephrase.")?;
     if !element.actions.contains(&action) {
         return Err("That control does not support the requested action.".into());
+    }
+    if screen
+        .elements
+        .iter()
+        .filter(|e| e.role == element.role && e.label == element.label)
+        .count()
+        != 1
+        || (action == "press" && element.label == element.role)
+    {
+        return Err(
+            "That control cannot be distinguished by its label. Choose a uniquely named control."
+                .into(),
+        );
     }
     let text = if action == "type" {
         Some(
@@ -220,6 +286,7 @@ pub fn proposal(response: &Value, command: &str, screen: &Screen) -> Result<Prop
 }
 
 pub async fn decide(
+    provider: JevProvider,
     command: &str,
     screen: &Screen,
     key: &str,
@@ -232,27 +299,59 @@ pub async fn decide(
         );
     }
     if key.trim().is_empty() {
-        return Err("Add a TypeSafe API key first.".into());
+        return Err(format!("Add a {} API key first.", provider.name()));
     }
-    let body = request(command, screen)?;
-    let response = evaluate(ENDPOINT, body, key).await?;
-    proposal(&response, command, screen)
+    let body = provider_request(provider, command, screen)?;
+    let response = evaluate(provider.endpoint(), body, key).await?;
+    provider_proposal(provider, &response, command, screen)
+}
+
+fn provider_proposal(
+    provider: JevProvider,
+    response: &Value,
+    command: &str,
+    screen: &Screen,
+) -> Result<Proposal, String> {
+    // Some direct-provider envelopes omit model metadata. If supplied, it must
+    // identify the requested model or a versioned release of that same alias.
+    if let Some(model) = response.get("model") {
+        let expected = provider.model();
+        let matches = model.as_str().is_some_and(|model| {
+            model == expected
+                || model
+                    .strip_prefix(expected)
+                    .is_some_and(|suffix| suffix.starts_with('-') && suffix.len() > 1)
+        });
+        if !matches {
+            return Err("Jev returned an unexpected model. No action was approved.".into());
+        }
+    }
+    proposal(response, command, screen)
+}
+
+fn provider_request(
+    provider: JevProvider,
+    command: &str,
+    screen: &Screen,
+) -> Result<Value, String> {
+    let mut body = request(command, screen)?;
+    body["model"] = json!(provider.model());
+    Ok(body)
 }
 
 // Private transport seam for loopback fixtures. Production only calls the
 // fixed HTTPS endpoint above. No redirects, retries or response-body logging.
 async fn evaluate(endpoint: &str, body: Value, key: &str) -> Result<Value, String> {
-    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    let client = CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|_| "Could not initialize Jev connection.".to_string())
-        })
-        .as_ref()
-        .map_err(Clone::clone)?;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if CLIENT.get().is_none() {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| "Could not initialize Jev connection.")?;
+        let _ = CLIENT.set(client);
+    }
+    let client = CLIENT.get().ok_or("Could not initialize Jev connection.")?;
     // Check the live process policy immediately before connecting, not just
     // the settings snapshot captured before a Keychain read.
     crate::transcribe::guard_local_only(endpoint)?;
@@ -265,7 +364,7 @@ async fn evaluate(endpoint: &str, body: Value, key: &str) -> Result<Value, Strin
         .map_err(|_| "Jev connection failed or timed out. Please try again.")?;
     if !response.status().is_success() {
         return Err(format!(
-            "Jev returned HTTP {}. Check your TypeSafe key, quota and connection.",
+            "Jev returned HTTP {}. Check the selected provider’s key, quota and connection.",
             response.status().as_u16()
         ));
     }
@@ -289,6 +388,25 @@ async fn evaluate(endpoint: &str, body: Value, key: &str) -> Result<Value, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn duplicate_or_unlabeled_controls_cannot_be_approved() {
+        let mut s = screen();
+        let mut duplicate = s.elements[0].clone();
+        duplicate.id = "e1".into();
+        s.elements.push(duplicate);
+        let mut reply = response("focus");
+        reply["answers"]["target"]["probabilities"]["e1"] = json!(0.0);
+        assert!(proposal(&reply, "focus Search", &s)
+            .unwrap_err()
+            .contains("distinguished"));
+        let mut s = screen();
+        s.elements[0].role = "AXButton".into();
+        s.elements[0].label = "AXButton".into();
+        s.elements[0].actions = vec!["press".into()];
+        assert!(proposal(&response("press"), "click button", &s)
+            .unwrap_err()
+            .contains("distinguished"));
+    }
     #[test]
     fn cancellation_replacement_and_double_confirmation_never_replay_work() {
         let mut session = ReviewSession::default();
@@ -383,11 +501,110 @@ mod tests {
     }
     #[tokio::test]
     async fn privacy_and_missing_key_fail_before_network() {
-        assert!(decide("focus Search", &screen(), "fixture", true)
+        for provider in [JevProvider::TypeSafe, JevProvider::OpenRouter] {
+            assert!(decide(provider, "focus Search", &screen(), "fixture", true)
+                .await
+                .unwrap_err()
+                .contains("Local-only"));
+            assert!(decide(provider, "focus Search", &screen(), "", false)
+                .await
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn provider_destinations_models_and_credentials_are_isolated() {
+        assert_eq!(
+            JevProvider::from_setting(None).unwrap(),
+            JevProvider::TypeSafe
+        );
+        for invalid in ["", "custom:https://example.com", "jev-router", "OPENROUTER"] {
+            assert!(JevProvider::from_setting(Some(invalid)).is_err());
+        }
+        assert_eq!(
+            JevProvider::OpenRouter.endpoint(),
+            "https://openrouter.ai/api/alpha/decisions"
+        );
+        assert_eq!(
+            JevProvider::TypeSafe.endpoint(),
+            "https://api.typesafe.ai/v1/systemone"
+        );
+        assert_ne!(
+            JevProvider::OpenRouter.secret_setting(),
+            JevProvider::TypeSafe.secret_setting()
+        );
+        assert_eq!(
+            JevProvider::OpenRouter.secret_setting(),
+            "jev_openrouter_api_key"
+        );
+        for provider in [JevProvider::TypeSafe, JevProvider::OpenRouter] {
+            assert_eq!(
+                JevProvider::from_setting(Some(provider.setting())).unwrap(),
+                provider
+            );
+            let body = provider_request(provider, "focus Search", &screen()).unwrap();
+            assert_eq!(body["model"], provider.model());
+            assert_eq!(
+                body["questions"],
+                request("focus Search", &screen()).unwrap()["questions"]
+            );
+        }
+        assert_eq!(JevProvider::OpenRouter.model(), "typesafe/jev-1.13");
+    }
+
+    #[tokio::test]
+    async fn openrouter_decisions_contract_uses_the_same_strict_response_validation() {
+        let mut reply = response("focus");
+        reply["model"] = json!("typesafe/jev-1.13-20260917");
+        reply["provider"] = json!("TypeSafe");
+        reply["id"] = json!("synthetic-decision");
+        let (url, server) = fixture("200 OK", reply.to_string(), "").await;
+        let url = url.replace("/v1/systemone", "/api/alpha/decisions");
+        let body = provider_request(JevProvider::OpenRouter, "focus Search", &screen()).unwrap();
+        let result = evaluate(&url, body.clone(), "synthetic-openrouter-key")
             .await
-            .unwrap_err()
-            .contains("Local-only"));
-        assert!(decide("focus Search", &screen(), "", false).await.is_err());
+            .unwrap();
+        assert_eq!(
+            provider_proposal(JevProvider::OpenRouter, &result, "focus Search", &screen())
+                .unwrap()
+                .action,
+            "focus"
+        );
+        let received = server.await.unwrap();
+        assert!(received.starts_with("POST /api/alpha/decisions HTTP/1.1"));
+        assert!(received
+            .to_lowercase()
+            .contains("authorization: bearer synthetic-openrouter-key\r\n"));
+        assert_eq!(
+            serde_json::from_str::<Value>(received.split_once("\r\n\r\n").unwrap().1).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn supplied_response_model_must_match_the_selected_provider() {
+        for provider in [JevProvider::TypeSafe, JevProvider::OpenRouter] {
+            let mut reply = response("focus");
+            assert!(provider_proposal(provider, &reply, "focus Search", &screen()).is_ok());
+            for model in [
+                provider.model().to_owned(),
+                format!("{}-20260917", provider.model()),
+            ] {
+                reply["model"] = json!(model);
+                assert!(provider_proposal(provider, &reply, "focus Search", &screen()).is_ok());
+            }
+            for model in [
+                json!(null),
+                json!(7),
+                json!("other/model"),
+                json!("typesafe/jev-router"),
+                json!(format!("{}0", provider.model())),
+                json!(format!("{}-", provider.model())),
+            ] {
+                reply["model"] = model;
+                assert!(provider_proposal(provider, &reply, "focus Search", &screen()).is_err());
+            }
+        }
     }
 
     #[test]

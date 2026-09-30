@@ -537,6 +537,10 @@ impl Engine {
         &self.settings
     }
 
+    pub fn is_command_capture(&self) -> bool {
+        self.command_capture.load(Ordering::SeqCst)
+    }
+
     /// Exclusive, short computer-command capture. The returned guard stops the
     /// microphone even when the caller cancels or drops its task. No dictation
     /// pipeline, previews, formatting, plugins, insertion or history are run.
@@ -545,8 +549,10 @@ impl Engine {
             .recording
             .lock()
             .map_err(|_| "Recording state unavailable")?;
+        if self.command_capture.load(Ordering::SeqCst) {
+            return Err("The previous computer command is still recording or stopping. Wait a moment, then try again.".into());
+        }
         if recording.is_some()
-            || self.command_capture.load(Ordering::SeqCst)
             || !self
                 .transcription_jobs
                 .lock()

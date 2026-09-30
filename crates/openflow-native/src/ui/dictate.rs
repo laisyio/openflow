@@ -618,6 +618,14 @@ impl DictatePage {
             .as_str(),
         ));
         let (eyebrow, title, body, action, enabled, cancel) = match state {
+            RecordingState::Recording if self.ivars().engine.is_command_capture() => (
+                "Computer command",
+                "Listening to a command…",
+                "Use Stop & review or Cancel in the Computer use window.",
+                "Command recording",
+                false,
+                false,
+            ),
             RecordingState::Recording => (
                 "Listening now",
                 "Keep talking\u{2026}",

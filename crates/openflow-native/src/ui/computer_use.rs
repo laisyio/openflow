@@ -6,13 +6,13 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAccessibility, NSApplicationActivationOptions, NSBackingStoreType, NSButton,
-    NSControlStateValueOff, NSControlStateValueOn, NSRunningApplication, NSSecureTextField,
-    NSSwitch, NSTextField, NSTextView, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
-    NSWorkspace,
+    NSControlStateValueOff, NSControlStateValueOn, NSPopUpButton, NSRunningApplication,
+    NSSecureTextField, NSSwitch, NSTextField, NSTextView, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use openflow_core::{
-    computer_use::{self, Proposal, ReviewSession},
+    computer_use::{self, JevProvider, Proposal, ReviewSession},
     engine::Engine,
 };
 use std::cell::{Cell, RefCell};
@@ -24,6 +24,8 @@ pub struct Ivars {
     engine: Arc<Engine>,
     window: Retained<NSWindow>,
     key: Retained<NSSecureTextField>,
+    provider: Retained<NSPopUpButton>,
+    privacy: Retained<NSTextField>,
     consent: Retained<NSSwitch>,
     command: Retained<NSTextField>,
     target: Retained<NSTextField>,
@@ -32,6 +34,7 @@ pub struct Ivars {
     review: Retained<NSButton>,
     confirm: Retained<NSButton>,
     pid: Cell<i32>,
+    target_app: RefCell<Option<Retained<NSRunningApplication>>>,
     application: RefCell<String>,
     session: RefCell<ReviewSession<(Snapshot, Proposal, String)>>,
     stop: RefCell<Option<CancellationToken>>,
@@ -49,6 +52,7 @@ define_class!(
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
             self.reset();
+            self.clear_target();
             self.ivars().consent.setState(NSControlStateValueOff);
             self.ivars().key.setStringValue(&NSString::from_str(""));
             self.ivars().command.setStringValue(&NSString::from_str(""));
@@ -61,13 +65,26 @@ define_class!(
         #[unsafe(method(saveKey:))]
         fn save_key(&self, _sender: &AnyObject) {
             self.reset();
+            let provider=match self.provider() {Ok(p)=>p,Err(e)=>{self.message(&e);return;}};
             let value = self.ivars().key.stringValue().to_string();
-            match self.ivars().engine.settings().set("jev_api_key", value.trim()) {
+            match self.ivars().engine.settings().set(provider.secret_setting(), value.trim()) {
                 Ok(()) => {
                     self.ivars().key.setStringValue(&NSString::from_str(""));
-                    self.message(if value.trim().is_empty() { "TypeSafe key removed." } else { "TypeSafe key saved in Keychain." });
+                    self.message(&format!("{} key {}.",provider.name(),if value.trim().is_empty() {"removed"} else {"saved in Keychain"}));
                 }
                 Err(_) => self.message("Could not save the key in Keychain. Please try again."),
+            }
+        }
+        #[unsafe(method(providerChanged:))]
+        fn provider_changed(&self, _sender: &AnyObject) {
+            self.reset();
+            self.ivars().consent.setState(NSControlStateValueOff);
+            self.ivars().key.setStringValue(&NSString::from_str(""));
+            let saved=self.provider().and_then(|p|self.ivars().engine.settings().set("jev_provider",p.setting()));
+            self.load_provider();
+            match saved {
+                Ok(())=>self.message("Provider changed. Add its key and enable sharing again. Keys are never copied between providers."),
+                Err(_)=>self.message("Could not save the provider. No command was sent; choose a provider again."),
             }
         }
         #[unsafe(method(consentChanged:))]
@@ -97,8 +114,8 @@ define_class!(
                 }
                 let pid=snapshot.pid;
                 match snapshot.execute(&proposal) {
-                    Ok(()) => {
-                        self.message("Action sent to the target app. Check its result before your next command.");
+                    Ok(outcome) => {
+                        self.message(outcome.message());
                         if let Some(app)=NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
                             app.activateWithOptions(NSApplicationActivationOptions::empty());
                         }
@@ -119,7 +136,7 @@ impl ComputerUseWindow {
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
-                frame(0., 0., 640., 640.),
+                frame(0., 0., 640., 680.),
                 NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
                 NSBackingStoreType::Buffered,
                 false,
@@ -133,6 +150,8 @@ impl ComputerUseWindow {
         let Controls {
             view,
             key,
+            provider,
+            privacy,
             save,
             consent,
             command,
@@ -148,6 +167,8 @@ impl ComputerUseWindow {
             engine,
             window,
             key,
+            provider,
+            privacy,
             consent,
             command,
             target,
@@ -156,6 +177,7 @@ impl ComputerUseWindow {
             review,
             confirm,
             pid: Cell::new(0),
+            target_app: RefCell::new(None),
             application: RefCell::new(String::new()),
             session: RefCell::new(ReviewSession::default()),
             stop: RefCell::new(None),
@@ -166,12 +188,14 @@ impl ComputerUseWindow {
             .window
             .setDelegate(Some(ProtocolObject::from_ref(&*this)));
         ui::wire(&save, &this, sel!(saveKey:));
+        ui::wire(&this.ivars().provider, &this, sel!(providerChanged:));
         ui::wire(&this.ivars().consent, &this, sel!(consentChanged:));
         ui::wire(&this.ivars().review, &this, sel!(reviewCommand:));
         ui::wire(&this.ivars().record, &this, sel!(recordCommand:));
         ui::wire(&this.ivars().confirm, &this, sel!(confirmCommand:));
         ui::wire(&cancel, &this, sel!(cancelCommand:));
-        this.message("Add your TypeSafe key, enable session sharing, then type or record one command. Voice stops automatically after 15 seconds.");
+        this.load_provider();
+        this.message("Choose TypeSafe or OpenRouter and save its key. Enable session sharing, then type or record one command. Voice stops automatically after 15 seconds.");
         this
     }
 }
@@ -179,6 +203,8 @@ impl ComputerUseWindow {
 struct Controls {
     view: Retained<NSView>,
     key: Retained<NSSecureTextField>,
+    provider: Retained<NSPopUpButton>,
+    privacy: Retained<NSTextField>,
     save: Retained<NSButton>,
     consent: Retained<NSSwitch>,
     command: Retained<NSTextField>,
@@ -191,33 +217,39 @@ struct Controls {
 }
 
 fn controls(mtm: MainThreadMarker) -> Controls {
-    let view = NSView::initWithFrame(NSView::alloc(mtm), frame(0., 0., 640., 640.));
+    let view = NSView::initWithFrame(NSView::alloc(mtm), frame(0., 0., 640., 680.));
     let heading = ui::note(
         mtm,
         "Say it. Review it. Do it.",
-        frame(24., 583., 592., 38.),
+        frame(24., 623., 592., 38.),
     );
     heading.setFont(Some(&ui::editorial_font(26.)));
     view.addSubview(&heading);
-    let intro = ui::note(mtm, "Control one Mac app with your voice. Jev chooses the control; you approve every action. This preview does not run autonomous tasks.", frame(24.,531.,592.,42.));
+    let intro = ui::note(mtm, "Control one Mac app with your voice. Jev chooses the control; you approve every action. This preview does not run autonomous tasks.", frame(24.,571.,592.,42.));
     ui::allow_wrapping(&intro, 592.);
     view.addSubview(&intro);
     let target = ui::note(
         mtm,
         "Target: open this window from the menu bar while another app is active.",
-        frame(24., 500., 592., 24.),
+        frame(24., 540., 592., 24.),
     );
     view.addSubview(&target);
     let tip = ui::note(
         mtm,
         "To change target, switch apps and choose Computer use… in OpenFlow’s menu bar.",
-        frame(24., 478., 592., 18.),
+        frame(24., 518., 592., 18.),
     );
     view.addSubview(&tip);
+    let provider = ui::popup(
+        mtm,
+        frame(24., 472., 240., 28.),
+        0,
+        &["Jev via TypeSafe", "Jev via OpenRouter"],
+    );
+    provider.setAccessibilityLabel(Some(&NSString::from_str("Jev decision provider")));
+    view.addSubview(&provider);
     let key = ui::secure_field(mtm, frame(24., 434., 462., 28.), 0);
-    key.setPlaceholderString(Some(&NSString::from_str(
-        "TypeSafe API key (not an OpenRouter key)",
-    )));
+    key.setPlaceholderString(Some(&NSString::from_str("TypeSafe API key")));
     key.setAccessibilityLabel(Some(&NSString::from_str("TypeSafe API key")));
     view.addSubview(&key);
     let save = ui::button(mtm, frame(496., 433., 120., 30.), "Save key", 0);
@@ -227,7 +259,11 @@ fn controls(mtm: MainThreadMarker) -> Controls {
         "Allow sending commands and control labels to TypeSafe this session",
     )));
     view.addSubview(&consent);
-    let privacy = ui::note(mtm,"Allow Jev this session: send commands and control labels to TypeSafe. Labels may be sensitive. No screenshots or field values. Local-only blocks this.",frame(76.,370.,540.,48.));
+    let privacy = ui::note(
+        mtm,
+        &sharing_notice(JevProvider::TypeSafe),
+        frame(76., 370., 540., 48.),
+    );
     ui::allow_wrapping(&privacy, 540.);
     view.addSubview(&privacy);
     let voice = ui::note(mtm,"Voice uses your configured speech provider. Commands bypass cleanup, plugins and history. Requires macOS Accessibility permission; voice also requires Microphone.",frame(24.,320.,592.,42.));
@@ -272,6 +308,8 @@ fn controls(mtm: MainThreadMarker) -> Controls {
     Controls {
         view,
         key,
+        provider,
+        privacy,
         save,
         consent,
         command,
@@ -289,8 +327,17 @@ pub fn preview_views(mtm: MainThreadMarker) -> Vec<(String, Retained<NSView>)> {
     ready
         .target
         .setStringValue(&NSString::from_str("Target: Example Notes"));
-    ready.status.setString(&NSString::from_str("Add your TypeSafe key, enable session sharing, then type or record one command. Voice stops automatically after 15 seconds."));
+    ready.status.setString(&NSString::from_str("Choose TypeSafe or OpenRouter and save its key. Enable session sharing, then type or record one command. Voice stops automatically after 15 seconds."));
     let review = controls(mtm);
+    review.provider.selectItemAtIndex(1);
+    review
+        .key
+        .setPlaceholderString(Some(&NSString::from_str("OpenRouter API key")));
+    review
+        .privacy
+        .setStringValue(&NSString::from_str(&sharing_notice(
+            JevProvider::OpenRouter,
+        )));
     review
         .target
         .setStringValue(&NSString::from_str("Target: Example Notes"));
@@ -323,10 +370,61 @@ pub fn preview_views(mtm: MainThreadMarker) -> Vec<(String, Retained<NSView>)> {
 }
 
 impl ComputerUseWindow {
+    fn provider(&self) -> Result<JevProvider, String> {
+        match self.ivars().provider.indexOfSelectedItem() {
+            0 => Ok(JevProvider::TypeSafe),
+            1 => Ok(JevProvider::OpenRouter),
+            _ => Err("Choose a supported Jev provider.".into()),
+        }
+    }
+    fn load_provider(&self) {
+        let provider = self
+            .ivars()
+            .engine
+            .settings()
+            .get("jev_provider")
+            .and_then(|v| JevProvider::from_setting(v.as_deref()));
+        match provider {
+            Ok(provider) => {
+                self.ivars()
+                    .provider
+                    .selectItemAtIndex(if provider == JevProvider::TypeSafe {
+                        0
+                    } else {
+                        1
+                    });
+                let label = format!("{} API key", provider.name());
+                self.ivars()
+                    .key
+                    .setPlaceholderString(Some(&NSString::from_str(&label)));
+                self.ivars()
+                    .key
+                    .setAccessibilityLabel(Some(&NSString::from_str(&label)));
+                self.ivars()
+                    .privacy
+                    .setStringValue(&NSString::from_str(&sharing_notice(provider)));
+                self.ivars()
+                    .consent
+                    .setAccessibilityLabel(Some(&NSString::from_str(&format!(
+                        "Allow sending commands and control labels to {} this session",
+                        provider.recipients()
+                    ))));
+            }
+            Err(_) => {
+                self.ivars().provider.selectItemAtIndex(-1);
+                self.ivars().consent.setState(NSControlStateValueOff);
+                self.ivars().privacy.setStringValue(&NSString::from_str(
+                    "Choose a supported Jev provider before enabling sharing.",
+                ));
+            }
+        }
+    }
     pub fn is_visible(&self) -> bool {
         self.ivars().window.isVisible()
     }
     pub fn present(&self) {
+        self.reset();
+        self.clear_target();
         if let Some(app) = NSWorkspace::sharedWorkspace().frontmostApplication() {
             let pid = app.processIdentifier();
             if pid != std::process::id() as i32 {
@@ -340,9 +438,50 @@ impl ComputerUseWindow {
                     .target
                     .setStringValue(&NSString::from_str(&format!("Target: {name}")));
                 *self.ivars().application.borrow_mut() = name;
+                *self.ivars().target_app.borrow_mut() = Some(app);
             }
         }
         ui::present_window(&self.ivars().window, "computer-use");
+    }
+    fn clear_target(&self) {
+        self.ivars().pid.set(0);
+        self.ivars().application.borrow_mut().clear();
+        self.ivars().target_app.borrow_mut().take();
+        self.ivars().target.setStringValue(&NSString::from_str(
+            "Target: switch to another app, then reopen Computer use from the menu bar.",
+        ));
+    }
+    fn target_is_current(&self) -> bool {
+        let saved = self.ivars().target_app.borrow().clone();
+        let Some(saved) = saved else {
+            return false;
+        };
+        let Some(current) =
+            NSRunningApplication::runningApplicationWithProcessIdentifier(self.ivars().pid.get())
+        else {
+            return false;
+        };
+        if saved.isTerminated()
+            || current.isTerminated()
+            || saved.bundleIdentifier() != current.bundleIdentifier()
+        {
+            return false;
+        }
+        let (Some(old_date), Some(new_date)) = (saved.launchDate(), current.launchDate()) else {
+            return false;
+        };
+        if old_date != new_date {
+            return false;
+        }
+        let name = current
+            .localizedName()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "Mac app".into());
+        self.ivars()
+            .target
+            .setStringValue(&NSString::from_str(&format!("Target: {name}")));
+        *self.ivars().application.borrow_mut() = name;
+        true
     }
     fn message(&self, text: &str) {
         self.ivars().status.setString(&NSString::from_str(text));
@@ -365,13 +504,16 @@ impl ComputerUseWindow {
         self.busy(false);
     }
     fn allowed(&self) -> bool {
-        if self.ivars().engine.settings().local_only() {
+        if let Err(e) = self.provider() {
+            self.message(&e);
+            false
+        } else if self.ivars().engine.settings().local_only() {
             self.message("Local-only protection is enabled. Jev needs a cloud connection; this feature will not send anything.");
             false
         } else if self.ivars().consent.state() != NSControlStateValueOn {
             self.message("Enable session sharing first. Jev receives your command and the target window’s control labels.");
             false
-        } else if self.ivars().pid.get() <= 0 {
+        } else if self.ivars().pid.get() <= 0 || !self.target_is_current() {
             self.message("Switch to the app you want to control, then open Computer use from OpenFlow’s menu bar.");
             false
         } else {
@@ -383,6 +525,10 @@ impl ComputerUseWindow {
         if !self.allowed() {
             return;
         }
+        let provider = match self.provider() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
         let command = self.ivars().command.stringValue().to_string();
         if command.trim().is_empty() || command.len() > computer_use::MAX_COMMAND {
             self.message("Enter one short command (up to 2,000 bytes).");
@@ -408,7 +554,7 @@ impl ComputerUseWindow {
         crate::app::spawn(async move {
             let credentials = tokio::task::spawn_blocking(move || {
                 (
-                    engine.settings().get("jev_api_key"),
+                    engine.settings().get(provider.secret_setting()),
                     engine.settings().local_only(),
                 )
             })
@@ -418,10 +564,13 @@ impl ComputerUseWindow {
                     let key = key.unwrap_or_default();
                     tokio::select! { biased;
                         _=cancel.cancelled()=>return,
-                        result=computer_use::decide(&command,&screen,&key,local_only)=>result,
+                        result=computer_use::decide(provider,&command,&screen,&key,local_only)=>result,
                     }
                 }
-                _ => Err("Could not read the TypeSafe key from Keychain.".into()),
+                _ => Err(format!(
+                    "Could not read the {} key from Keychain.",
+                    provider.name()
+                )),
             };
             deliver(generation, move |window| {
                 window.busy(false);
@@ -431,24 +580,39 @@ impl ComputerUseWindow {
                 }
                 match (result, snapshot) {
                     (Ok(proposal), Some(snapshot)) => {
-                        let element = snapshot
+                        let Some(element) = snapshot
                             .screen
                             .elements
                             .iter()
                             .find(|e| e.id == proposal.target)
-                            .expect("validated target");
+                        else {
+                            window.message("The proposed target is unavailable. Review again.");
+                            return;
+                        };
                         window.message(&describe_proposal(
                             &snapshot.screen.application,
                             &snapshot.window_label,
                             element,
                             &proposal,
                         ));
-                        window
+                        let remaining = snapshot.remaining();
+                        let offered = window
                             .ivars()
                             .session
                             .borrow_mut()
                             .offer(generation, (snapshot, proposal, command));
-                        window.ivars().confirm.setEnabled(true);
+                        window.ivars().confirm.setEnabled(offered);
+                        if offered {
+                            crate::app::spawn(async move {
+                                tokio::time::sleep(remaining).await;
+                                deliver(generation, |window| {
+                                    window.reset();
+                                    window.message(
+                                        "This proposal expired. Review the command again.",
+                                    );
+                                });
+                            });
+                        }
                     }
                     (Err(error), _) => window.message(&error),
                     _ => window.message("The target expired. Review a new command."),
@@ -467,6 +631,10 @@ impl ComputerUseWindow {
         if !self.allowed() {
             return;
         }
+        let provider = match self.provider() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
         if !computer_access::trusted() {
             self.message("Enable OpenFlow in System Settings → Privacy & Security → Accessibility before recording a computer command.");
             return;
@@ -493,9 +661,9 @@ impl ComputerUseWindow {
                     if capture_engine.settings().local_only() {
                         return Err("Local-only protection is enabled. Computer command recording was not started.".into());
                     }
-                    let key=capture_engine.settings().get("jev_api_key")?;
+                    let key=capture_engine.settings().get(provider.secret_setting())?;
                     if key.as_deref().is_none_or(|k|k.trim().is_empty()) {
-                        return Err("Save a TypeSafe API key before recording a computer command.".into());
+                        return Err(format!("Save a {} API key before recording a computer command.",provider.name()));
                     }
                     if startup_cancel.is_cancelled() {return Err("Recording cancelled.".into());}
                     capture_engine.begin_command_capture()
@@ -542,6 +710,10 @@ impl ComputerUseWindow {
     }
 }
 
+fn sharing_notice(provider: JevProvider) -> String {
+    format!("Allow Jev this session: send commands and control labels to {}. Labels may include selected values. No screenshots. Local-only blocks this.",provider.recipients())
+}
+
 fn deliver(generation: u64, body: impl FnOnce(&ComputerUseWindow) + Send + 'static) {
     crate::events::on_main(move || {
         crate::app::with_app(|app| {
@@ -563,7 +735,7 @@ fn describe_proposal(
 ) -> String {
     // Debug formatting makes invisible/bidi characters explicit in untrusted
     // labels and payloads; no truncation of the text that will actually be typed.
-    format!("Review before confirming\nApp: {application:?}\nWindow: {title:?}\nAction: {}\nControl: {:?} ({}, {})\n{}\nThis can change data in the target app. Check the target and payload carefully.",proposal.action,element.label,element.role,element.id,
+    format!("Review before confirming\nApp: {application:?}\nWindow: {title:?}\nAction: {:?}\nControl: {:?} ({:?}, {:?})\n{}\nThis can change data in the target app. Check the target and payload carefully.",proposal.action,element.label,element.role,element.id,
         proposal.text.as_ref().map(|t|format!("Exact text (replaces selected text; escaped display):\n{t:?}\n")).unwrap_or_default())
 }
 
@@ -571,10 +743,19 @@ fn describe_proposal(
 mod tests {
     use super::*;
     #[test]
+    fn sharing_notice_names_every_recipient_and_fits() {
+        for provider in [JevProvider::TypeSafe, JevProvider::OpenRouter] {
+            let notice = sharing_notice(provider);
+            assert!(notice.contains(provider.recipients()));
+            assert!(notice.contains("Local-only blocks"));
+            assert!(ui::wrapped_lines(&notice, 540.) as f64 * ui::NOTE_LINE <= 48.);
+        }
+    }
+    #[test]
     fn review_keeps_the_entire_payload_and_exposes_invisible_characters() {
         let element = computer_use::Element {
             id: "e0".into(),
-            role: "AXTextField".into(),
+            role: "AXTextField\nAction: forged\u{202e}".into(),
             label: "Search\u{202e}".into(),
             actions: vec!["type".into()],
         };
@@ -588,6 +769,7 @@ mod tests {
         assert!(review.contains(&text));
         assert!(review.contains("\\u{202e}"));
         assert!(!review.contains('\u{202e}'));
+        assert!(!review.contains("\nAction: forged"));
         assert!(review.contains("Draft"));
         assert!(review.contains("replaces selected text"));
     }

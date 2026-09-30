@@ -18,7 +18,7 @@ The project is currently an early source build. There are no official pre-built 
 - Self-hosted speech-to-text and speech synthesis on your own network, with no API key required
 - On-device transcription on Apple silicon (native macOS build), faster than the cloud round trip and with a Local only switch that refuses anything leaving the machine
 - Local executable hooks after transcription and formatting
-- [Jev computer use preview](docs/computer-use.md) in the native Mac app: spoken/typed commands, dynamic Accessibility targets, and confirmation before every action (requires a separate TypeSafe key; unavailable in Local-only mode)
+- [Jev computer use preview](docs/computer-use.md) in the native Mac app: spoken/typed commands, dynamic Accessibility targets, and confirmation before every action (TypeSafe or OpenRouter key; unavailable in Local-only mode)
 
 ### Streaming scope
 

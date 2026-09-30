@@ -16,6 +16,7 @@ pub const SECRET_SETTINGS: &[&str] = &[
     "formatting_api_key",
     "tts_api_key",
     "jev_api_key",
+    "jev_openrouter_api_key",
 ];
 
 pub fn is_secret_setting(key: &str) -> bool {
@@ -460,7 +461,9 @@ mod tests {
         assert!(is_secret_setting("formatting_api_key"));
         assert!(is_secret_setting("tts_api_key"));
         assert!(is_secret_setting("jev_api_key"));
-        assert_eq!(SECRET_SETTINGS.len(), 4);
+        assert!(is_secret_setting("jev_openrouter_api_key"));
+        assert!(!is_secret_setting("jev_provider"));
+        assert_eq!(SECRET_SETTINGS.len(), 5);
         assert!(!is_secret_setting("provider"));
         assert!(!is_secret_setting("dictionary"));
         // A near miss must not be routed to the keychain by accident.

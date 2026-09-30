@@ -1,6 +1,8 @@
 //! Bounded Accessibility snapshots and closed-set actions. No screen pixels,
-//! field values, shell commands, coordinates, or synthetic Return key.
+//! AXValue contents, shell commands, coordinates, or synthetic Return key.
+//! Control labels can still reveal a current selection.
 use openflow_core::computer_use::{Element, Proposal, Screen, MAX_ELEMENTS};
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CString};
 use std::time::{Duration, Instant};
@@ -12,6 +14,13 @@ extern "C" {
     fn AXUIElementCreateApplication(pid: i32) -> Ref;
     fn AXUIElementGetTypeID() -> usize;
     fn AXUIElementCopyAttributeValue(element: Ref, attribute: Ref, value: *mut Ref) -> i32;
+    fn AXUIElementCopyAttributeValues(
+        element: Ref,
+        attribute: Ref,
+        index: isize,
+        count: isize,
+        values: *mut Ref,
+    ) -> i32;
     fn AXUIElementCopyActionNames(element: Ref, names: *mut Ref) -> i32;
     fn AXUIElementIsAttributeSettable(element: Ref, attribute: Ref, settable: *mut u8) -> i32;
     fn AXUIElementSetAttributeValue(element: Ref, attribute: Ref, value: Ref) -> i32;
@@ -20,6 +29,30 @@ extern "C" {
     fn AXValueGetTypeID() -> usize;
     fn AXValueGetType(value: Ref) -> u32;
     fn AXValueGetValue(value: Ref, kind: u32, result: *mut c_void) -> u8;
+}
+
+thread_local! {static READ_DEADLINE: Cell<Option<Instant>> = const {Cell::new(None)};}
+struct ReadBudget(Option<Instant>);
+impl ReadBudget {
+    fn new() -> Self {
+        Self(READ_DEADLINE.with(|d| d.replace(Some(Instant::now() + Duration::from_millis(800)))))
+    }
+    fn expired() -> bool {
+        READ_DEADLINE.with(|d| {
+            d.get().is_some_and(|end| {
+                end.saturating_duration_since(Instant::now()) < Duration::from_millis(1)
+            })
+        })
+    }
+}
+impl Drop for ReadBudget {
+    fn drop(&mut self) {
+        READ_DEADLINE.with(|d| d.set(self.0));
+    }
+}
+
+fn valid_role(role: &str) -> bool {
+    role.starts_with("AX") && role.len() <= 64 && role.bytes().all(|c| c.is_ascii_alphanumeric())
 }
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
@@ -49,6 +82,43 @@ impl Drop for Owned {
     }
 }
 impl Owned {
+    fn ready_to_read(&self) -> bool {
+        let remaining = READ_DEADLINE.with(|d| {
+            d.get()
+                .map(|end| end.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_millis(50))
+        });
+        if remaining < Duration::from_millis(1) {
+            return false;
+        }
+        unsafe {
+            AXUIElementSetMessagingTimeout(
+                self.0,
+                remaining.min(Duration::from_millis(50)).as_secs_f32(),
+            );
+        }
+        true
+    }
+    fn children(&self, limit: usize) -> Vec<Self> {
+        if limit == 0 || !self.ready_to_read() {
+            return Vec::new();
+        }
+        let mut values = std::ptr::null();
+        if unsafe {
+            AXUIElementCopyAttributeValues(
+                self.0,
+                Self::text("AXChildren").0,
+                0,
+                limit as isize,
+                &mut values,
+            )
+        } != 0
+            || values.is_null()
+        {
+            return Vec::new();
+        }
+        Self(values).array(limit)
+    }
     fn selection(&self) -> Option<(isize, isize)> {
         #[repr(C)]
         struct Range {
@@ -79,6 +149,9 @@ impl Owned {
         Self(unsafe { CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), 0x08000100) })
     }
     fn attribute(&self, name: &str) -> Option<Self> {
+        if !self.ready_to_read() {
+            return None;
+        }
         let name = Self::text(name);
         let mut value = std::ptr::null();
         (unsafe { AXUIElementCopyAttributeValue(self.0, name.0, &mut value) } == 0
@@ -126,11 +199,17 @@ impl Owned {
             .collect()
     }
     fn settable(&self, name: &str) -> bool {
+        if !self.ready_to_read() {
+            return false;
+        }
         let name = Self::text(name);
         let mut yes = 0;
         unsafe { AXUIElementIsAttributeSettable(self.0, name.0, &mut yes) == 0 && yes != 0 }
     }
     fn actions(&self) -> Vec<String> {
+        if !self.ready_to_read() {
+            return Vec::new();
+        }
         let mut names = std::ptr::null();
         if unsafe { AXUIElementCopyActionNames(self.0, &mut names) } != 0 || names.is_null() {
             return Vec::new();
@@ -153,11 +232,40 @@ pub struct Snapshot {
     created: Instant,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ActionOutcome {
+    Acknowledged,
+    Unconfirmed,
+}
+impl ActionOutcome {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::Acknowledged => "Action sent to the target app. Check its result before your next command.",
+            Self::Unconfirmed => "The action was attempted, but the app did not confirm the result. It may have completed. Check the app before trying again. Nothing will be retried automatically.",
+        }
+    }
+}
+
+fn action_outcome(status: i32) -> Result<ActionOutcome, String> {
+    match status {
+        0 => Ok(ActionOutcome::Acknowledged),
+        // AX illegal argument, unsupported attribute, unsupported action.
+        -25201 | -25205 | -25206 => Err(
+            "The app refused that Accessibility action. Nothing will be retried automatically."
+                .into(),
+        ),
+        // Includes kAXErrorCannotComplete (-25204): a timeout does not mean the
+        // app failed to act. Unknown results must never invite a blind replay.
+        _ => Ok(ActionOutcome::Unconfirmed),
+    }
+}
+
 pub fn trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
 pub fn snapshot(pid: i32, application: &str) -> Result<Snapshot, String> {
+    let _budget = ReadBudget::new();
     if !trusted() {
         return Err("Enable OpenFlow in System Settings → Privacy & Security → Accessibility, then try again.".into());
     }
@@ -177,6 +285,9 @@ pub fn snapshot(pid: i32, application: &str) -> Result<Snapshot, String> {
     let window = root
         .attribute("AXFocusedWindow")
         .ok_or("The target app has no accessible focused window.")?;
+    if unsafe { CFGetTypeID(window.0) != AXUIElementGetTypeID() } {
+        return Err("The target app returned an invalid window.".into());
+    }
     unsafe {
         AXUIElementSetMessagingTimeout(window.0, 0.05);
     }
@@ -203,6 +314,9 @@ pub fn snapshot(pid: i32, application: &str) -> Result<Snapshot, String> {
             AXUIElementSetMessagingTimeout(item.0, 0.05);
         }
         let role = item.name("AXRole");
+        if !valid_role(&role) {
+            continue;
+        }
         let subrole = item.name("AXSubrole");
         if role.contains("Secure") || subrole.contains("Secure") {
             continue;
@@ -236,10 +350,8 @@ pub fn snapshot(pid: i32, application: &str) -> Result<Snapshot, String> {
             }
         }
         if depth < 12 {
-            if let Some(children) = item.attribute("AXChildren") {
-                for child in children.array(512usize.saturating_sub(visited + queue.len())) {
-                    queue.push_back((child, depth + 1));
-                }
+            for child in item.children(512usize.saturating_sub(visited + queue.len())) {
+                queue.push_back((child, depth + 1));
             }
         }
         if actions.is_empty() {
@@ -263,6 +375,9 @@ pub fn snapshot(pid: i32, application: &str) -> Result<Snapshot, String> {
         handles.push(item);
         selections.push(selection);
     }
+    if ReadBudget::expired() {
+        return Err("The target app took too long to respond. Try again when it is ready.".into());
+    }
     if elements.is_empty() {
         return Err("This window exposes no supported controls. Try another app or window.".into());
     }
@@ -281,15 +396,23 @@ pub fn snapshot(pid: i32, application: &str) -> Result<Snapshot, String> {
 }
 
 impl Snapshot {
+    pub fn remaining(&self) -> Duration {
+        Duration::from_secs(30).saturating_sub(self.created.elapsed())
+    }
     /// A proposal is consumed by the caller before execution. Re-enumerate the
     /// original window; never resolve old numeric IDs against a different tree.
-    pub fn execute(self, proposal: &Proposal) -> Result<(), String> {
+    pub fn execute(self, proposal: &Proposal) -> Result<ActionOutcome, String> {
         if self.created.elapsed() > Duration::from_secs(30) {
             return Err("The proposal expired. Review a new command.".into());
         }
         let fresh = snapshot(self.pid, &self.screen.application)?;
         let index = self.checked_target(&fresh, proposal)?;
         let target = &fresh.handles[index];
+        // Snapshot reads deliberately use short timeouts. Do not inherit those
+        // for mutations: an app may complete an action after its reply times out.
+        if unsafe { AXUIElementSetMessagingTimeout(target.0, 2.0) } != 0 {
+            return Err("Could not prepare the target app. No action was sent.".into());
+        }
         let status = match proposal.action.as_str() {
             "focus" => unsafe {
                 AXUIElementSetAttributeValue(target.0, Owned::text("AXFocused").0, kCFBooleanTrue)
@@ -322,14 +445,7 @@ impl Snapshot {
             },
             _ => return Err("Unsupported action.".into()),
         };
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(
-                "The app refused that Accessibility action. Nothing will be retried automatically."
-                    .into(),
-            )
-        }
+        action_outcome(status)
     }
 
     fn checked_target(&self, fresh: &Self, proposal: &Proposal) -> Result<usize, String> {
@@ -367,6 +483,48 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn action_timeouts_are_uncertain_not_refused() {
+        assert_eq!(action_outcome(0), Ok(ActionOutcome::Acknowledged));
+        for status in [-25204, -25200, -99999] {
+            let outcome = action_outcome(status).unwrap();
+            assert_eq!(outcome, ActionOutcome::Unconfirmed);
+            assert!(outcome.message().contains("may have completed"));
+            assert!(outcome
+                .message()
+                .contains("Check the app before trying again"));
+            assert!(!outcome.message().contains("refused"));
+        }
+        for status in [-25201, -25205, -25206] {
+            assert!(action_outcome(status).unwrap_err().contains("refused"));
+        }
+    }
+    #[test]
+    fn hostile_roles_are_not_treated_as_controls() {
+        for role in [
+            "",
+            "AXButton\nAction: fake",
+            "AXTextField\u{202e}",
+            &"AX".repeat(40),
+        ] {
+            assert!(!valid_role(role));
+        }
+        assert!(valid_role("AXButton"));
+        assert!(valid_role("AXTextField"));
+    }
+    #[test]
+    fn exhausted_budget_prevents_every_ipc_read() {
+        let _scope = ReadBudget::new();
+        READ_DEADLINE.with(|d| d.set(Some(Instant::now() - Duration::from_secs(1))));
+        // Null is intentional: if any helper reaches an AX function it would
+        // violate the budget, rather than merely returning a harmless fixture.
+        let item = Owned(std::ptr::null());
+        assert!(ReadBudget::expired());
+        assert!(item.attribute("AXRole").is_none());
+        assert!(!item.settable("AXFocused"));
+        assert!(item.actions().is_empty());
+        assert!(item.children(12).is_empty());
+    }
     // CF strings stand in for retained identities; no test queries another app
     // or invokes AX actions, requests permission, or accesses a microphone.
     fn fixture() -> Snapshot {
