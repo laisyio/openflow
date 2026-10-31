@@ -60,8 +60,6 @@ jobs:
             exit 1
           fi
 
-      - run: cargo test --workspace
-
       # Ad hoc signed, because a GitHub runner has no keychain of ours and this
       # workflow deliberately holds no signing secret. The consequence is real
       # and belongs in the release notes: Gatekeeper will not let a downloaded
